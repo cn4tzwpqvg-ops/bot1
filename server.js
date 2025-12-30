@@ -218,8 +218,13 @@ async function clearOrderMessage(orderId, chatId) {
 }
 
 // ================= Восстановление заказов =================
+const pLimit = require("p-limit"); // npm install p-limit
+
 async function restoreOrdersForClients() {
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
+
+  const limit = pLimit(5); // максимум 5 одновременных сообщений
+
   for (const client of clients) {
     const [orders] = await db.execute(`
       SELECT *
@@ -229,35 +234,59 @@ async function restoreOrdersForClients() {
       ORDER BY created_at DESC
     `, [client.username]);
 
-    for (const order of orders) {
-      try {
-        await bot.sendMessage(client.chat_id, buildOrderMessage(order), { parse_mode: "MarkdownV2" });
-      } catch (err) {
-        console.error(`Ошибка восстановления заказа №${order.id} для @${client.username}:`, err.message);
-      }
-    }
+    // формируем массив функций для ограниченной параллели
+    const tasks = orders.map(order =>
+      limit(async () => {
+        try {
+          await bot.sendMessage(client.chat_id, buildOrderMessage(order), { parse_mode: "MarkdownV2" });
+        } catch (err) {
+          console.error(`Ошибка восстановления заказа №${order.id} для @${client.username}:`, err.message);
+        }
+      })
+    );
+
+    // ждём завершения всех задач для текущего клиента
+    await Promise.all(tasks);
   }
+
   console.log("Восстановление заказов для клиентов завершено");
 }
 
+
+const pLimit = require("p-limit"); // npm install p-limit
+
 async function restoreOrdersForCouriers() {
   const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken')");
-  for (const order of orders) {
-    await sendOrUpdateOrder(order);
-  }
+
+  const limit = pLimit(5); // максимум 5 одновременных операций
+
+  const tasks = orders.map(order =>
+    limit(async () => {
+      try {
+        await sendOrUpdateOrder(order);
+      } catch (err) {
+        console.error(`Ошибка восстановления заказа №${order.id}:`, err.message);
+      }
+    })
+  );
+
+  await Promise.all(tasks);
+
   console.log("Восстановление заказов для курьеров завершено");
 }
+
+// ==================== Основной блок ====================
 (async function main() {
   await initDB();
   COURIERS = await getCouriers();
   await addCourier(ADMIN_USERNAME, ADMIN_ID);
-  await restoreOrdersForClients();
-  await restoreOrdersForCouriers();
+
+  await restoreOrdersForClients();   // уже переписана с ограничением
+  await restoreOrdersForCouriers();  // теперь тоже безопасно
 
   bot.startPolling();
   console.log("Бот и сервер запущены");
 })();
-
 
 // ================= Транзакция для отмены заказа =================
 async function releaseOrderTx(orderId) {
@@ -1489,6 +1518,5 @@ app.post("/api/send-order", async (req, res) => {
 
 // ================= Запуск сервера =================
 server.listen(PORT, HOST, () => {
-  console.log(`Server running at http://127.0.0.1:${PORT}`);
-  console.log("Bot готов к приёму заказов");
+  console.log(`Server running at port ${PORT}`);
 });
