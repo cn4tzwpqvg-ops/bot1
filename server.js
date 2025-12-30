@@ -33,7 +33,7 @@ async function initDB() {
     host: process.env.MYSQLHOST,
     user: process.env.MYSQLUSER,
     password: process.env.MYSQL_ROOT_PASSWORD,
-    database: process.env.MYSQL_DATABASE,
+   database: process.env.MYSQLDATABASE,
     port: parseInt(process.env.MYSQLPORT) || 3306
   });
 
