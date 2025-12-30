@@ -1332,9 +1332,6 @@ if (orders.length === 0) {
 });
 
 
-
-
-
 // ================= Express / WebSocket =================
 const app = express();
 app.use(cors());
@@ -1342,51 +1339,65 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// Функция для рассылки обновлений stock всем подключённым клиентам WebSocket
 function broadcastStock() {
   const data = JSON.stringify({ type: "stock-update" });
-  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); });
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(data);
+  });
 }
 
-// ================= API: отправка заказа =================
+// ================= Генерация ID заказа =================
 function generateOrderId() {
   let id;
-  do { id = String(Math.floor(100000 + Math.random() * 900000)); } while(getOrderById(id));
+  do {
+    id = String(Math.floor(100000 + Math.random() * 900000));
+  } while (getOrderById(id)); // на всякий случай, чтобы не было дубликата
   return id;
 }
 
+// ================= API: отправка заказа =================
 app.post("/api/send-order", async (req, res) => {
   try {
     const { tgNick, city, delivery, payment, orderText, date, time, client_chat_id } = req.body;
+
     console.log(`Новый заказ через API от ${tgNick}`);
-    console.log(`Детали: город=${city},доставка=${delivery},оплата=${payment},текст заказа="${orderText}"`);
+    console.log(`Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`);
+
     if (!tgNick || !orderText) {
-    console.log(`Ошибка: неверные данные`);
+      console.log(`Ошибка: неверные данные`);
       return res.status(400).json({ success: false, error: "Неверные данные" });
     }
 
+    // Генерируем уникальный ID заказа
     const id = generateOrderId();
     console.log(`Присвоен ID заказа: ${id}`);
+
     const order = {
-  id,
-  tgNick,
-  city,
-  delivery,
-  payment,
-  orderText,
-  date,
-  time,
-  status: "new",
-  client_chat_id
-};
+      id,
+      tgNick,
+      city,
+      delivery,
+      payment,
+      orderText,
+      date,
+      time,
+      status: "new",
+      client_chat_id
+    };
 
-
-    // Добавляем заказ в базу
-    addOrder(order);
+    // ===== Добавляем заказ в базу =====
+    await addOrder(order);
     console.log(`Заказ ${id} добавлен в базу`);
-    // 🔹 Отправляем или обновляем сообщения заказа всем курьерам и админу
-    const updated = getOrderById(id);
+
+    // ===== Получаем заказ из базы =====
+    const updated = await getOrderById(id);
+
+    // ===== Отправляем уведомления в Telegram =====
     await sendOrUpdateOrder(updated);
     console.log(`Уведомления отправлены для заказа ${id}`);
+
+    // ===== WebSocket: обновление stock =====
     broadcastStock();
     console.log(`WebSocket: отправлено обновление stock`);
 
@@ -1398,12 +1409,8 @@ app.post("/api/send-order", async (req, res) => {
   }
 });
 
-
-
-
-
 // ================= Запуск сервера =================
 server.listen(PORT, HOST, () => {
   console.log(`Server running at http://127.0.0.1:${PORT}`);
-  console.log("Bot started and polling.");
+  console.log("Bot готов к приёму заказов");
 });
