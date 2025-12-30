@@ -1103,6 +1103,27 @@ if (text === "Панель администратора" && id === ADMIN_ID) {
 }
 
 
+// ===== Все пользователи =====
+if (text === "Все пользователи" && id === ADMIN_ID) {
+  try {
+    // Получаем всех клиентов из базы
+    const [clients] = await db.execute("SELECT username, chat_id FROM clients");
+
+    if (clients.length === 0) {
+      return bot.sendMessage(id, "Пользователей пока нет.");
+    }
+
+    // Формируем список
+    const list = clients
+      .map(c => `@${c.username} — chat_id: ${c.chat_id || "неизвестно"}`)
+      .join("\n");
+
+    return bot.sendMessage(id, "Список всех пользователей:\n" + list);
+  } catch (err) {
+    console.error("Ошибка получения списка пользователей:", err.message);
+    return bot.sendMessage(id, "Произошла ошибка при получении списка пользователей.");
+  }
+}
 
 
 
