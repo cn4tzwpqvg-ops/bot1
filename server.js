@@ -253,8 +253,6 @@ async function restoreOrdersForClients() {
 }
 
 
-const pLimit = require("p-limit"); // npm install p-limit
-
 async function restoreOrdersForCouriers() {
   const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken')");
 
