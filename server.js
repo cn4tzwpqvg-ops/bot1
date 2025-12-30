@@ -218,7 +218,8 @@ async function clearOrderMessage(orderId, chatId) {
 }
 
 // ================= Восстановление заказов =================
-const pLimit = require("p-limit"); // npm install p-limit
+const pLimit = require("p-limit").default;
+ // npm install p-limit
 
 async function restoreOrdersForClients() {
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
