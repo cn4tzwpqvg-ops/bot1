@@ -1422,7 +1422,6 @@ if (text === "Рассылка" && id === ADMIN_ID) {
   adminWaitingBroadcast.set(username, true); // <-- устанавливаем флаг ожидания
   return bot.sendMessage(id, "Введите текст для рассылки всем подписанным клиентам:");
 }
-ы
 
 
 // ===== Рассылка с лимитом =====
