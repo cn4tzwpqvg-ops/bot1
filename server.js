@@ -177,10 +177,31 @@ async function addOrder(order) {
     if (client?.chat_id) order.client_chat_id = client.chat_id;
   }
 
+  // Преобразуем дату в формат YYYY-MM-DD для MySQL
+  let sqlDate = null;
+  if (order.date) {
+    const parts = order.date.split('.'); // ["31", "12", "2025"]
+    if (parts.length === 3) {
+      sqlDate = `${parts[2]}-${parts[1].padStart(2,'0')}-${parts[0].padStart(2,'0')}`; // "2025-12-31"
+    }
+  }
+
   await db.execute(`
     INSERT INTO orders (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `, [order.id, order.tgNick, order.city, order.delivery, order.payment, order.orderText, order.date, order.time, order.status || "new", new Date().toISOString(), order.client_chat_id || null]);
+  `, [
+    order.id,
+    order.tgNick,
+    order.city,
+    order.delivery,
+    order.payment,
+    order.orderText,
+    sqlDate, // исправленная дата
+    order.time,
+    order.status || "new",
+    new Date().toISOString(),
+    order.client_chat_id || null
+  ]);
 }
 
 async function getOrderById(id) {
@@ -190,17 +211,37 @@ async function getOrderById(id) {
 
 async function updateOrderStatus(id, status, courier_username = null) {
   const now = new Date().toISOString();
-  if (status === "taken") await db.execute("UPDATE orders SET status=?, courier_username=?, taken_at=? WHERE id=?", [status, courier_username, now, id]);
-  else if (status === "delivered") await db.execute("UPDATE orders SET status=?, delivered_at=?, courier_username=? WHERE id=?", [status, now, courier_username, id]);
-  else if (status === "new") await db.execute("UPDATE orders SET status=?, courier_username=NULL, taken_at=NULL WHERE id=?", [status, id]);
+
+  if (status === "taken") {
+    await db.execute(
+      "UPDATE orders SET status=?, courier_username=?, taken_at=? WHERE id=?",
+      [status, courier_username, now, id]
+    );
+  } else if (status === "delivered") {
+    await db.execute(
+      "UPDATE orders SET status=?, delivered_at=?, courier_username=? WHERE id=?",
+      [status, now, courier_username, id]
+    );
+  } else if (status === "new") {
+    await db.execute(
+      "UPDATE orders SET status=?, courier_username=NULL, taken_at=NULL WHERE id=?",
+      [status, id]
+    );
+  }
 }
 
 async function takeOrderAtomic(orderId, username) {
   if (!username) return false;
   const now = new Date().toISOString();
-  const [res] = await db.execute("UPDATE orders SET status='taken', courier_username=?, taken_at=? WHERE id=? AND status='new'", [username, now, orderId]);
+
+  const [res] = await db.execute(
+    "UPDATE orders SET status='taken', courier_username=?, taken_at=? WHERE id=? AND status='new'",
+    [username, now, orderId]
+  );
+
   return res.affectedRows === 1;
 }
+
 
 // ================= Order Messages =================
 async function getOrderMessages(orderId) {
