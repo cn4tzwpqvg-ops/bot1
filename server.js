@@ -257,6 +257,7 @@ async function updateOrderStatus(id, status, courier_username = null) {
 
 
 
+
 async function takeOrderAtomic(orderId, username) {
   if (!username) return false;
   const now = formatMySQLDateTime();
@@ -285,7 +286,6 @@ async function clearOrderMessage(orderId, chatId) {
   await db.execute("DELETE FROM order_messages WHERE order_id=? AND chat_id=?", [orderId, chatId]);
 }
 
-
 async function restoreOrdersForClients() {
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
 
@@ -303,37 +303,49 @@ async function restoreOrdersForClients() {
       [client.username]
     );
 
-    for (const order of orders) {
-      await limit(async () => {
+    // формируем массив задач для p-limit
+    const tasks = orders.map(order =>
+      limit(async () => {
         try {
-          await bot.sendMessage(client.chat_id, buildOrderMessage(order), { parse_mode: "MarkdownV2" });
+          const text = String(buildOrderMessage(order)); // гарантируем строку
+          await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
         } catch (err) {
           console.error(`Ошибка восстановления заказа №${order.id} для @${client.username}:`, err.message);
         }
-      });
-    }
+      })
+    );
+
+    // ждём завершения всех задач для текущего клиента
+    await Promise.all(tasks);
   }
 
   console.log("Восстановление заказов для клиентов завершено");
 }
 
 async function restoreOrdersForCouriers() {
-  const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken')");
+  const [orders] = await db.execute(
+    "SELECT * FROM orders WHERE status IN ('new','taken')"
+  );
 
   const limit = pLimit(5); // максимум 5 одновременных операций
 
-  for (const order of orders) {
-    await limit(async () => {
+  // формируем массив функций для ограниченной параллели
+  const tasks = orders.map(order =>
+    limit(async () => {
       try {
         await sendOrUpdateOrder(order);
       } catch (err) {
         console.error(`Ошибка восстановления заказа №${order.id}:`, err.message);
       }
-    });
-  }
+    })
+  );
+
+  // ждём завершения всех задач
+  await Promise.all(tasks);
 
   console.log("Восстановление заказов для курьеров завершено");
 }
+
 
 
 // ==================== Основной блок ====================
@@ -459,9 +471,8 @@ waitingReview.set(order.client_chat_id, {
 
   console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
 }
-
 async function sendOrUpdateOrder(order) {
-  // получаем список курьеров из MySQL
+  // Получаем список курьеров из MySQL
   const [rows] = await db.execute(
     "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
   );
@@ -473,74 +484,79 @@ async function sendOrUpdateOrder(order) {
 
   const limit = pLimit(5); // максимум 5 одновременных операций
 
-  const tasks = recipients.map(r => limit(async () => {
-    if (!r.chatId) return;
+  const tasks = recipients.map(r =>
+    limit(async () => {
+      if (!r.chatId) return;
 
-    // защитная проверка: getOrderMessages должен вернуть массив
-    const messages = getOrderMessages(order.id);
-    const msgArray = Array.isArray(messages) ? messages : [];
-    const msg = msgArray.find(m => m.chat_id === r.chatId);
+      // ✅ всегда массив
+      const messages = await getOrderMessages(order.id) || [];
+      const msg = messages.find(m => m.chat_id === r.chatId);
 
-    let kb = [];
-    const text = buildOrderMessage(order); // убедиться, что это строка
+      let kb = [];
+      const text = buildOrderMessage(order);
 
-    // ===== NEW =====
-    if (order.status === "new") {
-      kb = [[{ text: "Взять заказ", callback_data: `take_${order.id}` }]];
-    }
+      // ===== NEW =====
+      if (order.status === "new") {
+        kb = [[{ text: "Взять заказ", callback_data: `take_${order.id}` }]];
+      }
 
-    // ===== TAKEN =====
-    else if (order.status === "taken") {
-      if (order.courier_username === r.username || r.chatId === ADMIN_ID) {
-        kb = [[
-          { text: "Доставлен", callback_data: `delivered_${order.id}` },
-          { text: "Отказаться", callback_data: `release_${order.id}` }
-        ]];
-      } else {
-        // этому курьеру заказ больше не показываем
-        if (msg) {
-          try {
-            await bot.deleteMessage(r.chatId, msg.message_id);
-            clearOrderMessage(order.id, r.chatId);
-          } catch {}
+      // ===== TAKEN =====
+      else if (order.status === "taken") {
+        if (order.courier_username === r.username || r.chatId === ADMIN_ID) {
+          kb = [[
+            { text: "Доставлен", callback_data: `delivered_${order.id}` },
+            { text: "Отказаться", callback_data: `release_${order.id}` }
+          ]];
+        } else {
+          // этому курьеру заказ больше не показываем
+          if (msg) {
+            try {
+              await bot.deleteMessage(r.chatId, msg.message_id);
+              clearOrderMessage(order.id, r.chatId); // только этот чат
+            } catch {}
+          }
+          return;
         }
-        return;
       }
-    }
 
-    // ===== DELIVERED =====
-    else if (order.status === "delivered") {
-      kb = []; // без кнопок
-    }
-
-    try {
-      if (msg) {
-        await bot.editMessageText(text, {
-          chat_id: r.chatId,
-          message_id: msg.message_id,
-          parse_mode: "MarkdownV2",
-          reply_markup: kb.length ? { inline_keyboard: kb } : undefined
-        });
-      } else {
-        const sent = await bot.sendMessage(r.chatId, text, {
-          parse_mode: "MarkdownV2",
-          reply_markup: kb.length ? { inline_keyboard: kb } : undefined
-        });
-
-        saveOrderMessage(order.id, r.chatId, sent.message_id);
+      // ===== DELIVERED =====
+      else if (order.status === "delivered") {
+        kb = []; // без кнопок
       }
-    } catch (err) {
-      if (
-        !err.message.includes("message is not modified") &&
-        !err.message.includes("chat not found")
-      ) {
-        console.error(`Ошибка sendOrUpdateOrder: заказ ${order.id}, chat_id ${r.chatId}, пользователь @${r.username}`, err.message);
+
+      try {
+        if (msg) {
+          await bot.editMessageText(text, {
+            chat_id: r.chatId,
+            message_id: msg.message_id,
+            parse_mode: "MarkdownV2",
+            reply_markup: kb.length ? { inline_keyboard: kb } : undefined
+          });
+        } else {
+          const sent = await bot.sendMessage(r.chatId, text, {
+            parse_mode: "MarkdownV2",
+            reply_markup: kb.length ? { inline_keyboard: kb } : undefined
+          });
+
+          saveOrderMessage(order.id, r.chatId, sent.message_id);
+        }
+      } catch (err) {
+        if (
+          !err.message.includes("message is not modified") &&
+          !err.message.includes("chat not found")
+        ) {
+          console.error(
+            `Ошибка sendOrUpdateOrder: заказ ${order.id}, chat_id ${r.chatId}, пользователь @${r.username}`,
+            err.message
+          );
+        }
       }
-    }
-  }));
+    })
+  );
 
   await Promise.all(tasks);
 }
+
 
 
 
@@ -588,8 +604,9 @@ bot.on("callback_query", async (q) => {
   }
 
   // ================== Основная часть (заказы) ==================
-  const orderId = data.split("_")[1];
-  const order = getOrderById(orderId);
+const orderId = data.split("_")[1];
+const order = await getOrderById(orderId);
+
 
   if (!order) {
     console.log(` Заказ ${orderId} не найден`);
@@ -625,10 +642,10 @@ const success = takeOrderAtomic(orderId, username);
     });
   }
 
-  const updatedOrder = getOrderById(orderId);
-  await sendOrUpdateOrder(updatedOrder);
+const updatedOrder = await getOrderById(orderId); // ✅ добавляем await
+await sendOrUpdateOrder(updatedOrder);
 
-  return bot.answerCallbackQuery(q.id, { text: "Заказ взят" });
+return bot.answerCallbackQuery(q.id, { text: "Заказ взят" });
 }
 
 
@@ -656,9 +673,10 @@ const success = takeOrderAtomic(orderId, username);
   const oldCourier = order.courier_username;
 
 // ⬅️ возвращаем заказ в new (транзакция)
-releaseOrderTx(orderId);
+await releaseOrderTx(orderId);
 
 const updatedOrder = await getOrderById(orderId);
+
 
 
 // 🔹 обновляем сообщения
