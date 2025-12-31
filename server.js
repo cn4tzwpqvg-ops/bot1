@@ -919,6 +919,8 @@ try {
   );
 
 
+
+
   
     // ===== Прием отзыва от клиента =====
 // ===== Прием отзыва от клиента =====
@@ -1464,12 +1466,19 @@ if (text === "Статистика" && id === ADMIN_ID) {
   );
 }
 
+// ===== Кнопка "Рассылка" =====
+if (text === "Рассылка" && id === ADMIN_ID) {
+  adminWaitingBroadcast.set(username, true); // <-- устанавливаем флаг ожидания
+  return bot.sendMessage(id, "Введите текст для рассылки всем подписанным клиентам:");
+}
+
+
+
 // ===== Рассылка с лимитом =====
 if (adminWaitingBroadcast.has(username)) {
   const msgText = text;
 
   try {
-    // Получаем всех подписанных клиентов из MySQL
     const [allClients] = await db.execute(
       "SELECT chat_id, username FROM clients WHERE subscribed=1 AND chat_id IS NOT NULL"
     );
@@ -1477,14 +1486,13 @@ if (adminWaitingBroadcast.has(username)) {
     console.log(`Начало рассылки от @${username}, текст: "${msgText}"`);
     console.log(`Всего получателей: ${allClients.length}`);
 
-    const limit = pLimit(5); // максимум 5 одновременных сообщений
+    const limit = pLimit(5);
     let successCount = 0;
 
-    // Создаём задачи для параллельной отправки
     const tasks = allClients.map(c => limit(async () => {
       try {
-        const safeMsg = escapeMarkdownV2(msgText); // <-- Экранируем спецсимволы
-        await bot.sendMessage(c.chat_id, safeMsg, { parse_mode: 'MarkdownV2' }); // <-- Добавляем parse_mode
+        const safeMsg = escapeMarkdownV2(msgText);
+        await bot.sendMessage(c.chat_id, safeMsg, { parse_mode: 'MarkdownV2' });
         successCount++;
         console.log(`Отправлено пользователю chat_id: ${c.chat_id}`);
       } catch (err) {
@@ -1492,17 +1500,13 @@ if (adminWaitingBroadcast.has(username)) {
       }
     }));
 
-    // Ждём завершения всех задач
     await Promise.all(tasks);
 
-    // Отправляем отчёт админу
     const safeReport = escapeMarkdownV2(`Рассылка завершена\nУспешно отправлено: ${successCount} из ${allClients.length}`);
     await bot.sendMessage(ADMIN_ID, safeReport, { parse_mode: 'MarkdownV2' });
 
-    // Сбрасываем ожидание текста рассылки
     adminWaitingBroadcast.delete(username);
     console.log(`Рассылка от @${username} завершена`);
-
   } catch (err) {
     console.error(`Ошибка при рассылке от @${username}:`, err.message);
     await bot.sendMessage(ADMIN_ID, `Ошибка при рассылке: ${escapeMarkdownV2(err.message)}`, { parse_mode: 'MarkdownV2' });
@@ -1510,7 +1514,6 @@ if (adminWaitingBroadcast.has(username)) {
 
   return;
 }
-
 
 
  // ===== Панель курьера =====
@@ -1613,6 +1616,9 @@ console.log(
 return;
 }
 });
+
+
+
 
 
 // ================= Express / WebSocket =================
