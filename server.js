@@ -1631,6 +1631,30 @@ app.post("/api/send-order", async (req, res) => {
   }
 });
 
+// ================= Фикс зависших заказов =================
+app.post("/fix-all-new-orders", async (req, res) => {
+  try {
+    const [orders] = await db.execute("SELECT * FROM orders WHERE status='new'");
+
+    if (orders.length === 0) return res.send("Нет новых заказов для исправления.");
+
+    for (const order of orders) {
+      try {
+        await sendOrUpdateOrder(order);
+        console.log(`Заказ #${order.id} обновлен`);
+      } catch (err) {
+        console.error(`Ошибка при обновлении заказа #${order.id}:`, err.message);
+      }
+    }
+
+    res.send(`Обновлено ${orders.length} заказ(ов). Кнопки теперь должны появиться.`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Ошибка сервера при исправлении заказов");
+  }
+});
+
+
 // ================= Запуск сервера =================
 server.listen(PORT, HOST, () => {
   console.log(`Server running at port ${PORT}`);
