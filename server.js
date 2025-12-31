@@ -309,7 +309,13 @@ async function saveOrderMessage(orderId, chatId, messageId) {
 async function clearOrderMessage(orderId, chatId) {
   await db.execute("DELETE FROM order_messages WHERE order_id=? AND chat_id=?", [orderId, chatId]);
 }
+// =================== Вспомогательная функция ===================
+function escapeMarkdownV2(text) {
+  if (text == null) return "";
+  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
 
+// =================== Восстановление заказов для клиентов ===================
 async function restoreOrdersForClients() {
   console.log("[INFO] Восстановление заказов для клиентов...");
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
@@ -328,61 +334,63 @@ async function restoreOrdersForClients() {
       [client.username]
     );
 
-     console.log(`[INFO] Клиент @${client.username} имеет ${orders.length} заказов`);
+    console.log(`[INFO] Клиент @${client.username} имеет ${orders.length} заказов`);
 
-    // формируем массив задач для p-limit
+    // массив задач для p-limit
     const tasks = orders.map(order =>
       limit(async () => {
         try {
-          // строим сообщение
           let text = buildOrderMessage(order);
-          console.log(`[INFO] Отправляем заказ №${order.id} клиенту @${client.username}`);
 
-          // гарантируем, что это строка
           if (typeof text !== "string") text = "";
-
-          // безопасно экранируем MarkdownV2
+          // Экранируем все спецсимволы MarkdownV2
           text = escapeMarkdownV2(text);
 
           await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
+          console.log(`[INFO] Отправлен заказ №${order.id} клиенту @${client.username}`);
         } catch (err) {
-          console.error(`Ошибка восстановления заказа №${order.id} для @${client.username}:`, err.message);
+          console.error(`[ERROR] Ошибка отправки заказа №${order.id} клиенту @${client.username}:`, err.message);
         }
       })
     );
 
-    // ждём завершения всех задач для текущего клиента
+    // ждём завершения всех задач для клиента
     await Promise.all(tasks);
   }
 
-  console.log("Восстановление заказов для клиентов завершено");
+  console.log("[INFO] Восстановление заказов для клиентов завершено");
 }
 
+// =================== Восстановление заказов для курьеров ===================
 async function restoreOrdersForCouriers() {
   console.log("[INFO] Восстановление заказов для курьеров...");
-  const [orders] = await db.execute(
-    "SELECT * FROM orders WHERE status IN ('new','taken')"
-  );
+  const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken')");
 
   const limit = pLimit(5);
 
   const tasks = orders.map(order =>
     limit(async () => {
       try {
-        // Проверяем, нет ли уже сообщений для этого заказа у курьеров
+        // Проверяем, нет ли сообщений для этого заказа
         const messages = await getOrderMessages(order.id);
         if (!messages || messages.length === 0) {
-        console.log(`[INFO] Восстанавливаем заказ №${order.id} для курьеров`);
-          await sendOrUpdateOrder(order);
+          console.log(`[INFO] Восстанавливаем заказ №${order.id} для курьеров`);
+
+          // Строим текст и экранируем спецсимволы
+          let text = buildOrderMessage(order);
+          if (typeof text !== "string") text = "";
+          text = escapeMarkdownV2(text);
+
+          await sendOrUpdateOrder(order, text); // передаем экранированный текст в функцию уведомления
         }
       } catch (err) {
-        console.error(`Ошибка восстановления заказа №${order.id}:`, err.message);
+        console.error(`[ERROR] Ошибка восстановления заказа №${order.id}:`, err.message);
       }
     })
   );
 
   await Promise.all(tasks);
-  console.log("Восстановление заказов для курьеров завершено");
+  console.log("[INFO] Восстановление заказов для курьеров завершено");
 }
 
 
@@ -414,13 +422,6 @@ async function releaseOrderTx(orderId) {
   }
 }
 
-
-
-// ================= Markdown =================
-function escapeMarkdownV2(text) {
-  if (text == null) return ""; // заменяем null/undefined на пустую строку
-  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
-}
 
 // ================= Построение сообщения =================
 const deliveryMap = { "DHL": "DHL", "Курьер": "Курьер" };
