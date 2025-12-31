@@ -1463,7 +1463,6 @@ if (text === "Статистика" && id === ADMIN_ID) {
   );
 }
 
-
 // ===== Рассылка с лимитом =====
 if (adminWaitingBroadcast.has(username)) {
   const msgText = text;
@@ -1483,7 +1482,8 @@ if (adminWaitingBroadcast.has(username)) {
     // Создаём задачи для параллельной отправки
     const tasks = allClients.map(c => limit(async () => {
       try {
-        await bot.sendMessage(c.chat_id, msgText);
+        const safeMsg = escapeMarkdownV2(msgText); // <-- Экранируем спецсимволы
+        await bot.sendMessage(c.chat_id, safeMsg, { parse_mode: 'MarkdownV2' }); // <-- Добавляем parse_mode
         successCount++;
         console.log(`Отправлено пользователю chat_id: ${c.chat_id}`);
       } catch (err) {
@@ -1495,10 +1495,8 @@ if (adminWaitingBroadcast.has(username)) {
     await Promise.all(tasks);
 
     // Отправляем отчёт админу
-    await bot.sendMessage(
-      ADMIN_ID,
-      `Рассылка завершена\nУспешно отправлено: ${successCount} из ${allClients.length}`
-    );
+    const safeReport = escapeMarkdownV2(`Рассылка завершена\nУспешно отправлено: ${successCount} из ${allClients.length}`);
+    await bot.sendMessage(ADMIN_ID, safeReport, { parse_mode: 'MarkdownV2' });
 
     // Сбрасываем ожидание текста рассылки
     adminWaitingBroadcast.delete(username);
@@ -1506,7 +1504,7 @@ if (adminWaitingBroadcast.has(username)) {
 
   } catch (err) {
     console.error(`Ошибка при рассылке от @${username}:`, err.message);
-    await bot.sendMessage(ADMIN_ID, `Ошибка при рассылке: ${err.message}`);
+    await bot.sendMessage(ADMIN_ID, `Ошибка при рассылке: ${escapeMarkdownV2(err.message)}`, { parse_mode: 'MarkdownV2' });
   }
 
   return;
