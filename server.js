@@ -446,12 +446,11 @@ waitingReview.set(order.client_chat_id, {
   console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
 }
 
-
-
 async function sendOrUpdateOrder(order) {
-  const rows = db
-    .prepare("SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL")
-    .all();
+  // получаем список курьеров из MySQL
+  const [rows] = await db.execute(
+    "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
+  );
 
   const recipients = [
     { username: ADMIN_USERNAME, chatId: ADMIN_ID },
@@ -463,9 +462,7 @@ async function sendOrUpdateOrder(order) {
   const tasks = recipients.map(r => limit(async () => {
     if (!r.chatId) return;
 
-    const msg = getOrderMessages(order.id).find(
-      m => m.chat_id === r.chatId
-    );
+    const msg = getOrderMessages(order.id).find(m => m.chat_id === r.chatId);
 
     let kb = [];
     const text = buildOrderMessage(order);
@@ -483,11 +480,10 @@ async function sendOrUpdateOrder(order) {
           { text: "Отказаться", callback_data: `release_${order.id}` }
         ]];
       } else {
-        // этому курьеру заказ больше не показываем
         if (msg) {
           try {
             await bot.deleteMessage(r.chatId, msg.message_id);
-            clearOrderMessage(order.id, r.chatId); // только этот чат
+            clearOrderMessage(order.id, r.chatId);
           } catch {}
         }
         return;
@@ -527,7 +523,6 @@ async function sendOrUpdateOrder(order) {
 
   await Promise.all(tasks);
 }
-
 
 
 
