@@ -170,24 +170,38 @@ async function getClient(username) {
 }
 
 // ================= Заказы =================
+// ================= Заказы =================
+
+// Вспомогательная функция для формата MySQL DATETIME
+function formatMySQLDateTime(date = new Date()) {
+  const pad = n => n.toString().padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+// Вспомогательная функция для формата MySQL DATE
+function formatMySQLDate(date = new Date()) {
+  const pad = n => n.toString().padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 async function addOrder(order) {
+  // Если нет chat_id клиента, пробуем получить по tgNick
   if (!order.client_chat_id) {
     const cleanNick = order.tgNick.replace(/^@+/, "");
     const client = await getClient(cleanNick);
     if (client?.chat_id) order.client_chat_id = client.chat_id;
   }
 
-  // Преобразуем дату в формат YYYY-MM-DD для MySQL
-  let sqlDate = null;
-  if (order.date) {
-    const parts = order.date.split('.'); // ["31", "12", "2025"]
-    if (parts.length === 3) {
-      sqlDate = `${parts[2]}-${parts[1].padStart(2,'0')}-${parts[0].padStart(2,'0')}`; // "2025-12-31"
-    }
-  }
+  // Приводим даты к формату MySQL
+  const dateValue = order.date instanceof Date 
+    ? formatMySQLDate(order.date)
+    : order.date ? order.date.split('.').reverse().join('-') : formatMySQLDate();
+
+  const createdAt = formatMySQLDateTime();
 
   await db.execute(`
-    INSERT INTO orders (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
+    INSERT INTO orders 
+      (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `, [
     order.id,
@@ -196,10 +210,10 @@ async function addOrder(order) {
     order.delivery,
     order.payment,
     order.orderText,
-    sqlDate, // исправленная дата
+    dateValue,
     order.time,
     order.status || "new",
-    new Date().toISOString(),
+    createdAt,
     order.client_chat_id || null
   ]);
 }
@@ -210,8 +224,7 @@ async function getOrderById(id) {
 }
 
 async function updateOrderStatus(id, status, courier_username = null) {
-  const now = new Date().toISOString();
-
+  const now = formatMySQLDateTime();
   if (status === "taken") {
     await db.execute(
       "UPDATE orders SET status=?, courier_username=?, taken_at=? WHERE id=?",
@@ -232,16 +245,13 @@ async function updateOrderStatus(id, status, courier_username = null) {
 
 async function takeOrderAtomic(orderId, username) {
   if (!username) return false;
-  const now = new Date().toISOString();
-
+  const now = formatMySQLDateTime();
   const [res] = await db.execute(
     "UPDATE orders SET status='taken', courier_username=?, taken_at=? WHERE id=? AND status='new'",
     [username, now, orderId]
   );
-
   return res.affectedRows === 1;
 }
-
 
 // ================= Order Messages =================
 async function getOrderMessages(orderId) {
