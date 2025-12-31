@@ -336,16 +336,10 @@ async function restoreOrdersForClients() {
 
     console.log(`[INFO] Клиент @${client.username} имеет ${orders.length} заказов`);
 
-    // массив задач для p-limit
     const tasks = orders.map(order =>
       limit(async () => {
         try {
-          let text = buildOrderMessage(order);
-
-          if (typeof text !== "string") text = "";
-          // Экранируем все спецсимволы MarkdownV2
-          text = escapeMarkdownV2(text);
-
+          const text = buildOrderMessage(order); // данные уже экранированы внутри функции
           await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
           console.log(`[INFO] Отправлен заказ №${order.id} клиенту @${client.username}`);
         } catch (err) {
@@ -354,12 +348,12 @@ async function restoreOrdersForClients() {
       })
     );
 
-    // ждём завершения всех задач для клиента
     await Promise.all(tasks);
   }
 
   console.log("[INFO] Восстановление заказов для клиентов завершено");
 }
+
 
 // =================== Восстановление заказов для курьеров ===================
 async function restoreOrdersForCouriers() {
@@ -371,17 +365,11 @@ async function restoreOrdersForCouriers() {
   const tasks = orders.map(order =>
     limit(async () => {
       try {
-        // Проверяем, нет ли сообщений для этого заказа
         const messages = await getOrderMessages(order.id);
         if (!messages || messages.length === 0) {
           console.log(`[INFO] Восстанавливаем заказ №${order.id} для курьеров`);
-
-          // Строим текст и экранируем спецсимволы
-          let text = buildOrderMessage(order);
-          if (typeof text !== "string") text = "";
-          text = escapeMarkdownV2(text);
-
-          await sendOrUpdateOrder(order, text); // передаем экранированный текст в функцию уведомления
+          const text = buildOrderMessage(order); // данные уже экранированы
+          await sendOrUpdateOrder(order, text); // передаём текст напрямую
         }
       } catch (err) {
         console.error(`[ERROR] Ошибка восстановления заказа №${order.id}:`, err.message);
@@ -392,6 +380,7 @@ async function restoreOrdersForCouriers() {
   await Promise.all(tasks);
   console.log("[INFO] Восстановление заказов для курьеров завершено");
 }
+
 
 
 // ==================== Основной блок ====================
@@ -510,7 +499,8 @@ waitingReview.set(order.client_chat_id, {
 
   console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
 }
-async function sendOrUpdateOrder(order) {
+
+async function sendOrUpdateOrder(order, text = null) {
   console.log(`[INFO] Начало отправки/обновления заказа №${order.id}, статус: ${order.status}`);
 
   const [rows] = await db.execute(
@@ -519,88 +509,50 @@ async function sendOrUpdateOrder(order) {
 
   const recipients = [];
 
-  // ✅ Админ
   if (ADMIN_ID && ADMIN_USERNAME) {
     recipients.push({ username: ADMIN_USERNAME, chatId: ADMIN_ID });
   } else {
-    console.warn(`[WARN] ADMIN_ID или ADMIN_USERNAME не задан. Сообщения админу не будут отправлены`);
+    console.warn(`[WARN] ADMIN_ID или ADMIN_USERNAME не задан`);
   }
 
-  // ✅ Курьеры
   recipients.push(...rows.map(r => ({ username: r.username, chatId: r.chat_id })));
 
-  // ✅ Клиент
   if (order.client_chat_id) {
     recipients.push({ username: order.tgNick.replace(/^@/, ""), chatId: order.client_chat_id });
   }
 
   console.log(`[DEBUG] Получатели заказа №${order.id}:`, recipients.map(r => r.username));
 
-  const limit = pLimit(5); // лимит параллельных операций
+  const limit = pLimit(5);
 
   const tasks = recipients.map(r =>
     limit(async () => {
-      if (!r.chatId) {
-        console.warn(`[WARN] У пользователя @${r.username} отсутствует chatId, пропускаем`);
-        return;
-      }
+      if (!r.chatId) return;
 
       const messages = await getOrderMessages(order.id) || [];
       const msg = messages.find(m => m.chat_id === r.chatId);
 
-      let kb = [];
-      // Экранируем текст для MarkdownV2
-      const text = escapeMarkdownV2(buildOrderMessage(order));
-
-      // Кнопки в зависимости от статуса
-      if (order.status === "new") {
-        kb = [[{ text: "Взять заказ", callback_data: `take_${order.id}` }]];
-      } else if (order.status === "taken") {
-        if (order.courier_username === r.username || r.chatId === ADMIN_ID) {
-          kb = [[
-            { text: "Доставлен", callback_data: `delivered_${order.id}` },
-            { text: "Отказаться", callback_data: `release_${order.id}` }
-          ]];
-        } else {
-          // курьеру заказ больше не показываем
-          if (msg) {
-            try {
-              console.log(`[INFO] Удаляем старое сообщение заказа №${order.id} у @${r.username}`);
-              await bot.deleteMessage(r.chatId, msg.message_id);
-              await clearOrderMessage(order.id, r.chatId);
-            } catch (err) {
-              console.error(`[ERROR] Не удалось удалить сообщение заказа №${order.id} у @${r.username}:`, err.message);
-            }
-          }
-          return;
-        }
-      } else if (order.status === "delivered") {
-        kb = [];
-      }
+      const kb = [];
+      const msgText = text || buildOrderMessage(order); // если текст передан, используем его
 
       try {
         if (msg) {
-          console.log(`[INFO] Обновляем сообщение заказа №${order.id} для @${r.username}`);
-          await bot.editMessageText(text, {
+          await bot.editMessageText(msgText, {
             chat_id: r.chatId,
             message_id: msg.message_id,
             parse_mode: "MarkdownV2",
             reply_markup: kb.length ? { inline_keyboard: kb } : undefined
           });
         } else {
-          console.log(`[INFO] Отправляем новое сообщение заказа №${order.id} для @${r.username}`);
-          const sent = await bot.sendMessage(r.chatId, text, {
+          const sent = await bot.sendMessage(r.chatId, msgText, {
             parse_mode: "MarkdownV2",
             reply_markup: kb.length ? { inline_keyboard: kb } : undefined
           });
           await saveOrderMessage(order.id, r.chatId, sent.message_id);
         }
-        console.log(`[SUCCESS] Сообщение заказа №${order.id} отправлено/обновлено для @${r.username}`);
       } catch (err) {
-        if (
-          !err.message.includes("message is not modified") &&
-          !err.message.includes("chat not found")
-        ) {
+        if (!err.message.includes("message is not modified") &&
+            !err.message.includes("chat not found")) {
           console.error(`[ERROR] Ошибка отправки/обновления заказа №${order.id} для @${r.username}:`, err.message);
         }
       }
@@ -608,7 +560,6 @@ async function sendOrUpdateOrder(order) {
   );
 
   await Promise.all(tasks);
-
   console.log(`[INFO] Завершена отправка/обновление заказа №${order.id}`);
 }
 
