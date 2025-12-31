@@ -171,7 +171,7 @@ async function getClient(username) {
 
 // ================= Заказы =================
 // ================= Заказы =================
-
+ы
 // Вспомогательная функция для формата MySQL DATETIME
 function formatMySQLDateTime(date = new Date()) {
   const pad = n => n.toString().padStart(2, '0');
@@ -184,6 +184,7 @@ function formatMySQLDate(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
+// ================= Заказы =================
 async function addOrder(order) {
   // Если нет chat_id клиента, пробуем получить по tgNick
   if (!order.client_chat_id) {
@@ -192,56 +193,69 @@ async function addOrder(order) {
     if (client?.chat_id) order.client_chat_id = client.chat_id;
   }
 
-  // Приводим даты к формату MySQL
-  const dateValue = order.date instanceof Date 
-    ? formatMySQLDate(order.date)
-    : order.date ? order.date.split('.').reverse().join('-') : formatMySQLDate();
+  const now = new Date();
+  const mysqlDate = order.date ? order.date : formatMySQLDate(now); // DATE
+  const mysqlTime = order.time ? order.time : `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`; // TIME
+  const createdAt = formatMySQLDateTime(now); // DATETIME
 
-  const createdAt = formatMySQLDateTime();
-
-  await db.execute(`
-    INSERT INTO orders 
+  await db.execute(
+    `
+    INSERT INTO orders
       (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `, [
-    order.id,
-    order.tgNick,
-    order.city,
-    order.delivery,
-    order.payment,
-    order.orderText,
-    dateValue,
-    order.time,
-    order.status || "new",
-    createdAt,
-    order.client_chat_id || null
-  ]);
+    `,
+    [
+      order.id,
+      order.tgNick,
+      order.city,
+      order.delivery,
+      order.payment,
+      order.orderText,
+      mysqlDate,
+      mysqlTime,
+      order.status || "new",
+      createdAt,
+      order.client_chat_id || null
+    ]
+  );
 }
+
 
 async function getOrderById(id) {
   const [rows] = await db.execute("SELECT * FROM orders WHERE id=?", [id]);
   return rows[0];
 }
-
 async function updateOrderStatus(id, status, courier_username = null) {
   const now = formatMySQLDateTime();
-  if (status === "taken") {
-    await db.execute(
-      "UPDATE orders SET status=?, courier_username=?, taken_at=? WHERE id=?",
-      [status, courier_username, now, id]
-    );
-  } else if (status === "delivered") {
-    await db.execute(
-      "UPDATE orders SET status=?, delivered_at=?, courier_username=? WHERE id=?",
-      [status, now, courier_username, id]
-    );
-  } else if (status === "new") {
-    await db.execute(
-      "UPDATE orders SET status=?, courier_username=NULL, taken_at=NULL WHERE id=?",
-      [status, id]
-    );
+
+  switch (status) {
+    case "taken":
+      await db.execute(
+        "UPDATE orders SET status = ?, courier_username = ?, taken_at = ? WHERE id = ?",
+        [status, courier_username, now, id]
+      );
+      break;
+
+    case "delivered":
+      await db.execute(
+        "UPDATE orders SET status = ?, delivered_at = ?, courier_username = ? WHERE id = ?",
+        [status, now, courier_username, id]
+      );
+      break;
+
+    case "new":
+      await db.execute(
+        "UPDATE orders SET status = ?, courier_username = NULL, taken_at = NULL, delivered_at = NULL WHERE id = ?",
+        [status, id]
+      );
+      break;
+
+    default:
+      throw new Error(`Unknown status: ${status}`);
   }
 }
+
+
 
 async function takeOrderAtomic(orderId, username) {
   if (!username) return false;
@@ -462,10 +476,13 @@ async function sendOrUpdateOrder(order) {
   const tasks = recipients.map(r => limit(async () => {
     if (!r.chatId) return;
 
-    const msg = getOrderMessages(order.id).find(m => m.chat_id === r.chatId);
+    // защитная проверка: getOrderMessages должен вернуть массив
+    const messages = getOrderMessages(order.id);
+    const msgArray = Array.isArray(messages) ? messages : [];
+    const msg = msgArray.find(m => m.chat_id === r.chatId);
 
     let kb = [];
-    const text = buildOrderMessage(order);
+    const text = buildOrderMessage(order); // убедиться, что это строка
 
     // ===== NEW =====
     if (order.status === "new") {
@@ -480,6 +497,7 @@ async function sendOrUpdateOrder(order) {
           { text: "Отказаться", callback_data: `release_${order.id}` }
         ]];
       } else {
+        // этому курьеру заказ больше не показываем
         if (msg) {
           try {
             await bot.deleteMessage(r.chatId, msg.message_id);
@@ -675,12 +693,11 @@ if (data.startsWith("delivered_")) {
     });
   }
 
-  //  обновляем статус
-  updateOrderStatus(orderId, "delivered", order.courier_username);
+// обновляем статус
+await updateOrderStatus(orderId, "delivered", order.courier_username);
 
-
+// получаем уже обновлённый заказ
 const updatedOrder = await getOrderById(orderId);
-
 
   //  обновляем сообщения всем участникам
   await sendOrUpdateOrder(updatedOrder);
