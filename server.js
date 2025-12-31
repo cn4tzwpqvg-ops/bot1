@@ -7,6 +7,9 @@ const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
 
+// ================= Новая функция: рассылка и обновление с лимитом =================
+const pLimit = require("p-limit").default; // убедиться, что установлен npm install p-limit
+
 
 
 // ================= Настройки =================
@@ -217,8 +220,6 @@ async function clearOrderMessage(orderId, chatId) {
   await db.execute("DELETE FROM order_messages WHERE order_id=? AND chat_id=?", [orderId, chatId]);
 }
 
-// ================= Восстановление заказов =================
-const pLimit = require("p-limit").default; // npm install p-limit
 
 async function restoreOrdersForClients() {
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
@@ -395,10 +396,6 @@ waitingReview.set(order.client_chat_id, {
 }
 
 
-
-
-// ================= Новая функция: рассылка и обновление с лимитом =================
-const pLimit = require("p-limit").default; // убедиться, что установлен npm install p-limit
 
 async function sendOrUpdateOrder(order) {
   const rows = db
