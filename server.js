@@ -171,22 +171,36 @@ async function getClient(username) {
 
 // ================= Заказы =================
 // ================= Заказы =================
+// ================= Вспомогательные функции =================
 
-// Вспомогательная функция для формата MySQL DATETIME
+// Преобразует дату в формат MySQL DATETIME: YYYY-MM-DD HH:MM:SS
 function formatMySQLDateTime(date = new Date()) {
   const pad = n => n.toString().padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+         `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-// Вспомогательная функция для формата MySQL DATE
+// Преобразует дату в формат MySQL DATE: YYYY-MM-DD
 function formatMySQLDate(date = new Date()) {
   const pad = n => n.toString().padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
+// Парсинг даты из dd.mm.yyyy в MySQL формат
+function parseDateForMySQL(dateStr) {
+  if (!dateStr) return formatMySQLDate(new Date());
+  const parts = dateStr.split('.');
+  if (parts.length === 3) {
+    const [day, month, year] = parts;
+    return `${year}-${month.padStart(2,'0')}-${day.padStart(2,'0')}`;
+  }
+  return dateStr; // если уже в формате YYYY-MM-DD
+}
+
 // ================= Заказы =================
+
 async function addOrder(order) {
-  // Если нет chat_id клиента, пробуем получить по tgNick
+  // Получаем chat_id клиента по tgNick, если отсутствует
   if (!order.client_chat_id) {
     const cleanNick = order.tgNick.replace(/^@+/, "");
     const client = await getClient(cleanNick);
@@ -194,9 +208,9 @@ async function addOrder(order) {
   }
 
   const now = new Date();
-  const mysqlDate = order.date ? order.date : formatMySQLDate(now); // DATE
-  const mysqlTime = order.time ? order.time : `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`; // TIME
-  const createdAt = formatMySQLDateTime(now); // DATETIME
+  const mysqlDate = order.date ? parseDateForMySQL(order.date) : formatMySQLDate(now);
+  const mysqlTime = order.time ? order.time : `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`;
+  const createdAt = formatMySQLDateTime(now);
 
   await db.execute(
     `
@@ -218,13 +232,17 @@ async function addOrder(order) {
       order.client_chat_id || null
     ]
   );
-}
 
+  // Автоматическая отправка уведомлений в Telegram
+  const updatedOrder = await getOrderById(order.id);
+  await sendOrUpdateOrder(updatedOrder);
+}
 
 async function getOrderById(id) {
   const [rows] = await db.execute("SELECT * FROM orders WHERE id=?", [id]);
   return rows[0];
 }
+
 async function updateOrderStatus(id, status, courier_username = null) {
   const now = formatMySQLDateTime();
 
@@ -255,9 +273,6 @@ async function updateOrderStatus(id, status, courier_username = null) {
   }
 }
 
-
-
-
 async function takeOrderAtomic(orderId, username) {
   if (!username) return false;
   const now = formatMySQLDateTime();
@@ -267,6 +282,7 @@ async function takeOrderAtomic(orderId, username) {
   );
   return res.affectedRows === 1;
 }
+
 
 // ================= Order Messages =================
 async function getOrderMessages(orderId) {
