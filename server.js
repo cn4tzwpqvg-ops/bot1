@@ -549,7 +549,8 @@ async function sendOrUpdateOrder(order) {
       const msg = messages.find(m => m.chat_id === r.chatId);
 
       let kb = [];
-      const text = buildOrderMessage(order);
+      // Экранируем текст для MarkdownV2
+      const text = escapeMarkdownV2(buildOrderMessage(order));
 
       // Кнопки в зависимости от статуса
       if (order.status === "new") {
@@ -610,7 +611,6 @@ async function sendOrUpdateOrder(order) {
 
   console.log(`[INFO] Завершена отправка/обновление заказа №${order.id}`);
 }
-
 
 
 // ================= Telegram: callback =================
@@ -1471,7 +1471,7 @@ if (text === "Рассылка" && id === ADMIN_ID) {
   adminWaitingBroadcast.set(username, true); // <-- устанавливаем флаг ожидания
   return bot.sendMessage(id, "Введите текст для рассылки всем подписанным клиентам:");
 }
-
+ы
 
 
 // ===== Рассылка с лимитом =====
