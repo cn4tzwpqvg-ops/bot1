@@ -283,7 +283,6 @@ async function takeOrderAtomic(orderId, username) {
   return res.affectedRows === 1;
 }
 
-
 // ================= Order Messages =================
 async function getOrderMessages(orderId) {
   const [rows] = await db.execute("SELECT * FROM order_messages WHERE order_id=?", [orderId]);
@@ -323,7 +322,15 @@ async function restoreOrdersForClients() {
     const tasks = orders.map(order =>
       limit(async () => {
         try {
-          const text = String(buildOrderMessage(order)); // гарантируем строку
+          // строим сообщение
+          let text = buildOrderMessage(order);
+
+          // гарантируем, что это строка
+          if (typeof text !== "string") text = "";
+
+          // безопасно экранируем MarkdownV2
+          text = escapeMarkdownV2(text);
+
           await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
         } catch (err) {
           console.error(`Ошибка восстановления заказа №${order.id} для @${client.username}:`, err.message);
@@ -362,16 +369,14 @@ async function restoreOrdersForCouriers() {
   console.log("Восстановление заказов для курьеров завершено");
 }
 
-
-
 // ==================== Основной блок ====================
 (async function main() {
   await initDB();
   COURIERS = await getCouriers();
   await addCourier(ADMIN_USERNAME, ADMIN_ID);
 
-  await restoreOrdersForClients();   // уже переписана с ограничением
-  await restoreOrdersForCouriers();  // теперь тоже безопасно
+  await restoreOrdersForClients();   // безопасно
+  await restoreOrdersForCouriers();  // безопасно
 
   bot.startPolling();
   console.log("Бот и сервер запущены");
@@ -393,11 +398,15 @@ async function releaseOrderTx(orderId) {
 }
 
 
+
 // ================= Markdown =================
-function escapeMarkdownV2(text) { if (!text) return ""; return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1"); }
+function escapeMarkdownV2(text) {
+  if (text == null) return ""; // заменяем null/undefined на пустую строку
+  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
 
 // ================= Построение сообщения =================
-const deliveryMap = {"DHL": "DHL", "Курьер": "Курьер" };
+const deliveryMap = { "DHL": "DHL", "Курьер": "Курьер" };
 const paymentMap = {
   "Наличные": "Наличные",
   "Карта": "Банковская карта",
@@ -405,8 +414,7 @@ const paymentMap = {
 };
 
 function buildOrderMessage(order) {
-const courierName = order.courier_username || null;
-
+  const courierName = order.courier_username || null;
 
   const courierText = courierName
     ? `\nКурьер: ${escapeMarkdownV2(courierName)}`
@@ -420,25 +428,22 @@ const courierName = order.courier_username || null;
       : "Доставлен";
 
   return [
-    ` *Заказ №${escapeMarkdownV2(order.id)}*`,
+    `*Заказ №${escapeMarkdownV2(order.id)}*`,
     ``,
-    ` *Клиент:* ${escapeMarkdownV2(order.tgNick)}`,
-    ` *Город:* ${escapeMarkdownV2(order.city || "—")}`,
-    ` *Доставка:* ${escapeMarkdownV2(
-      deliveryMap[order.delivery] || order.delivery || "—"
-    )}`,
-    ` *Оплата:* ${escapeMarkdownV2(
-      paymentMap[order.payment] || order.payment || "—"
-    )}`,
-    ` *Дата:* ${escapeMarkdownV2(order.date || "—")}`,
-    ` *Время:* ${escapeMarkdownV2(order.time || "—")}`,
+    `*Клиент:* ${escapeMarkdownV2(order.tgNick)}`,
+    `*Город:* ${escapeMarkdownV2(order.city || "—")}`,
+    `*Доставка:* ${escapeMarkdownV2(deliveryMap[order.delivery] || order.delivery || "—")}`,
+    `*Оплата:* ${escapeMarkdownV2(paymentMap[order.payment] || order.payment || "—")}`,
+    `*Дата:* ${escapeMarkdownV2(order.date || "—")}`,
+    `*Время:* ${escapeMarkdownV2(order.time || "—")}`,
     ``,
-    ` *Состав заказа:*`,
-    `${escapeMarkdownV2(order.orderText)}`,
+    `*Состав заказа:*`,
+    `${escapeMarkdownV2(order.orderText || "")}`,
     ``,
     `Статус: *${escapeMarkdownV2(statusText)}*${courierText}`
   ].join("\n");
 }
+
 
 async function askForReview(order) {
   // 1️⃣ Проверка: есть ли chat_id клиента
@@ -486,9 +491,7 @@ waitingReview.set(order.client_chat_id, {
   );
 
   console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
-}
-async function sendOrUpdateOrder(order) {
-  // Получаем список курьеров из MySQL
+}async function sendOrUpdateOrder(order) {
   const [rows] = await db.execute(
     "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
   );
@@ -498,46 +501,38 @@ async function sendOrUpdateOrder(order) {
     ...rows.map(r => ({ username: r.username, chatId: r.chat_id }))
   ];
 
-  const limit = pLimit(5); // максимум 5 одновременных операций
+  const limit = pLimit(5);
 
   const tasks = recipients.map(r =>
     limit(async () => {
       if (!r.chatId) return;
 
-      // ✅ всегда массив
       const messages = await getOrderMessages(order.id) || [];
       const msg = messages.find(m => m.chat_id === r.chatId);
 
       let kb = [];
-      const text = buildOrderMessage(order);
+      const text = buildOrderMessage(order); // безопасно
 
-      // ===== NEW =====
       if (order.status === "new") {
         kb = [[{ text: "Взять заказ", callback_data: `take_${order.id}` }]];
-      }
-
-      // ===== TAKEN =====
-      else if (order.status === "taken") {
+      } else if (order.status === "taken") {
         if (order.courier_username === r.username || r.chatId === ADMIN_ID) {
           kb = [[
             { text: "Доставлен", callback_data: `delivered_${order.id}` },
             { text: "Отказаться", callback_data: `release_${order.id}` }
           ]];
         } else {
-          // этому курьеру заказ больше не показываем
+          // курьеру заказ не показываем
           if (msg) {
             try {
               await bot.deleteMessage(r.chatId, msg.message_id);
-              clearOrderMessage(order.id, r.chatId); // только этот чат
+              await clearOrderMessage(order.id, r.chatId);
             } catch {}
           }
           return;
         }
-      }
-
-      // ===== DELIVERED =====
-      else if (order.status === "delivered") {
-        kb = []; // без кнопок
+      } else if (order.status === "delivered") {
+        kb = [];
       }
 
       try {
@@ -553,8 +548,7 @@ async function sendOrUpdateOrder(order) {
             parse_mode: "MarkdownV2",
             reply_markup: kb.length ? { inline_keyboard: kb } : undefined
           });
-
-          saveOrderMessage(order.id, r.chatId, sent.message_id);
+          await saveOrderMessage(order.id, r.chatId, sent.message_id);
         }
       } catch (err) {
         if (
@@ -572,7 +566,6 @@ async function sendOrUpdateOrder(order) {
 
   await Promise.all(tasks);
 }
-
 
 
 
@@ -1006,7 +999,7 @@ if (rows.length === 0) {
   // Получаем состояние просмотра: "active" или "done"
   const state = adminWaitingOrdersCourier.get(username);
   const showDone = state.type === "done";
-
+  
 // Получаем заказы в зависимости от типа
 const query = showDone
   ? "SELECT * FROM orders WHERE status='delivered' AND courier_username=?"
@@ -1014,22 +1007,39 @@ const query = showDone
 
 const [orders] = await db.execute(query, [selectedCourier]);
 
-if (orders.length === 0) {
+if (!orders || orders.length === 0) {
   return bot.sendMessage(
     id,
     `Курьер @${selectedCourier} пока не имеет ${showDone ? "выполненных" : "активных"} заказов`
   );
 }
 
-  // Отправка заказов параллельно
-  await bot.sendMessage(id, `${showDone ? "Выполненные" : "Активные"} заказы курьера @${selectedCourier}:`);
-  await Promise.all(orders.map(async (o) => {
+// Отправка заголовка
+await bot.sendMessage(
+  id,
+  `${showDone ? "Выполненные" : "Активные"} заказы курьера @${selectedCourier}:`
+);
+
+// Отправка заказов параллельно с гарантией строк
+await Promise.all(
+  orders.map(async (o) => {
+    // Приводим все важные поля к строкам
+    o.orderText = o.orderText || "—";
+    o.tgNick = o.tgNick || "—";
+    o.city = o.city || "—";
+    o.delivery = o.delivery || "—";
+    o.payment = o.payment || "—";
+    o.date = o.date || "—";
+    o.time = o.time || "—";
+
     try {
-      await bot.sendMessage(id, buildOrderMessage(o), { parse_mode: "MarkdownV2" });
+      const text = String(buildOrderMessage(o)); // гарантируем строку
+      await bot.sendMessage(id, text, { parse_mode: "MarkdownV2" });
     } catch (err) {
-      console.error(`Ошибка отправки заказа №${o.id} @${username}:`, err.message);
+      console.error(`Ошибка отправки заказа №${o.id} @${selectedCourier}:`, err.message);
     }
-  }));
+  })
+);
 
   // Состояние оставляем, чтобы админ мог выбрать следующего курьера
   return;
@@ -1487,46 +1497,56 @@ if (orders.length === 0) {
   );
 }
 
-  // Отправляем все заказы
-  await Promise.all(
-    orders.map(async (o) => {
-      console.log(`Отправляем заказ №${o.id} курьеру @${username}`);
+ // Отправляем все заказы
+await Promise.all(
+  orders.map(async (o) => {
+    console.log(`Отправляем заказ №${o.id} курьеру @${username}`);
 
-      let inlineKeyboard = [];
+    // Приводим все ключевые поля к строке, чтобы escapeMarkdownV2 не падал
+    o.orderText = o.orderText || "—";
+    o.tgNick = o.tgNick || "—";
+    o.city = o.city || "—";
+    o.delivery = o.delivery || "—";
+    o.payment = o.payment || "—";
+    o.date = o.date || "—";
+    o.time = o.time || "—";
 
-      if (isActive) {
-        if (o.status === "new") {
-          inlineKeyboard = [
-            [{ text: "Взять заказ", callback_data: `take_${o.id}` }]
-          ];
-        } else if (o.status === "taken") {
-          inlineKeyboard = [[
-            { text: "Доставлен", callback_data: `delivered_${o.id}` },
-            { text: "Отказаться", callback_data: `release_${o.id}` }
-          ]];
-        }
+    let inlineKeyboard = [];
+
+    if (isActive) {
+      if (o.status === "new") {
+        inlineKeyboard = [
+          [{ text: "Взять заказ", callback_data: `take_${o.id}` }]
+        ];
+      } else if (o.status === "taken") {
+        inlineKeyboard = [[
+          { text: "Доставлен", callback_data: `delivered_${o.id}` },
+          { text: "Отказаться", callback_data: `release_${o.id}` }
+        ]];
       }
+    }
 
-      try {
-        await bot.sendMessage(id, buildOrderMessage(o), {
-          parse_mode: "MarkdownV2",
-          reply_markup: inlineKeyboard.length
-            ? { inline_keyboard: inlineKeyboard }
-            : undefined
-        });
-      } catch (err) {
-        console.error(
-          `Ошибка отправки заказа №${o.id} курьеру @${username}:`,
-          err.message
-        );
-      }
-    })
-  );
+    try {
+      const text = String(buildOrderMessage(o)); // гарантируем строку
+      await bot.sendMessage(id, text, {
+        parse_mode: "MarkdownV2",
+        reply_markup: inlineKeyboard.length
+          ? { inline_keyboard: inlineKeyboard }
+          : undefined
+      });
+    } catch (err) {
+      console.error(
+        `Ошибка отправки заказа №${o.id} курьеру @${username}:`,
+        err.message
+      );
+    }
+  })
+);
 
-  console.log(
-    ` Все ${isActive ? "активные" : "выполненные"} заказы отправлены курьеру @${username}`
-  );
-  return;
+console.log(
+  `Все ${isActive ? "активные" : "выполненные"} заказы отправлены курьеру @${username}`
+);
+return;
 }
 });
 
