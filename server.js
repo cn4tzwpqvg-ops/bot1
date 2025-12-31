@@ -218,8 +218,7 @@ async function clearOrderMessage(orderId, chatId) {
 }
 
 // ================= Восстановление заказов =================
-const pLimit = require("p-limit").default;
- // npm install p-limit
+const pLimit = require("p-limit").default; // npm install p-limit
 
 async function restoreOrdersForClients() {
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
@@ -227,52 +226,49 @@ async function restoreOrdersForClients() {
   const limit = pLimit(5); // максимум 5 одновременных сообщений
 
   for (const client of clients) {
-    const [orders] = await db.execute(`
+    const [orders] = await db.execute(
+      `
       SELECT *
       FROM orders
       WHERE REPLACE(tgNick,'@','') = ?
       AND status IN ('new','taken')
       ORDER BY created_at DESC
-    `, [client.username]);
+      `,
+      [client.username]
+    );
 
-    // формируем массив функций для ограниченной параллели
-    const tasks = orders.map(order =>
-      limit(async () => {
+    for (const order of orders) {
+      await limit(async () => {
         try {
           await bot.sendMessage(client.chat_id, buildOrderMessage(order), { parse_mode: "MarkdownV2" });
         } catch (err) {
           console.error(`Ошибка восстановления заказа №${order.id} для @${client.username}:`, err.message);
         }
-      })
-    );
-
-    // ждём завершения всех задач для текущего клиента
-    await Promise.all(tasks);
+      });
+    }
   }
 
   console.log("Восстановление заказов для клиентов завершено");
 }
-
 
 async function restoreOrdersForCouriers() {
   const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken')");
 
   const limit = pLimit(5); // максимум 5 одновременных операций
 
-  const tasks = orders.map(order =>
-    limit(async () => {
+  for (const order of orders) {
+    await limit(async () => {
       try {
         await sendOrUpdateOrder(order);
       } catch (err) {
         console.error(`Ошибка восстановления заказа №${order.id}:`, err.message);
       }
-    })
-  );
-
-  await Promise.all(tasks);
+    });
+  }
 
   console.log("Восстановление заказов для курьеров завершено");
 }
+
 
 // ==================== Основной блок ====================
 (async function main() {
@@ -401,7 +397,9 @@ waitingReview.set(order.client_chat_id, {
 
 
 
-// ================= Новая функция: рассылка и обновление =================
+// ================= Новая функция: рассылка и обновление с лимитом =================
+const pLimit = require("p-limit").default; // убедиться, что установлен npm install p-limit
+
 async function sendOrUpdateOrder(order) {
   const rows = db
     .prepare("SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL")
@@ -412,8 +410,10 @@ async function sendOrUpdateOrder(order) {
     ...rows.map(r => ({ username: r.username, chatId: r.chat_id }))
   ];
 
-  for (const r of recipients) {
-    if (!r.chatId) continue;
+  const limit = pLimit(5); // максимум 5 одновременных операций
+
+  const tasks = recipients.map(r => limit(async () => {
+    if (!r.chatId) return;
 
     const msg = getOrderMessages(order.id).find(
       m => m.chat_id === r.chatId
@@ -435,14 +435,14 @@ async function sendOrUpdateOrder(order) {
           { text: "Отказаться", callback_data: `release_${order.id}` }
         ]];
       } else {
-        //  этому курьеру заказ больше не показываем
+        // этому курьеру заказ больше не показываем
         if (msg) {
           try {
             await bot.deleteMessage(r.chatId, msg.message_id);
-            clearOrderMessage(order.id, r.chatId); // ТОЛЬКО ЭТОТ ЧАТ
+            clearOrderMessage(order.id, r.chatId); // только этот чат
           } catch {}
         }
-        continue;
+        return;
       }
     }
 
@@ -468,16 +468,17 @@ async function sendOrUpdateOrder(order) {
         saveOrderMessage(order.id, r.chatId, sent.message_id);
       }
     } catch (err) {
-  if (
-    !err.message.includes("message is not modified") &&
-    !err.message.includes("chat not found")
-  ) {
-    console.error(`Ошибка sendOrUpdateOrder: заказ ${order.id}, chat_id ${r.chatId},пользователь @${r.username}`, err.message);
-  }
-}
-  }
-}
+      if (
+        !err.message.includes("message is not modified") &&
+        !err.message.includes("chat not found")
+      ) {
+        console.error(`Ошибка sendOrUpdateOrder: заказ ${order.id}, chat_id ${r.chatId}, пользователь @${r.username}`, err.message);
+      }
+    }
+  }));
 
+  await Promise.all(tasks);
+}
 
 
 
@@ -596,7 +597,8 @@ const success = takeOrderAtomic(orderId, username);
 // ⬅️ возвращаем заказ в new (транзакция)
 releaseOrderTx(orderId);
 
-const updatedOrder = getOrderById(orderId);
+const updatedOrder = await getOrderById(orderId);
+
 
 // 🔹 обновляем сообщения
 await sendOrUpdateOrder(updatedOrder);
@@ -634,7 +636,8 @@ if (data.startsWith("delivered_")) {
   updateOrderStatus(orderId, "delivered", order.courier_username);
 
 
-  const updatedOrder = getOrderById(orderId);
+const updatedOrder = await getOrderById(orderId);
+
 
   //  обновляем сообщения всем участникам
   await sendOrUpdateOrder(updatedOrder);
@@ -963,8 +966,8 @@ if (text === "Курьеры" && id === ADMIN_ID) {
 
 
   // Добавляем или обновляем клиента
- addOrUpdateClient(username, first_name, id);
-  const client = getClient(username);
+await addOrUpdateClient(username, first_name, id);
+const client = await getClient(username);
 
  // ===== Главное меню =====
 if (text === "Назад") {
@@ -1309,14 +1312,7 @@ if (text === "Статистика" && id === ADMIN_ID) {
 }
 
 
-  // ===== Рассылка =====
-if (text === "Рассылка" && id === ADMIN_ID) {
-  await bot.sendMessage(ADMIN_ID, "Введите текст для рассылки:");
-  adminWaitingBroadcast.set(username, true);
-  console.log(`Админ @${username} начал рассылку, ожидаем текст`);
-  return;
-}
-
+ // ===== Рассылка с лимитом =====
 if (adminWaitingBroadcast.has(username)) {
   const msgText = text;
 
@@ -1328,17 +1324,19 @@ if (adminWaitingBroadcast.has(username)) {
   console.log(`Начало рассылки от @${username}, текст: "${msgText}"`);
   console.log(`Всего получателей: ${allClients.length}`);
 
+  const limit = pLimit(5); // максимум 5 одновременных сообщений
   let successCount = 0;
 
-  // Используем for...of и await, чтобы не было проблем с промисами
   for (const c of allClients) {
-    try {
-      await bot.sendMessage(c.chat_id, msgText);
-      successCount++;
-      console.log(`Отправлено пользователю chat_id: ${c.chat_id}`);
-    } catch (err) {
-      console.error(`Ошибка при отправке @${c.username} (chat_id: ${c.chat_id}):`, err.message);
-    }
+    await limit(async () => {
+      try {
+        await bot.sendMessage(c.chat_id, msgText);
+        successCount++;
+        console.log(`Отправлено пользователю chat_id: ${c.chat_id}`);
+      } catch (err) {
+        console.error(`Ошибка при отправке @${c.username} (chat_id: ${c.chat_id}):`, err.message);
+      }
+    });
   }
 
   await bot.sendMessage(
@@ -1350,6 +1348,7 @@ if (adminWaitingBroadcast.has(username)) {
   adminWaitingBroadcast.delete(username);
   return;
 }
+
 
 
  // ===== Панель курьера =====
@@ -1454,13 +1453,16 @@ function broadcastStock() {
 }
 
 // ================= Генерация ID заказа =================
-function generateOrderId() {
+async function generateOrderId() {
   let id;
+  let exists;
   do {
     id = String(Math.floor(100000 + Math.random() * 900000));
-  } while (getOrderById(id)); // на всякий случай, чтобы не было дубликата
+    exists = await getOrderById(id);
+  } while (exists);
   return id;
 }
+
 
 // ================= API: отправка заказа =================
 app.post("/api/send-order", async (req, res) => {
@@ -1475,8 +1477,8 @@ app.post("/api/send-order", async (req, res) => {
       return res.status(400).json({ success: false, error: "Неверные данные" });
     }
 
-    // Генерируем уникальный ID заказа
-    const id = generateOrderId();
+    // Генерируем уникальный ID заказа 
+    const id = await generateOrderId();
     console.log(`Присвоен ID заказа: ${id}`);
 
     const order = {
