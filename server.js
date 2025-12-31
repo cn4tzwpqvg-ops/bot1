@@ -170,7 +170,6 @@ async function getClient(username) {
 }
 
 // ================= Заказы =================
-// ================= Заказы =================
 // ================= Вспомогательные функции =================
 
 // Преобразует дату в формат MySQL DATETIME: YYYY-MM-DD HH:MM:SS
@@ -673,10 +672,15 @@ const order = await getOrderById(orderId);
 
   try {
     // ================== TAKE ==================
-  if (data.startsWith("take_")) {
-     console.log(`TAKE заказ ${orderId} пользователем @${username}`);
-  if (!isCourier(username) && fromId !== ADMIN_ID) {
-     console.log(`Пользователь @${username} не курьер`);
+if (data.startsWith("take_")) {
+  const orderId = data.split("_")[1];
+
+  console.log(`TAKE заказ ${orderId} пользователем @${username}`);
+
+  // ⛔️ БЫЛО: if (!isCourier(username) && fromId !== ADMIN_ID)
+  // ✅ ДОЛЖНО: дождаться результата функции
+  if (!(await isCourier(username)) && fromId !== ADMIN_ID) {
+    console.log(`Пользователь @${username} не курьер`);
     return bot.answerCallbackQuery(q.id, {
       text: "Только курьеры",
       show_alert: true
@@ -1460,23 +1464,24 @@ if (text === "Статистика" && id === ADMIN_ID) {
 }
 
 
- // ===== Рассылка с лимитом =====
+// ===== Рассылка с лимитом =====
 if (adminWaitingBroadcast.has(username)) {
   const msgText = text;
 
-  // Получаем всех подписанных клиентов из MySQL
-  const [allClients] = await db.execute(
-    "SELECT chat_id, username FROM clients WHERE subscribed=1 AND chat_id IS NOT NULL"
-  );
+  try {
+    // Получаем всех подписанных клиентов из MySQL
+    const [allClients] = await db.execute(
+      "SELECT chat_id, username FROM clients WHERE subscribed=1 AND chat_id IS NOT NULL"
+    );
 
-  console.log(`Начало рассылки от @${username}, текст: "${msgText}"`);
-  console.log(`Всего получателей: ${allClients.length}`);
+    console.log(`Начало рассылки от @${username}, текст: "${msgText}"`);
+    console.log(`Всего получателей: ${allClients.length}`);
 
-  const limit = pLimit(5); // максимум 5 одновременных сообщений
-  let successCount = 0;
+    const limit = pLimit(5); // максимум 5 одновременных сообщений
+    let successCount = 0;
 
-  for (const c of allClients) {
-    await limit(async () => {
+    // Создаём задачи для параллельной отправки
+    const tasks = allClients.map(c => limit(async () => {
       try {
         await bot.sendMessage(c.chat_id, msgText);
         successCount++;
@@ -1484,16 +1489,26 @@ if (adminWaitingBroadcast.has(username)) {
       } catch (err) {
         console.error(`Ошибка при отправке @${c.username} (chat_id: ${c.chat_id}):`, err.message);
       }
-    });
+    }));
+
+    // Ждём завершения всех задач
+    await Promise.all(tasks);
+
+    // Отправляем отчёт админу
+    await bot.sendMessage(
+      ADMIN_ID,
+      `Рассылка завершена\nУспешно отправлено: ${successCount} из ${allClients.length}`
+    );
+
+    // Сбрасываем ожидание текста рассылки
+    adminWaitingBroadcast.delete(username);
+    console.log(`Рассылка от @${username} завершена`);
+
+  } catch (err) {
+    console.error(`Ошибка при рассылке от @${username}:`, err.message);
+    await bot.sendMessage(ADMIN_ID, `Ошибка при рассылке: ${err.message}`);
   }
 
-  await bot.sendMessage(
-    ADMIN_ID,
-    `Рассылка завершена\nУспешно отправлено: ${successCount}`
-  );
-
-  // Сбрасываем ожидание текста рассылки
-  adminWaitingBroadcast.delete(username);
   return;
 }
 
@@ -1512,11 +1527,17 @@ if (text === "Панель курьера" && (COURIERS[username] || id === ADMI
 }
 
 // ===== Активные заказы =====// ===== Заказы (Активные и Выполненные) =====
-// ===== Заказы курьера (Активные и Выполненные) =====
-console.log("DEBUG courier check:", username, isCourier(username));
+// ⛔️ БЫЛО: isCourier(username)
+// ✔️ ДОЛЖНО: await isCourier(username)
+console.log(
+  "DEBUG courier check:",
+  username,
+  await isCourier(username)
+);
+
 if (
   (text === "Активные заказы" || text === "Выполненные заказы") &&
-  isCourier(username)
+  (await isCourier(username))
 ) {
   const isActive = text === "Активные заказы";
 
@@ -1621,7 +1642,6 @@ async function generateOrderId() {
   return id;
 }
 
-
 // ================= API: отправка заказа =================
 app.post("/api/send-order", async (req, res) => {
   try {
@@ -1635,9 +1655,22 @@ app.post("/api/send-order", async (req, res) => {
       return res.status(400).json({ success: false, error: "Неверные данные" });
     }
 
-    // Генерируем уникальный ID заказа 
-    const id = await generateOrderId();
-    console.log(`Присвоен ID заказа: ${id}`);
+    // ===== Проверка существующего заказа =====
+    const [existing] = await db.execute(
+      "SELECT id FROM orders WHERE client_chat_id=? AND orderText=?",
+      [client_chat_id, orderText]
+    );
+
+    let id;
+    if (existing.length) {
+      // Если заказ уже есть — берём его ID
+      id = existing[0].id;
+      console.log(`Заказ уже существует, используем ID: ${id}`);
+    } else {
+      // Иначе генерируем новый ID
+      id = await generateOrderId();
+      console.log(`Присвоен новый ID заказа: ${id}`);
+    }
 
     const order = {
       id,
@@ -1652,9 +1685,13 @@ app.post("/api/send-order", async (req, res) => {
       client_chat_id
     };
 
-    // ===== Добавляем заказ в базу =====
-    await addOrder(order);
-    console.log(`Заказ ${id} добавлен в базу`);
+    // ===== Добавляем заказ в базу, если его ещё нет =====
+    if (!existing.length) {
+      await addOrder(order);
+      console.log(`Заказ ${id} добавлен в базу`);
+    } else {
+      console.log(`Заказ ${id} уже в базе, пропускаем добавление`);
+    }
 
     // ===== Получаем заказ из базы =====
     const updated = await getOrderById(id);
@@ -1675,28 +1712,43 @@ app.post("/api/send-order", async (req, res) => {
   }
 });
 
+
+
 // ================= Фикс зависших заказов =================
 app.post("/fix-all-new-orders", async (req, res) => {
   try {
+    // Получаем все заказы со статусом "new"
     const [orders] = await db.execute("SELECT * FROM orders WHERE status='new'");
 
-    if (orders.length === 0) return res.send("Нет новых заказов для исправления.");
+    if (orders.length === 0) {
+      console.log("Нет новых заказов для исправления.");
+      return res.send("Нет новых заказов для исправления.");
+    }
+
+    let successCount = 0;
 
     for (const order of orders) {
       try {
+        // Повторная отправка уведомлений в Telegram
         await sendOrUpdateOrder(order);
-        console.log(`Заказ #${order.id} обновлен`);
+        console.log(`Заказ #${order.id} успешно обновлен`);
+        successCount++;
       } catch (err) {
         console.error(`Ошибка при обновлении заказа #${order.id}:`, err.message);
       }
     }
 
-    res.send(`Обновлено ${orders.length} заказ(ов). Кнопки теперь должны появиться.`);
+    // Можно также отправить обновление stock после всех исправлений
+    broadcastStock();
+    console.log("WebSocket: обновлено состояние stock после фикса");
+
+    res.send(`Обновлено ${successCount} из ${orders.length} заказ(ов). Кнопки теперь должны появиться.`);
   } catch (err) {
-    console.error(err);
+    console.error("Ошибка сервера при исправлении заказов:", err);
     res.status(500).send("Ошибка сервера при исправлении заказов");
   }
 });
+
 
 
 // ================= Запуск сервера =================
