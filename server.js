@@ -213,25 +213,35 @@ async function addOrder(order) {
   const createdAt = formatMySQLDateTime(now);
 
   await db.execute(
-    `
-    INSERT INTO orders
-      (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-    [
-      order.id,
-      order.tgNick,
-      order.city,
-      order.delivery,
-      order.payment,
-      order.orderText,
-      mysqlDate,
-      mysqlTime,
-      order.status || "new",
-      createdAt,
-      order.client_chat_id || null
-    ]
-  );
+  `
+  INSERT INTO orders
+    (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON DUPLICATE KEY UPDATE
+    tgNick = VALUES(tgNick),
+    city = VALUES(city),
+    delivery = VALUES(delivery),
+    payment = VALUES(payment),
+    orderText = VALUES(orderText),
+    date = VALUES(date),
+    time = VALUES(time),
+    status = VALUES(status),
+    client_chat_id = VALUES(client_chat_id)
+  `,
+  [
+    order.id,
+    order.tgNick,
+    order.city,
+    order.delivery,
+    order.payment,
+    order.orderText,
+    mysqlDate,
+    mysqlTime,
+    order.status || "new",
+    createdAt,
+    order.client_chat_id || null
+  ]
+);
 
   // Автоматическая отправка уведомлений в Telegram
   const updatedOrder = await getOrderById(order.id);
@@ -491,7 +501,8 @@ waitingReview.set(order.client_chat_id, {
   );
 
   console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
-}async function sendOrUpdateOrder(order) {
+}
+async function sendOrUpdateOrder(order) {
   const [rows] = await db.execute(
     "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
   );
