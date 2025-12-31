@@ -312,6 +312,7 @@ async function clearOrderMessage(orderId, chatId) {
 }
 
 async function restoreOrdersForClients() {
+  console.log("[INFO] Восстановление заказов для клиентов...");
   const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
 
   const limit = pLimit(5); // максимум 5 одновременных сообщений
@@ -328,12 +329,15 @@ async function restoreOrdersForClients() {
       [client.username]
     );
 
+     console.log(`[INFO] Клиент @${client.username} имеет ${orders.length} заказов`);
+
     // формируем массив задач для p-limit
     const tasks = orders.map(order =>
       limit(async () => {
         try {
           // строим сообщение
           let text = buildOrderMessage(order);
+          console.log(`[INFO] Отправляем заказ №${order.id} клиенту @${client.username}`);
 
           // гарантируем, что это строка
           if (typeof text !== "string") text = "";
@@ -356,28 +360,32 @@ async function restoreOrdersForClients() {
 }
 
 async function restoreOrdersForCouriers() {
+  console.log("[INFO] Восстановление заказов для курьеров...");
   const [orders] = await db.execute(
     "SELECT * FROM orders WHERE status IN ('new','taken')"
   );
 
-  const limit = pLimit(5); // максимум 5 одновременных операций
+  const limit = pLimit(5);
 
-  // формируем массив функций для ограниченной параллели
   const tasks = orders.map(order =>
     limit(async () => {
       try {
-        await sendOrUpdateOrder(order);
+        // Проверяем, нет ли уже сообщений для этого заказа у курьеров
+        const messages = await getOrderMessages(order.id);
+        if (!messages || messages.length === 0) {
+        console.log(`[INFO] Восстанавливаем заказ №${order.id} для курьеров`);
+          await sendOrUpdateOrder(order);
+        }
       } catch (err) {
         console.error(`Ошибка восстановления заказа №${order.id}:`, err.message);
       }
     })
   );
 
-  // ждём завершения всех задач
   await Promise.all(tasks);
-
   console.log("Восстановление заказов для курьеров завершено");
 }
+
 
 // ==================== Основной блок ====================
 (async function main() {
@@ -503,6 +511,9 @@ waitingReview.set(order.client_chat_id, {
   console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
 }
 async function sendOrUpdateOrder(order) {
+console.log(`[INFO] Отправка/обновление заказа №${order.id}, статус: ${order.status}`);
+
+  // Получаем всех курьеров с chat_id
   const [rows] = await db.execute(
     "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
   );
@@ -516,13 +527,16 @@ async function sendOrUpdateOrder(order) {
 
   const tasks = recipients.map(r =>
     limit(async () => {
-      if (!r.chatId) return;
+      if (!r.chatId) 
+      console.log(`[WARN] У пользователя @${r.username} нет chat_id, пропускаем`);
+      return;
 
+      // ✅ Проверяем, есть ли уже сообщение для этого курьера
       const messages = await getOrderMessages(order.id) || [];
       const msg = messages.find(m => m.chat_id === r.chatId);
 
       let kb = [];
-      const text = buildOrderMessage(order); // безопасно
+      const text = buildOrderMessage(order); // уже безопасно экранирован
 
       if (order.status === "new") {
         kb = [[{ text: "Взять заказ", callback_data: `take_${order.id}` }]];
@@ -533,12 +547,14 @@ async function sendOrUpdateOrder(order) {
             { text: "Отказаться", callback_data: `release_${order.id}` }
           ]];
         } else {
-          // курьеру заказ не показываем
+          // Курьеру заказ не показываем
           if (msg) {
+             console.log(`[INFO] Удаляем сообщение заказа №${order.id} у @${r.username} (не его заказ)`);
             try {
               await bot.deleteMessage(r.chatId, msg.message_id);
               await clearOrderMessage(order.id, r.chatId);
-            } catch {}
+            } catch {err}
+            console.error(`[ERROR] Не удалось удалить сообщение заказа №${order.id} у @${r.username}:`, err.message);
           }
           return;
         }
@@ -548,6 +564,8 @@ async function sendOrUpdateOrder(order) {
 
       try {
         if (msg) {
+          console.log(`[INFO] Редактируем сообщение заказа №${order.id} у @${r.username}`);
+          // Редактируем существующее сообщение
           await bot.editMessageText(text, {
             chat_id: r.chatId,
             message_id: msg.message_id,
@@ -555,6 +573,11 @@ async function sendOrUpdateOrder(order) {
             reply_markup: kb.length ? { inline_keyboard: kb } : undefined
           });
         } else {
+           console.log(`[INFO] Отправляем новое сообщение заказа №${order.id} пользователю @${r.username}`);
+          // Удаляем старое на всякий случай
+          await clearOrderMessage(order.id, r.chatId);
+
+          // Отправляем новое
           const sent = await bot.sendMessage(r.chatId, text, {
             parse_mode: "MarkdownV2",
             reply_markup: kb.length ? { inline_keyboard: kb } : undefined
@@ -562,6 +585,7 @@ async function sendOrUpdateOrder(order) {
           await saveOrderMessage(order.id, r.chatId, sent.message_id);
         }
       } catch (err) {
+        console.error(`[ERROR] Ошибка sendOrUpdateOrder: заказ №${order.id}, @${r.username}`, err.message);
         if (
           !err.message.includes("message is not modified") &&
           !err.message.includes("chat not found")
@@ -576,7 +600,9 @@ async function sendOrUpdateOrder(order) {
   );
 
   await Promise.all(tasks);
+   console.log(`[INFO] Завершена отправка/обновление заказа №${order.id}`);
 }
+
 
 
 
@@ -586,7 +612,7 @@ bot.on("callback_query", async (q) => {
   const fromId = q.from.id;
   const username = q.from.username;
 
-  console.log(`Callback от @${username} (id: ${fromId}): ${data}`);
+    console.log(`[CALLBACK] Пользователь @${username} (${fromId}) нажал: ${data}`);
 
 
   if (!username) {
