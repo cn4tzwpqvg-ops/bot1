@@ -171,7 +171,7 @@ async function getClient(username) {
 
 // ================= Заказы =================
 // ================= Заказы =================
-ы
+
 // Вспомогательная функция для формата MySQL DATETIME
 function formatMySQLDateTime(date = new Date()) {
   const pad = n => n.toString().padStart(2, '0');
