@@ -424,7 +424,6 @@ async function releaseOrderTx(orderId) {
   }
 }
 
-
 // =================== Построение сообщения =================
 const deliveryMap = { "DHL": "DHL", "Курьер": "Курьер" };
 const paymentMap = {
@@ -440,7 +439,7 @@ function buildOrderMessage(order) {
     delivered: "Доставлен"
   };
 
-  const courierName = order.courier_username || "—";
+  const courierName = order.courier_username ? '@' + order.courier_username.replace(/^@/, '') : "—";
 
   return [
     `*Заказ №${escapeMarkdownV2(String(order.id))}*`,
@@ -472,7 +471,9 @@ async function askForReview(order) {
     rating: null
   });
 
-  const courierEscaped = escapeMarkdownV2(order.courier_username || "—");
+  const courierEscaped = order.courier_username 
+    ? '@' + escapeMarkdownV2(order.courier_username.replace(/^@/, '')) 
+    : '—';
   const orderIdEscaped = escapeMarkdownV2(String(order.id));
 
   await bot.sendMessage(
@@ -505,36 +506,36 @@ async function sendOrUpdateOrder(order, text = null) {
     "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
   );
 
-  // Формируем список получателей
-  const recipients = [];
+  // Формируем уникальный список получателей по chatId
+  const recipientsMap = new Map();
 
   if (ADMIN_ID && ADMIN_USERNAME) {
-    recipients.push({ username: ADMIN_USERNAME, chatId: ADMIN_ID });
+    recipientsMap.set(ADMIN_ID, { username: ADMIN_USERNAME, chatId: ADMIN_ID });
   }
 
-  // Курьеры
-  recipients.push(...courierRows.map(r => ({ username: r.username, chatId: r.chat_id })));
+  courierRows.forEach(r => {
+    if (r.chat_id) recipientsMap.set(r.chat_id, { username: r.username, chatId: r.chat_id });
+  });
 
-  // Клиент
   if (order.client_chat_id) {
-    recipients.push({
+    recipientsMap.set(order.client_chat_id, {
       username: order.tgNick.replace(/^@/, ""),
       chatId: order.client_chat_id
     });
   }
 
+  const recipients = Array.from(recipientsMap.values());
+
   const limit = pLimit(5); // ограничиваем параллельные отправки
 
-  // Обрабатываем каждого получателя
   const tasks = recipients.map(recipient =>
     limit(async () => {
       if (!recipient.chatId) return;
 
-      // Получаем существующие сообщения
+      // Получаем существующие сообщения для данного chatId
       const messages = await getOrderMessages(order.id);
       const existingMsg = messages.find(m => m.chat_id === recipient.chatId);
 
-      // Определяем роли
       const isClient = recipient.chatId === order.client_chat_id;
       const isCourier = !!COURIERS[recipient.username];
       const isOwnerCourier = order.courier_username === recipient.username;
@@ -552,12 +553,10 @@ async function sendOrUpdateOrder(order, text = null) {
         }
       }
 
-      // Формируем текст сообщения
       const msgText = text || buildOrderMessage(order);
 
       try {
         if (existingMsg) {
-          // Обновляем сообщение
           await bot.editMessageText(msgText, {
             chat_id: recipient.chatId,
             message_id: existingMsg.message_id,
@@ -565,7 +564,6 @@ async function sendOrUpdateOrder(order, text = null) {
             reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
           });
         } else {
-          // Отправляем новое сообщение
           const sent = await bot.sendMessage(recipient.chatId, msgText, {
             parse_mode: "MarkdownV2",
             reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
@@ -584,6 +582,7 @@ async function sendOrUpdateOrder(order, text = null) {
   await Promise.all(tasks);
   console.log(`[INFO] Завершена отправка/обновление заказа №${order.id}`);
 }
+
 
 
 
@@ -642,110 +641,128 @@ bot.on("callback_query", async (q) => {
   }
 
   try {
-    // ================== TAKE ==================
-    if (data.startsWith("take_")) {
-      console.log(`TAKE заказ ${orderId} пользователем @${username}`);
+   // ================== TAKE ==================
+if (data.startsWith("take_")) {
+  console.log(`TAKE заказ ${orderId} пользователем @${username}`);
 
-      if (!(await isCourier(username)) && fromId !== ADMIN_ID) {
-        console.log(`Пользователь @${username} не курьер`);
-        return bot.answerCallbackQuery(q.id, {
-          text: "Только курьеры",
-          show_alert: true
-        });
-      }
-
-      const success = await takeOrderAtomic(orderId, username);
-      console.log(`Результат попытки взять заказ ${orderId}: ${success ? "успешно" : "не удалось"}`);
-
-      if (!success) {
-        return bot.answerCallbackQuery(q.id, {
-          text: "Заказ уже взят другим курьером",
-          show_alert: true
-        });
-      }
-
-      const updatedOrder = await getOrderById(orderId);
-      await sendOrUpdateOrder(updatedOrder);
-
-      return bot.answerCallbackQuery(q.id, { text: "Заказ взят" });
-    }
-
-    // ================== RELEASE ==================
-    if (data.startsWith("release_")) {
-      console.log(`RELEASE заказ ${orderId} пользователем @${username}`);
-
-      if (order.status !== "taken") {
-        console.log(`Заказ ${orderId} уже не в статусе 'taken'`);
-        return bot.answerCallbackQuery(q.id, {
-          text: "От этого заказа уже отказались",
-          show_alert: true
-        });
-      }
-
-      if (order.courier_username !== username && fromId !== ADMIN_ID) {
-        console.log(`Пользователь @${username} не может отказаться от заказа ${orderId}`);
-        return bot.answerCallbackQuery(q.id, {
-          text: "Вы не можете отказаться от этого заказа",
-          show_alert: true
-        });
-      }
-
-      const oldCourier = order.courier_username;
-      await releaseOrderTx(orderId);
-
-      const updatedOrder = await getOrderById(orderId);
-      await sendOrUpdateOrder(updatedOrder);
-
-      console.log(`Заказ ${orderId} возвращен в 'new' после отказа курьера @${oldCourier}`);
-
-      if (ADMIN_ID) {
-        await bot.sendMessage(
-          ADMIN_ID,
-          `Курьер @${oldCourier} отказался от заказа №${orderId}`
-        );
-      }
-
-      return bot.answerCallbackQuery(q.id, {
-        text: "Вы отказались от заказа"
-      });
-    }
-
-    // ================== DELIVERED ==================
-    if (data.startsWith("delivered_")) {
-      console.log(`DELIVERED заказ ${orderId} пользователем @${username}`);
-
-      if (order.courier_username !== username && fromId !== ADMIN_ID) {
-        console.log(`Пользователь @${username} не может отметить заказ ${orderId} как доставленный`);
-        return bot.answerCallbackQuery(q.id, {
-          text: "Нельзя отметить",
-          show_alert: true
-        });
-      }
-
-      await updateOrderStatus(orderId, "delivered", username);
-
-      const updatedOrder = await getOrderById(orderId);
-      await sendOrUpdateOrder(updatedOrder);
-
-      if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
-        await askForReview(updatedOrder);
-      }
-
-      console.log(`Заказ ${orderId} помечен как доставленный`);
-
-      return bot.answerCallbackQuery(q.id, {
-        text: "Заказ доставлен"
-      });
-    }
-
-  } catch (err) {
-    console.error(`[ERROR] Callback заказ ${orderId}:`, err);
+  // Проверка: курьер или админ
+  if (!(await isCourier(username)) && fromId !== ADMIN_ID) {
+    console.log(`Пользователь @${username} не курьер`);
     return bot.answerCallbackQuery(q.id, {
-      text: "Ошибка",
+      text: "Только курьеры",
       show_alert: true
     });
   }
-}); // конец bot.on
+
+  // Пытаемся взять заказ атомарно
+  const success = await takeOrderAtomic(orderId, username);
+  console.log(`Результат попытки взять заказ ${orderId}: ${success ? "успешно" : "не удалось"}`);
+
+  if (!success) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Заказ уже взят другим курьером",
+      show_alert: true
+    });
+  }
+
+  // Получаем уже обновлённый заказ
+  const updatedOrder = await getOrderById(orderId);
+
+  // Отправляем/обновляем сообщение всем получателям
+  // Внутри sendOrUpdateOrder теперь используется recipientsMap,
+  // чтобы одно сообщение на chat_id, кнопки для админа не показываются
+  await sendOrUpdateOrder(updatedOrder);
+
+  // Ответ на callback
+  return bot.answerCallbackQuery(q.id, { text: "Заказ взят" });
+}
+
+
+    // ================== RELEASE ==================
+if (data.startsWith("release_")) {
+  console.log(`RELEASE заказ ${orderId} пользователем @${username}`);
+
+  // Проверка статуса заказа
+  if (order.status !== "taken") {
+    console.log(`Заказ ${orderId} уже не в статусе 'taken'`);
+    return bot.answerCallbackQuery(q.id, {
+      text: "От этого заказа уже отказались",
+      show_alert: true
+    });
+  }
+
+  // Проверка владельца заказа или админа
+  if (order.courier_username !== username && fromId !== ADMIN_ID) {
+    console.log(`Пользователь @${username} не может отказаться от заказа ${orderId}`);
+    return bot.answerCallbackQuery(q.id, {
+      text: "Вы не можете отказаться от этого заказа",
+      show_alert: true
+    });
+  }
+
+  const oldCourier = order.courier_username;
+
+  // Возврат заказа в статус "new" атомарно
+  await releaseOrderTx(orderId);
+
+  // Получаем обновлённый заказ
+  const updatedOrder = await getOrderById(orderId);
+
+  // Обновляем или отправляем сообщение всем получателям
+  await sendOrUpdateOrder(updatedOrder);
+
+  console.log(`Заказ ${orderId} возвращен в 'new' после отказа курьера @${oldCourier}`);
+
+  // Уведомление админа (если есть)
+  if (ADMIN_ID) {
+    await bot.sendMessage(
+      ADMIN_ID,
+      `Курьер @${oldCourier} отказался от заказа №${orderId}`
+    );
+  }
+
+  return bot.answerCallbackQuery(q.id, {
+    text: "Вы отказались от заказа"
+  });
+}
+
+  // ================== DELIVERED ==================
+if (data.startsWith("delivered_")) {                  // ← открытие DELIVERED
+  console.log(`DELIVERED заказ ${orderId} пользователем @${username}`);
+
+  if (order.courier_username !== username && fromId !== ADMIN_ID) {
+    console.log(`Пользователь @${username} не может отметить заказ ${orderId} как доставленный`);
+    return bot.answerCallbackQuery(q.id, {
+      text: "Нельзя отметить",
+      show_alert: true
+    });
+  }
+
+  await updateOrderStatus(orderId, "delivered", username);
+
+  const updatedOrder = await getOrderById(orderId);
+  await sendOrUpdateOrder(updatedOrder);
+
+  if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
+    await askForReview(updatedOrder);
+  }
+
+  console.log(`Заказ ${orderId} помечен как доставленный`);
+
+  return bot.answerCallbackQuery(q.id, {
+    text: "Заказ доставлен"
+  });
+}                                                    // ← закрытие DELIVERED
+
+} catch (err) {                                       // ← открытие catch
+  console.error(`[ERROR] Callback заказ ${orderId}:`, err);
+  return bot.answerCallbackQuery(q.id, {
+    text: "Ошибка",
+    show_alert: true
+  });
+}                                                    // ← закрытие catch
+
+});                                                   // ← закрытие bot.on
 
 
 // ================== /start и меню =================
