@@ -516,7 +516,7 @@ async function sendOrUpdateOrder(order, text = null) {
 
   // Курьеры
   courierRows.forEach(r => {
-    if (r.chat_id) recipientsMap.set(r.chat_id, { username: r.username, chatId: r.chat_id });
+    if (r.chat_id) recipientsMap.set(r.chat_id, { username: r.username.replace(/^@/, ""), chatId: r.chat_id });
   });
 
   // Клиент
@@ -528,8 +528,7 @@ async function sendOrUpdateOrder(order, text = null) {
   }
 
   const recipients = Array.from(recipientsMap.values());
-
-  const limit = pLimit(5); // ограничиваем параллельные отправки
+  const limit = pLimit(5);
 
   const tasks = recipients.map(recipient =>
     limit(async () => {
@@ -537,12 +536,13 @@ async function sendOrUpdateOrder(order, text = null) {
 
       const isClient = recipient.chatId === order.client_chat_id;
       const isAdmin = recipient.chatId === ADMIN_ID;
-      const isCourier = !!COURIERS[recipient.username];
-      const isOwnerCourier = order.courier_username === recipient.username;
+
+      const usernameKey = recipient.username.replace(/^@/, "");
+      const isCourier = !!COURIERS[usernameKey];
+      const isOwnerCourier = order.courier_username && order.courier_username.replace(/^@/, "") === usernameKey;
 
       // Формируем клавиатуру
       let keyboard = [];
-
       if (!isClient && !isAdmin && isCourier) {
         if (order.status === "new") {
           // Все курьеры видят кнопку "Взять заказ"
@@ -556,14 +556,12 @@ async function sendOrUpdateOrder(order, text = null) {
         }
       }
 
-      // Формируем текст
       const msgText = text || buildOrderMessage({
         ...order,
         courier_username: order.courier_username || "—"
       });
 
       try {
-        // Проверяем, есть ли уже отправленное сообщение
         const messages = await getOrderMessages(order.id);
         const existingMsg = messages.find(m => m.chat_id === recipient.chatId);
 
