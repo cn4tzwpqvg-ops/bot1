@@ -660,7 +660,7 @@ if (data.startsWith("take_")) {
 
   if (!success) {
     return bot.answerCallbackQuery(q.id, {
-      text: "Заказ уже взят другим курьером",
+      text: "Заказ уже взят другим курьером!",
       show_alert: true
     });
   }
