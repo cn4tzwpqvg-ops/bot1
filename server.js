@@ -121,6 +121,12 @@ async function initDB() {
   console.log("База данных и таблицы готовы");
 }
 
+function escapeMarkdown(text) {
+  if (!text) return "";
+  return text.replace(/([*_`[\]])/g, "\\$1");
+}
+
+
 // ================= Курьеры =================
 async function getCouriers() {
   const [rows] = await db.execute("SELECT username, chat_id FROM couriers");
@@ -830,12 +836,13 @@ await bot.sendMessage(id, welcomeText, {
 
 // ===== Уведомление админу о новом пользователе =====
 if (isNew && ADMIN_ID) {
-  const login = msg.from.username ? `@${msg.from.username}` : "—";
+  const login = msg.from.username ? `@${escapeMarkdown(msg.from.username)}` : "—";
 
   try {
     await bot.sendMessage(
       ADMIN_ID,
-      `🆕 *Новый пользователь*\n\nИмя: *${first_name || "—"}*\nЛогин: ${login}\nChat ID: \`${id}\``,
+      `🆕 *Новый пользователь*\n\nИмя: *${escapeMarkdown(first_name) || "—"}*
+\nЛогин: ${login}\nChat ID: \`${id}\``,
       { parse_mode: "Markdown" }
     );
     console.log(`Админу отправлено уведомление о новом пользователе @${username}`);
