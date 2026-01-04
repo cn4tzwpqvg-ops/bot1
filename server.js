@@ -820,12 +820,29 @@ bot.onText(/\/start/, async (msg) => {
       console.log(`Пользователь @${username} видит обычное меню с кнопкой "Мои заказы"`);
     }
 
-    // Отправляем сообщение
-    await bot.sendMessage(id, welcomeText, {
-      reply_markup: { keyboard, resize_keyboard: true }
-    });
+ // Отправляем сообщение пользователю
+await bot.sendMessage(id, welcomeText, {
+  reply_markup: { keyboard, resize_keyboard: true }
+});
 
-    console.log(`Приветственное сообщение отправлено @${username}`);
+// ===== Уведомление админу о новом пользователе =====
+if (isNew && ADMIN_ID) {
+  const login = msg.from.username ? `@${msg.from.username}` : "—";
+
+  try {
+    await bot.sendMessage(
+      ADMIN_ID,
+      `🆕 *Новый пользователь*\n\nИмя: *${first_name || "—"}*\nЛогин: ${login}\nChat ID: \`${id}\``,
+      { parse_mode: "Markdown" }
+    );
+    console.log(`Админу отправлено уведомление о новом пользователе @${username}`);
+  } catch (err) {
+    console.error("Не удалось отправить уведомление админу:", err.message);
+  }
+}
+
+console.log(`Приветственное сообщение отправлено @${username}`);
+
   } catch (err) {
     console.error(`Ошибка обработки /start для @${username}:`, err.message);
   }
@@ -1079,6 +1096,15 @@ if (text === "Курьеры" && id === ADMIN_ID) {
   console.log(`Админ @${username} запросил список курьеров`);
   return bot.sendMessage(id, "Список курьеров:\n" + list);
 }
+
+
+
+// 👉 Проверяем — новый ли пользователь
+const [rows] = await db.execute(
+  "SELECT id FROM clients WHERE chat_id=?",
+  [id]
+);
+const isNew = rows.length === 0;
 
 
 
