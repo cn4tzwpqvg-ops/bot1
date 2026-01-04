@@ -135,17 +135,18 @@ async function getCouriers() {
   return map;
 }
 
-async function addCourier(username, chatId) {
-  if (!username || !chatId) return false;
+async function addCourier(username, chatId = null) {
+  if (!username) return false;
   await db.execute(`
     INSERT INTO couriers (username, chat_id)
     VALUES (?, ?)
     ON DUPLICATE KEY UPDATE chat_id=VALUES(chat_id)
   `, [username, chatId]);
   COURIERS = await getCouriers();
-  console.log(`Курьер добавлен/обновлён: @${username}`);
+  console.log(`Курьер добавлен/обновлён: @${username}, chat_id: ${chatId}`);
   return true;
 }
+
 
 async function removeCourier(username) {
   await db.execute("DELETE FROM couriers WHERE username=?", [username]);
@@ -895,14 +896,29 @@ const adminWaitingBroadcast = new Map();
 })();
 
 
-
 // ===== Основной обработчик сообщений =====
 bot.on("message", async (msg) => {
   const id = msg.from.id;
-  const username = msg.from.username || `id${id}`;
+  const username = msg.from.username; // username должен быть для курьеров
   const first_name = msg.from.first_name || "";
+
   if (!msg.text) return;
-const text = msg.text.trim();
+  const text = msg.text.trim();
+
+  // Проверка username
+  if (!username) {
+    console.log(`[WARN] Пользователь с chat_id ${id} не имеет username`);
+    return bot.sendMessage(id, "У вас нет username, бот не сможет идентифицировать вас как курьера.");
+  }
+
+  // ===== Логирование всех сообщений =====
+  console.log(" MESSAGE", {
+    from: id,
+    username,
+    text,
+    waitingReview: waitingReview.has(id)
+  });
+
 
 // ===== Проверка бана =====
 try {
@@ -1393,31 +1409,43 @@ if (text === "Удалить курьера" && id === ADMIN_ID) {
   return bot.sendMessage(id, "Введите ник курьера, чтобы удалить (@username):");
 }
 
-  // ===== Обработка введённого ника курьера =====
+// ===== Обработка введённого ника курьера =====
 if (adminWaitingCourier.has(username)) {
   const { action } = adminWaitingCourier.get(username);
-  if (!text.startsWith("@")) return bot.sendMessage(id, "Ник должен начинаться с @");
+  if (!text.startsWith("@")) {
+    return bot.sendMessage(id, "Ник должен начинаться с @");
+  }
 
   const uname = text.replace(/^@+/, "").trim();
-  const client = getClient(uname);
+
+  // Получаем клиента асинхронно
+  const client = await getClient(uname);
 
   if (action === "add") {
     if (client && client.chat_id) {
-      addCourier(uname, client.chat_id);
-      bot.sendMessage(ADMIN_ID, `Курьер @${uname} добавлен`);
+      // Добавляем курьера с chat_id
+      await addCourier(uname, client.chat_id);
+      await bot.sendMessage(ADMIN_ID, `Курьер @${uname} добавлен`);
     } else {
-      addCourier(uname, null); // пока нет chat_id, добавим как null
-      bot.sendMessage(ADMIN_ID, `Курьер @${uname} добавлен (ещё не писал боту)`);
+      // Добавляем курьера без chat_id (ещё не писал боту)
+      await addCourier(uname, null);
+      await bot.sendMessage(ADMIN_ID, `Курьер @${uname} добавлен (ещё не писал боту)`);
     }
   } else if (action === "remove") {
-    removeCourier(uname);
-    bot.sendMessage(ADMIN_ID, `Курьер @${uname} удален`);
+    // Удаляем курьера
+    await removeCourier(uname);
+    await bot.sendMessage(ADMIN_ID, `Курьер @${uname} удалён`);
   }
 
-  COURIERS = getCouriers();
+  // Обновляем глобальный объект курьеров
+  COURIERS = await getCouriers();
+
+  // Сбрасываем состояние ожидания ника
   adminWaitingCourier.delete(username);
+
   return;
 }
+
 
 // ===== Список курьеров =====
 if (text === "Список курьеров" && id === ADMIN_ID) {
