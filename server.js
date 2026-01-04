@@ -217,23 +217,22 @@ async function addOrder(order) {
   const mysqlTime = order.time ? order.time : `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`;
   const createdAt = formatMySQLDateTime(now);
 
-  await db.execute(
-  `
-  INSERT INTO orders
-    (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  ON DUPLICATE KEY UPDATE
-    tgNick = VALUES(tgNick),
-    city = VALUES(city),
-    delivery = VALUES(delivery),
-    payment = VALUES(payment),
-    orderText = VALUES(orderText),
-    date = VALUES(date),
-    time = VALUES(time),
-    status = VALUES(status),
-    client_chat_id = VALUES(client_chat_id)
-  `,
-  [
+  // Вставляем или обновляем заказ
+  await db.execute(`
+    INSERT INTO orders
+      (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      tgNick = VALUES(tgNick),
+      city = VALUES(city),
+      delivery = VALUES(delivery),
+      payment = VALUES(payment),
+      orderText = VALUES(orderText),
+      date = VALUES(date),
+      time = VALUES(time),
+      status = VALUES(status),
+      client_chat_id = VALUES(client_chat_id)
+  `, [
     order.id,
     order.tgNick,
     order.city,
@@ -245,13 +244,18 @@ async function addOrder(order) {
     order.status || "new",
     createdAt,
     order.client_chat_id || null
-  ]
-);
+  ]);
 
-  // Автоматическая отправка уведомлений в Telegram
-  const updatedOrder = await getOrderById(order.id);
-  await sendOrUpdateOrder(updatedOrder);
+  // Проверяем, было ли уже сообщение клиенту
+  const messages = await getOrderMessages(order.id);
+  const clientAlreadyNotified = messages.some(m => m.chat_id === order.client_chat_id);
+
+  if (!clientAlreadyNotified) {
+    const updatedOrder = await getOrderById(order.id);
+    await sendOrUpdateOrder(updatedOrder);
+  }
 }
+
 
 async function getOrderById(id) {
   const [rows] = await db.execute("SELECT * FROM orders WHERE id=?", [id]);
@@ -335,25 +339,21 @@ async function restoreOrdersForClients() {
       [client.username]
     );
 
-    console.log(`[INFO] Клиент @${client.username} имеет ${orders.length} заказов`);
-
     const tasks = orders.map(order =>
       limit(async () => {
         try {
           // Проверяем, есть ли уже сообщение клиенту
           const messages = await getOrderMessages(order.id);
           const alreadySent = messages.some(m => m.chat_id === client.chat_id);
-          if (alreadySent) return; // если уже отправлено — пропускаем
+          if (alreadySent) return;
 
           const text = escapeMarkdownV2(buildOrderMessage(order));
           const sent = await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
 
-          // Сохраняем сообщение, чтобы не дублировать в будущем
           await saveOrderMessage(order.id, client.chat_id, sent.message_id);
-
           console.log(`[INFO] Отправлен заказ №${order.id} клиенту @${client.username}`);
         } catch (err) {
-          console.error(`[ERROR] Ошибка отправки заказа №${order.id} клиенту @${client.username}:`, err.message, err.stack);
+          console.error(`[ERROR] Ошибка отправки заказа №${order.id} клиенту @${client.username}:`, err.message);
         }
       })
     );
@@ -367,29 +367,24 @@ async function restoreOrdersForClients() {
 
 
 
+
 // =================== Восстановление заказов для курьеров ===================
 async function restoreOrdersForCouriers() {
   console.log("[INFO] Восстановление заказов для курьеров...");
 
-const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at ASC");
+  const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at ASC");
   const limit = pLimit(5);
 
   const tasks = orders.map(order =>
     limit(async () => {
       try {
         const messages = await getOrderMessages(order.id);
+        if (messages.some(m => !!COURIERS[m.username])) return; // если курьеры уже получили, пропускаем
 
-        if (!messages || messages.length === 0) {
-          console.log(`[INFO] Восстанавливаем заказ №${order.id} для курьеров`);
-
-          // Экранируем текст на всякий случай
-          const text = escapeMarkdownV2(buildOrderMessage(order));
-
-          // Отправка или обновление заказа
-          await sendOrUpdateOrder(order, text);
-        }
+        const text = escapeMarkdownV2(buildOrderMessage(order));
+        await sendOrUpdateOrder(order, text);
       } catch (err) {
-        console.error(`[ERROR] Ошибка восстановления заказа №${order.id}:`, err.message, err.stack);
+        console.error(`[ERROR] Ошибка восстановления заказа №${order.id}:`, err.message);
       }
     })
   );
@@ -397,6 +392,7 @@ const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','
   await Promise.all(tasks);
   console.log("[INFO] Восстановление заказов для курьеров завершено");
 }
+
 
 
 
