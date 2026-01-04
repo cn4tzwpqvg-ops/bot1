@@ -312,8 +312,9 @@ async function clearOrderMessage(orderId, chatId) {
 // =================== Вспомогательная функция ===================
 function escapeMarkdownV2(text) {
   if (text == null) return "";
-  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
+  return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }
+
 
 // =================== Восстановление заказов для клиентов ===================
 async function restoreOrdersForClients() {
@@ -412,7 +413,6 @@ async function releaseOrderTx(orderId) {
 }
 
 
-// ================= Построение сообщения =================
 // =================== Построение сообщения =================
 const deliveryMap = { "DHL": "DHL", "Курьер": "Курьер" };
 const paymentMap = {
@@ -422,32 +422,28 @@ const paymentMap = {
 };
 
 function buildOrderMessage(order) {
-  const courierName = order.courier_username || null;
-  const courierText = courierName
-    ? escapeMarkdownV2(`\nКурьер: ${courierName}`)
-    : "";
+  const statusMap = {
+    new: "Новый",
+    taken: "Взято",
+    delivered: "Доставлен"
+  };
 
-  const statusText =
-    order.status === "new"
-      ? "Новый"
-      : order.status === "taken"
-      ? "Взято"
-      : "Доставлен";
+  const courierName = order.courier_username || "—";
 
   return [
     `*Заказ №${escapeMarkdownV2(String(order.id))}*`,
-    " ",
-    `*Клиент:* ${escapeMarkdownV2(order.tgNick)}`,
+    `*Клиент:* ${escapeMarkdownV2(order.tgNick || "—")}`,
     `*Город:* ${escapeMarkdownV2(order.city || "—")}`,
     `*Доставка:* ${escapeMarkdownV2(deliveryMap[order.delivery] || order.delivery || "—")}`,
     `*Оплата:* ${escapeMarkdownV2(paymentMap[order.payment] || order.payment || "—")}`,
     `*Дата:* ${escapeMarkdownV2(order.date || "—")}`,
     `*Время:* ${escapeMarkdownV2(order.time || "—")}`,
-    " ",
+    "",
     `*Состав заказа:*`,
     `${escapeMarkdownV2(order.orderText || "")}`,
-    " ",
-    `Статус: *${escapeMarkdownV2(statusText)}*${courierText}`
+    "",
+    `Статус: *${escapeMarkdownV2(statusMap[order.status] || "—")}*`,
+    `Курьер: ${escapeMarkdownV2(courierName)}`
   ].join("\n");
 }
 
@@ -464,14 +460,12 @@ async function askForReview(order) {
     rating: null
   });
 
-  console.log("waitingReview SET", order.client_chat_id, waitingReview.get(order.client_chat_id));
-
   const courierEscaped = escapeMarkdownV2(order.courier_username || "—");
   const orderIdEscaped = escapeMarkdownV2(String(order.id));
 
   await bot.sendMessage(
     order.client_chat_id,
-    `Заказ №${orderIdEscaped} доставлен\n\nКурьер: @${courierEscaped}\n\nПоставьте оценку курьеру:`,
+    `Заказ №${orderIdEscaped} доставлен\n\nКурьер: ${courierEscaped}\n\nПоставьте оценку курьеру:`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -494,7 +488,9 @@ async function askForReview(order) {
 async function sendOrUpdateOrder(order, text = null) {
   console.log(`[INFO] Начало отправки/обновления заказа №${order.id}, статус: ${order.status}`);
 
-  const [rows] = await db.execute("SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL");
+  const [rows] = await db.execute(
+    "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
+  );
 
   const recipients = [];
 
@@ -505,10 +501,11 @@ async function sendOrUpdateOrder(order, text = null) {
   recipients.push(...rows.map(r => ({ username: r.username, chatId: r.chat_id })));
 
   if (order.client_chat_id) {
-    recipients.push({ username: order.tgNick.replace(/^@/, ""), chatId: order.client_chat_id });
+    recipients.push({
+      username: order.tgNick.replace(/^@/, ""),
+      chatId: order.client_chat_id
+    });
   }
-
-  console.log(`[DEBUG] Получатели заказа №${order.id}:`, recipients.map(r => r.username));
 
   const limit = pLimit(5);
 
@@ -516,10 +513,30 @@ async function sendOrUpdateOrder(order, text = null) {
     limit(async () => {
       if (!r.chatId) return;
 
-      const messages = await getOrderMessages(order.id) || [];
+      const messages = (await getOrderMessages(order.id)) || [];
       const msg = messages.find(m => m.chat_id === r.chatId);
 
+      // === КНОПКИ ДЛЯ КАЖДОГО ПОЛУЧАТЕЛЯ ===
       const kb = [];
+
+      // Клиент — без кнопок
+      const isClient = r.chatId === order.client_chat_id;
+
+      // Курьеры
+      const isCourier = !!COURIERS[r.username];
+      const isOwnerCourier = order.courier_username === r.username;
+
+      if (!isClient && isCourier) {
+        if (order.status === "new") {
+          kb.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
+        } else if (order.status === "taken" && isOwnerCourier) {
+          kb.push([
+            { text: "❌ Отказаться", callback_data: `release_${order.id}` },
+            { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
+          ]);
+        }
+      }
+
       const msgText = text || buildOrderMessage(order);
 
       try {
@@ -535,12 +552,18 @@ async function sendOrUpdateOrder(order, text = null) {
             parse_mode: "MarkdownV2",
             reply_markup: kb.length ? { inline_keyboard: kb } : undefined
           });
+
           await saveOrderMessage(order.id, r.chatId, sent.message_id);
         }
       } catch (err) {
-        if (!err.message.includes("message is not modified") &&
-            !err.message.includes("chat not found")) {
-          console.error(`[ERROR] Ошибка отправки/обновления заказа №${order.id} для @${r.username}:`, err.message);
+        if (
+          !err.message.includes("message is not modified") &&
+          !err.message.includes("chat not found")
+        ) {
+          console.error(
+            `[ERROR] Ошибка отправки/обновления заказа №${order.id} для @${r.username}:`,
+            err.message
+          );
         }
       }
     })
@@ -552,7 +575,7 @@ async function sendOrUpdateOrder(order, text = null) {
 
 
 
-// ================= Telegram: callback =================
+// ==============ss`s== Telegram: callback =================
 bot.on("callback_query", async (q) => {
   const data = q.data || "";
   const fromId = q.from.id;
@@ -628,7 +651,7 @@ if (data.startsWith("take_")) {
   }
 
   // атомарно пытаемся взять
-const success = takeOrderAtomic(orderId, username);
+const success = await takeOrderAtomic(orderId, username);
   console.log(`Результат попытки взять заказ ${orderId}: ${success ? "успешно" : "не удалось"}`);
 
 
