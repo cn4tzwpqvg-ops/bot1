@@ -771,10 +771,13 @@ bot.onText(/\/start/, async (msg) => {
   const username = msg.from.username || `id${id}`;
   const first_name = msg.from.first_name || "";
 
-  // 🔹 Логирование старта
   console.log(` /start от @${username} (id: ${id}), имя: ${first_name}`);
 
   try {
+    // Проверяем, новый ли пользователь
+    const [existing] = await db.execute("SELECT id FROM clients WHERE username=?", [username]);
+    const isNew = existing.length === 0;
+
     // Сохраняем или обновляем клиента
     await addOrUpdateClient(username, first_name, id);
     console.log(`Клиент @${username} добавлен/обновлён в базе`);
@@ -787,7 +790,7 @@ bot.onText(/\/start/, async (msg) => {
          ON DUPLICATE KEY UPDATE chat_id = VALUES(chat_id)`,
         [username, id]
       );
-      COURIERS = await getCouriers(); // обновляем локальный объект курьеров
+      COURIERS = await getCouriers();
       console.log(`Курьер @${username} добавлен/обновлён, chat_id: ${id}`);
     }
 
