@@ -557,6 +557,15 @@ async function sendOrUpdateOrder(order, text = null) {
         }
       }
 
+      // ===== Кнопка для клиента =====
+if (isClient) {
+  const orderAge = Date.now() - new Date(order.created_at).getTime();
+  // Новый заказ и прошло не более 20 минут
+  if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
+    keyboard.push([{ text: "❌ Отменить заказ", callback_data: `cancel_${order.id}` }]);
+  }
+}
+
       // Формируем текст
       const msgText = text || buildOrderMessage({
         ...order,
@@ -598,12 +607,6 @@ async function sendOrUpdateOrder(order, text = null) {
   await Promise.all(tasks);
   console.log(`[INFO] Завершена отправка/обновление заказа №${order.id}`);
 }
-
-
-
-
-
-
 
 // ============== Telegram: callback =================
 bot.on("callback_query", async (q) => {
@@ -747,6 +750,65 @@ if (data.startsWith("release_")) {
       text: "Ошибка при отказе",
       show_alert: true
     });
+  }
+}
+
+
+// ================== CANCEL ==================
+if (data.startsWith("cancel_")) {
+  console.log(`CANCEL заказ ${orderId} пользователем @${username}`);
+
+  // Проверка: только клиент, который сделал заказ
+  if (order.client_chat_id !== fromId) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Вы не можете отменить этот заказ",
+      show_alert: true
+    });
+  }
+
+  // Проверка времени (не более 20 минут)
+  const orderAge = Date.now() - new Date(order.created_at).getTime();
+  if (orderAge > 20 * 60 * 1000) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Срок отмены заказа истек",
+      show_alert: true
+    });
+  }
+
+  // Проверка статуса
+  if (order.status !== "new") {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Заказ уже обработан",
+      show_alert: true
+    });
+  }
+
+  try {
+    // Меняем статус заказа на canceled
+    await db.execute("UPDATE orders SET status='canceled' WHERE id=?", [orderId]);
+
+    // Обновляем сообщение клиента
+    const messages = await getOrderMessages(orderId);
+    const clientMsg = messages.find(m => m.chat_id === order.client_chat_id);
+    if (clientMsg) {
+      await bot.editMessageText(`❌ Ваш заказ #${order.id} отменен`, {
+        chat_id: order.client_chat_id,
+        message_id: clientMsg.message_id
+      });
+    }
+
+    // Уведомляем курьера, если кто-то уже взял заказ
+    if (order.courier_username) {
+      await bot.sendMessage(order.courier_username, `Заказ #${order.id} был отменён пользователем`);
+    }
+
+    // Обновляем WebSocket stock
+    broadcastStock();
+
+    return bot.answerCallbackQuery(q.id, { text: "Заказ успешно отменен" });
+  } catch (err) {
+    console.error(`Ошибка при отмене заказа ${orderId}:`, err.message);
+    return bot.answerCallbackQuery(q.id, { text: "Ошибка при отмене", show_alert: true });
   }
 }
 
