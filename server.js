@@ -1675,10 +1675,10 @@ app.post("/api/send-order", async (req, res) => {
     const { tgNick, city, delivery, payment, orderText, date, time, client_chat_id } = req.body;
 
     // ===== ПРОВЕРКА ВХОДНЫХ ДАННЫХ =====
-    if (!client_chat_id || !tgNick || !orderText) {
-      console.log("❌ Ошибка: неполные данные", req.body);
-      return res.status(400).json({ success: false, error: "INVALID_DATA" });
-    }
+   if (!tgNick || !orderText) {
+  console.log("❌ Ошибка: неполные данные", req.body);
+  return res.status(400).json({ success: false, error: "INVALID_DATA" });
+}
 
     const cleanUsername = tgNick.replace(/^@/, "");
 
