@@ -576,11 +576,18 @@ if (order.status === "canceled") {
 }
 
 
-      // Формируем текст
-      const msgText = text || buildOrderMessage({
-        ...order,
-        courier_username: order.courier_username || "—"
-      });
+     // Формируем текст
+let msgText = text || buildOrderMessage({
+  ...order,
+  courier_username: order.courier_username || "—"
+});
+
+// ❗ Если заказ отменён — добавляем уведомление прямо в том же сообщении
+if (order.status === "canceled") {
+  msgText += "\n\n❌ Заказ был отменён покупателем";
+  keyboard = []; // убираем кнопки полностью
+}
+
 
       try {
         // Проверяем существующие сообщения
