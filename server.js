@@ -1692,20 +1692,36 @@ app.post("/api/send-order", async (req, res) => {
       ON DUPLICATE KEY UPDATE username = VALUES(username)
     `, [client_chat_id, cleanUsername]);
 
-    // ===== ПРОВЕРКА БАНА =====
-    const [rows] = await db.execute(
-      "SELECT banned FROM clients WHERE chat_id = ? LIMIT 1",
-      [client_chat_id]
-    );
+ // ===== ПРОВЕРКА БАНА =====
+let banned = false;
 
-    if (rows.length && rows[0].banned === 1) {
-      console.log(`⛔ Заблокированный пользователь ${cleanUsername} (${client_chat_id})`);
-      return res.json({
-        success: false,
-        error: "USER_BANNED",
-        message: "Вы заблокированы и не можете создавать заказы"
-      });
-    }
+// Сначала проверяем по chat_id, если есть
+if (client_chat_id) {
+  const [rows] = await db.execute(
+    "SELECT banned FROM clients WHERE chat_id = ? LIMIT 1",
+    [client_chat_id]
+  );
+  if (rows.length && rows[0].banned === 1) banned = true;
+}
+
+// Если chat_id нет или не найден — проверяем по username
+if (!banned) {
+  const [rows2] = await db.execute(
+    "SELECT banned FROM clients WHERE username = ? LIMIT 1",
+    [cleanUsername]
+  );
+  if (rows2.length && rows2[0].banned === 1) banned = true;
+}
+
+if (banned) {
+  console.log(`⛔ Заблокированный пользователь ${cleanUsername} (${client_chat_id || "no chat_id"})`);
+  return res.json({
+    success: false,
+    error: "USER_BANNED",
+    message: "Вы заблокированы и не можете создавать заказы"
+  });
+}
+
 
     // ===== Проверка существующего заказа =====
     const [existing] = await db.execute(
