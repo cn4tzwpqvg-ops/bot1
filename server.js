@@ -1674,6 +1674,37 @@ app.post("/api/send-order", async (req, res) => {
   try {
     const { tgNick, city, delivery, payment, orderText, date, time, client_chat_id } = req.body;
 
+    // ===== ПРОВЕРКА БАНА ПОЛЬЗОВАТЕЛЯ =====
+
+// убираем @ из ника
+const cleanUsername = tgNick?.replace(/^@/, "");
+
+// если нет chat_id — сразу стоп
+if (!client_chat_id) {
+  return res.status(400).json({
+    success: false,
+    error: "NO_CHAT_ID",
+    message: "Не удалось определить пользователя"
+  });
+}
+
+// проверяем бан
+const [[bannedUser]] = await db.execute(
+  "SELECT banned FROM clients WHERE chat_id = ? OR username = ?",
+  [client_chat_id, cleanUsername]
+);
+
+if (bannedUser?.banned) {
+  console.log(`❌ Заблокированный пользователь @${cleanUsername} (${client_chat_id}) попытался создать заказ`);
+
+  return res.status(403).json({
+    success: false,
+    error: "USER_BANNED",
+    message: "Вы заблокированы и не можете создавать заказы"
+  });
+}
+
+
     console.log(`Новый заказ через API от ${tgNick}`);
     console.log(`Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`);
 
