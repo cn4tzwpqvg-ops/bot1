@@ -557,14 +557,21 @@ async function sendOrUpdateOrder(order, text = null) {
         }
       }
 
-      // ===== Кнопка для клиента =====
+// ===== Кнопка для клиента =====
 if (isClient) {
   const orderAge = Date.now() - new Date(order.created_at).getTime();
   // Новый заказ и прошло не более 20 минут
   if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
-    keyboard.push([{ text: "❌ Отменить заказ", callback_data: `cancel_${order.id}` }]);
+    // Сначала кнопка подтверждения
+    keyboard.push([{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]);
+  }
+
+  // Если заказ уже отменен – показываем сообщение без кнопок
+  if (order.status === "canceled") {
+    keyboard = [];
   }
 }
+
 
       // Формируем текст
       const msgText = text || buildOrderMessage({
@@ -751,6 +758,47 @@ if (data.startsWith("release_")) {
       show_alert: true
     });
   }
+}
+
+
+// ================== CONFIRM CANCEL ==================
+if (data.startsWith("confirm_cancel_")) {
+  const orderId = data.split("_")[2];
+  const order = await getOrderById(orderId);
+  if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+
+  if (order.client_chat_id !== fromId) {
+    return bot.answerCallbackQuery(q.id, { text: "Вы не можете отменить этот заказ", show_alert: true });
+  }
+
+  // Кнопки Да / Нет
+  await bot.editMessageText(
+    `Вы точно хотите отменить заказ #${order.id}?`,
+    {
+      chat_id: fromId,
+      message_id: q.message.message_id,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Да, отменить", callback_data: `cancel_${order.id}` },
+            { text: "Нет", callback_data: `no_cancel_${order.id}` }
+          ]
+        ]
+      }
+    }
+  );
+
+  return bot.answerCallbackQuery(q.id);
+}
+
+// ================== NO CANCEL ==================
+if (data.startsWith("no_cancel_")) {
+  const orderId = data.split("_")[2];
+  const order = await getOrderById(orderId);
+  if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+
+  await sendOrUpdateOrder(order); // вернем обычные кнопки (курьеры, клиент)
+  return bot.answerCallbackQuery(q.id, { text: "Отмена заказа отменена" });
 }
 
 
