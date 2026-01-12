@@ -471,12 +471,14 @@ async function askForReview(order) {
     return;
   }
 
-  waitingReview.set(order.client_chat_id, {
-    orderId: order.id,
-    courier: order.courier_username || "",
-    client: order.tgNick.replace(/^@/, ""),
-    rating: null
-  });
+ waitingReview.set(order.client_chat_id, {
+  orderId: order.id,
+  courier: order.courier_username
+    ? order.courier_username.replace(/^@/, "")
+    : "",
+  client: order.tgNick.replace(/^@/, ""),
+  rating: null
+});
 
   const courierEscaped = order.courier_username 
     ? '@' + escapeMarkdownV2(order.courier_username.replace(/^@/, '')) 
@@ -674,40 +676,51 @@ bot.on("callback_query", async (q) => {
 
 // ================== Просмотр отзывов курьера ==================
 if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
-  const courier = data.replace("reviews_", "").replace(/^@/, "");
+
+  // username курьера БЕЗ @ (как в БД)
+  const courierUsername = data
+    .replace("reviews_", "")
+    .replace(/^@/, "");
 
   try {
-    // Получаем все отзывы курьера
     const [reviews] = await db.execute(
-      "SELECT order_id, client_username, rating, review_text, created_at FROM reviews WHERE courier_username=? ORDER BY created_at DESC",
-      [courier]
+      `SELECT order_id, client_username, courier_username, rating, review_text, created_at
+       FROM reviews
+       WHERE courier_username = ?
+       ORDER BY created_at DESC`,
+      [courierUsername]
     );
 
     if (reviews.length === 0) {
-      return bot.sendMessage(fromId, `У курьера @${courier} пока нет отзывов`);
+      return bot.sendMessage(
+        fromId,
+        `❌ У курьера @${courierUsername} пока нет отзывов`
+      );
     }
 
-    // Формируем красивое сообщение
-    const msg = reviews.map(r => 
-  `*Заказ №${r.order_id}*\n` +
-  `👤 Клиент: @${r.client_username}\n` +
-  `🚚 Курьер: @${courier}\n` +  // берём из переменной, которую передали при выборе
-  `⭐ Оценка: ${r.rating}/5\n` +
-  `📝 Отзыв: ${r.review_text || "—"}\n` +
-  `📅 Дата: ${new Date(r.created_at).toLocaleString("ru-RU")}`
-).join("\n\n--------------------\n\n");
+    const msg = reviews.map(r =>
+      `*Заказ №${r.order_id}*\n` +
+      `👤 Клиент: @${r.client_username}\n` +
+      `🚚 Курьер: @${r.courier_username}\n` +
+      `⭐ Оценка: ${r.rating}/5\n` +
+      `📝 Отзыв: ${r.review_text || "—"}\n` +
+      `📅 Дата: ${new Date(r.created_at).toLocaleString("ru-RU")}`
+    ).join("\n\n--------------------\n\n");
 
-
-    // Отправка (обрезаем, если слишком длинное)
-    await bot.sendMessage(fromId, msg.length > 4000 ? msg.slice(0, 4000) + "\n…и ещё отзывы" : msg, { parse_mode: "Markdown" });
+    await bot.sendMessage(
+      fromId,
+      msg.length > 4000 ? msg.slice(0, 4000) + "\n…и ещё отзывы" : msg,
+      { parse_mode: "Markdown" }
+    );
 
   } catch (err) {
-    console.error(err);
+    console.error("Отзывы курьера:", err);
     await bot.sendMessage(fromId, "Ошибка при получении отзывов");
   }
 
   return bot.answerCallbackQuery(q.id, { text: "Отзывы загружены" });
 }
+
 
 
 // ================== Основная часть (заказы) ==================
@@ -1149,6 +1162,10 @@ try {
 // ===== сохраняем отзыв + рейтинг =====
 const now = new Date().toISOString().slice(0, 19).replace("T", " "); // MySQL DATETIME
 
+// 🔥 НОРМАЛИЗУЕМ username (ВСЕГДА БЕЗ @ В БД)
+const cleanClient = (review.client || "").replace(/^@/, "");
+const cleanCourier = (review.courier || "").replace(/^@/, "");
+
 await db.execute(
   `INSERT INTO reviews (
      order_id,
@@ -1158,34 +1175,43 @@ await db.execute(
      review_text,
      created_at
    ) VALUES (?, ?, ?, ?, ?, ?)`,
-  [review.orderId, review.client, review.courier, review.rating, reviewText, now]
+  [
+    review.orderId,
+    cleanClient,
+    cleanCourier,
+    review.rating,
+    reviewText,
+    now
+  ]
 );
 
 console.log(
   `Отзыв сохранён: заказ ${review.orderId}, ` +
   `рейтинг ${review.rating}, ` +
-  `клиент @${review.client}`
+  `клиент @${cleanClient}, ` +
+  `курьер @${cleanCourier}`
 );
-  // отправляем админу
-  await bot.sendMessage(
-    ADMIN_ID,
-    `Новый отзыв
 
- Заказ: №${review.orderId}
- Клиент: ${withAt(review.client)}
- Курьер: @${review.courier}
- Оценка: ${review.rating}/5
+// ===== отправляем админу =====
+await bot.sendMessage(
+  ADMIN_ID,
+  `Новый отзыв
 
- Отзыв:
+Заказ: №${review.orderId}
+Клиент: @${cleanClient}
+Курьер: @${cleanCourier}
+Оценка: ${review.rating}/5
+
+Отзыв:
 ${reviewText}`
-  );
+);
 
-  waitingReview.delete(id);
+waitingReview.delete(id);
 
-  return bot.sendMessage(
-    id,
-    "Спасибо за отзыв! Он отправлен администратору."
-  );
+return bot.sendMessage(
+  id,
+  "Спасибо за отзыв! Он отправлен администратору."
+);
 }
 
 
