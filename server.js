@@ -689,8 +689,14 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 
     // Формируем красивое сообщение
     const msg = reviews.map(r => 
-      `*Заказ №${r.order_id}*\nКлиент: @${r.client_username}\nОценка: ${r.rating}/5\nОтзыв: ${r.review_text || "—"}\nДата: ${new Date(r.created_at).toLocaleString("ru-RU")}`
-    ).join("\n\n--------------------\n\n");
+  `*Заказ №${r.order_id}*\n` +
+  `👤 Клиент: @${r.client_username}\n` +
+  `🚚 Курьер: @${courier}\n` +  // берём из переменной, которую передали при выборе
+  `⭐ Оценка: ${r.rating}/5\n` +
+  `📝 Отзыв: ${r.review_text || "—"}\n` +
+  `📅 Дата: ${new Date(r.created_at).toLocaleString("ru-RU")}`
+).join("\n\n--------------------\n\n");
+
 
     // Отправка (обрезаем, если слишком длинное)
     await bot.sendMessage(fromId, msg.length > 4000 ? msg.slice(0, 4000) + "\n…и ещё отзывы" : msg, { parse_mode: "Markdown" });
