@@ -672,6 +672,38 @@ bot.on("callback_query", async (q) => {
     });
   }
 
+// ================== Просмотр отзывов курьера ==================
+if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
+  const courier = data.replace("reviews_", "").replace(/^@/, "");
+
+  try {
+    // Получаем все отзывы курьера
+    const [reviews] = await db.execute(
+      "SELECT order_id, client_username, rating, review_text, created_at FROM reviews WHERE courier_username=? ORDER BY created_at DESC",
+      [courier]
+    );
+
+    if (reviews.length === 0) {
+      return bot.sendMessage(fromId, `У курьера @${courier} пока нет отзывов`);
+    }
+
+    // Формируем красивое сообщение
+    const msg = reviews.map(r => 
+      `*Заказ №${r.order_id}*\nКлиент: @${r.client_username}\nОценка: ${r.rating}/5\nОтзыв: ${r.review_text || "—"}\nДата: ${new Date(r.created_at).toLocaleString("ru-RU")}`
+    ).join("\n\n--------------------\n\n");
+
+    // Отправка (обрезаем, если слишком длинное)
+    await bot.sendMessage(fromId, msg.length > 4000 ? msg.slice(0, 4000) + "\n…и ещё отзывы" : msg, { parse_mode: "Markdown" });
+
+  } catch (err) {
+    console.error(err);
+    await bot.sendMessage(fromId, "Ошибка при получении отзывов");
+  }
+
+  return bot.answerCallbackQuery(q.id, { text: "Отзывы загружены" });
+}
+
+
 // ================== Основная часть (заказы) ==================
 let orderId = null;
 let order = null;
@@ -1603,23 +1635,36 @@ if (text === "Выполненные заказы" && id === ADMIN_ID) {
   });
 }
 
-// ===== Статистика заказов =====
 if (text === "Статистика" && id === ADMIN_ID) {
-  const [[{ c: total }]] = await db.execute("SELECT COUNT(*) AS c FROM orders");
-  const [[{ c: newO }]] = await db.execute("SELECT COUNT(*) AS c FROM orders WHERE status='new'");
-  const [[{ c: taken }]] = await db.execute("SELECT COUNT(*) AS c FROM orders WHERE status='taken'");
-  const [[{ c: delivered }]] = await db.execute("SELECT COUNT(*) AS c FROM orders WHERE status='delivered'");
+  try {
+    // ===== Статистика заказов =====
+    const [[{ c: total }]] = await db.execute("SELECT COUNT(*) AS c FROM orders");
+    const [[{ c: newO }]] = await db.execute("SELECT COUNT(*) AS c FROM orders WHERE status='new'");
+    const [[{ c: taken }]] = await db.execute("SELECT COUNT(*) AS c FROM orders WHERE status='taken'");
+    const [[{ c: delivered }]] = await db.execute("SELECT COUNT(*) AS c FROM orders WHERE status='delivered'");
 
-  return bot.sendMessage(
-    id,
-    `Статистика заказов
+    // ===== Список курьеров =====
+    const [couriers] = await db.execute("SELECT username FROM couriers");
 
-Всего: ${total}
-Новые: ${newO}
-Взяты: ${taken}
-Доставлены: ${delivered}`
-  );
+    // Формируем inline-кнопки для каждого курьера
+    const keyboard = couriers.map(c => [{ text: `@${c.username}`, callback_data: `reviews_${c.username}` }]);
+    if (keyboard.length === 0) keyboard.push([{ text: "Нет курьеров", callback_data: "none" }]);
+
+    // ===== Отправляем сообщение =====
+    await bot.sendMessage(
+      id,
+      `📊 *Статистика заказов*\n\nВсего: ${total}\nНовые: ${newO}\nВзяты: ${taken}\nДоставлены: ${delivered}\n\n👇 Нажмите на курьера, чтобы посмотреть отзывы`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: keyboard }
+      }
+    );
+  } catch (err) {
+    console.error("Ошибка при показе статистики:", err);
+    await bot.sendMessage(id, "Ошибка при получении статистики заказов");
+  }
 }
+
 
 // ===== Кнопка "Рассылка" =====
 if (text === "Рассылка" && id === ADMIN_ID) {
