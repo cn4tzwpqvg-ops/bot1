@@ -677,10 +677,7 @@ bot.on("callback_query", async (q) => {
 // ================== Просмотр отзывов курьера ==================
 if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 
-  // username курьера БЕЗ @ (как в БД)
-  const courierUsername = data
-    .replace("reviews_", "")
-    .replace(/^@/, "");
+  const courierUsername = data.replace("reviews_", "").replace(/^@/, "");
 
   try {
     const [reviews] = await db.execute(
@@ -694,23 +691,24 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
     if (reviews.length === 0) {
       return bot.sendMessage(
         fromId,
-        `❌ У курьера @${courierUsername} пока нет отзывов`
+        `❌ У курьера @${escapeMarkdownV2(courierUsername)} пока нет отзывов`,
+        { parse_mode: "MarkdownV2" }
       );
     }
 
     const msg = reviews.map(r =>
-      `*Заказ №${r.order_id}*\n` +
-      `👤 Клиент: @${r.client_username}\n` +
-      `🚚 Курьер: @${r.courier_username}\n` +
-      `⭐ Оценка: ${r.rating}/5\n` +
-      `📝 Отзыв: ${r.review_text || "—"}\n` +
-      `📅 Дата: ${new Date(r.created_at).toLocaleString("ru-RU")}`
+      `*Заказ №${escapeMarkdownV2(String(r.order_id))}*\n` +
+      `👤 Клиент: @${escapeMarkdownV2(r.client_username)}\n` +
+      `🚚 Курьер: @${escapeMarkdownV2(r.courier_username)}\n` +
+      `⭐ Оценка: ${escapeMarkdownV2(String(r.rating))}/5\n` +
+      `📝 Отзыв: ${escapeMarkdownV2(r.review_text || "—")}\n` +
+      `📅 Дата: ${escapeMarkdownV2(new Date(r.created_at).toLocaleString("ru-RU"))}`
     ).join("\n\n--------------------\n\n");
 
     await bot.sendMessage(
       fromId,
       msg.length > 4000 ? msg.slice(0, 4000) + "\n…и ещё отзывы" : msg,
-      { parse_mode: "Markdown" }
+      { parse_mode: "MarkdownV2" }
     );
 
   } catch (err) {
@@ -720,6 +718,7 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 
   return bot.answerCallbackQuery(q.id, { text: "Отзывы загружены" });
 }
+
 
 
 
