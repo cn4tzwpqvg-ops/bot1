@@ -126,6 +126,12 @@ function escapeMarkdown(text) {
   return text.replace(/([*_`[\]])/g, "\\$1");
 }
 
+function withAt(username) {
+  if (!username) return "—";
+  return username.startsWith("@") ? username : `@${username}`;
+}
+
+
 
 // ================= Курьеры =================
 async function getCouriers() {
@@ -444,7 +450,7 @@ function buildOrderMessage(order) {
 
   return [
     `*Заказ №${escapeMarkdownV2(String(order.id))}*`,
-    `*Клиент:* ${escapeMarkdownV2(order.tgNick || "—")}`,
+    `*Клиент:* ${escapeMarkdownV2(withAt(order.tgNick))}`,
     `*Город:* ${escapeMarkdownV2(order.city || "—")}`,
     `*Доставка:* ${escapeMarkdownV2(deliveryMap[order.delivery] || order.delivery || "—")}`,
     `*Оплата:* ${escapeMarkdownV2(paymentMap[order.payment] || order.payment || "—")}`,
@@ -1128,7 +1134,7 @@ console.log(
     `Новый отзыв
 
  Заказ: №${review.orderId}
- Клиент: ${review.client}
+ Клиент: ${withAt(review.client)}
  Курьер: @${review.courier}
  Оценка: ${review.rating}/5
 
