@@ -1441,19 +1441,26 @@ if (text === "Назад") {
 }
 
 // ===== АКТИВНЫЕ ЗАКАЗЫ =====
+// ===== АКТИВНЫЕ ЗАКАЗЫ =====
 if (text === "Активные заказы") {
   const userId = id;
   const userName = username;
   const isAdmin = userId === ADMIN_ID;
+  const isCourierUser = await isCourier(userName);
+  const courierName = userName.replace(/^@/, "");
 
+  // Берём все заказы со статусом new или taken
   const [orders] = await db.query(
     `SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at DESC`
   );
 
+  // Фильтруем для конкретного курьера (или показываем всё администратору)
   const activeOrders = orders.filter(order => {
-    if (isAdmin) return true;
-    const courierName = userName.replace(/^@/, "");
+    if (isAdmin) return true; // админ видит все
+    if (!isCourierUser) return false; // обычный пользователь не видит
+    // Новый заказ без курьера — может взять любой курьер
     if (order.status === "new" && !order.courier_username) return true;
+    // Заказ уже взят этим курьером
     if (order.status === "taken" && order.courier_username?.replace(/^@/, "") === courierName) return true;
     return false;
   });
@@ -1473,10 +1480,58 @@ if (text === "Активные заказы") {
     });
   }
 
+  // Отправка заказов с той же логикой кнопок, что и при приходе нового заказа
   for (const order of activeOrders) {
-    await sendOrUpdateOrder(order);
+    // Определяем, кто получатель
+    const isClient = order.client_chat_id === userId;
+    const isOwnerCourier = order.courier_username?.replace(/^@/, "") === courierName;
+    
+    // ================== Кнопки ==================
+    let keyboard = [];
+
+    // Курьеры и админ
+    const canSeeButtons = !isClient && (isCourierUser || isAdmin);
+
+    if (canSeeButtons) {
+      if (order.status === "new") {
+        keyboard.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
+      } else if (order.status === "taken" && isOwnerCourier) {
+        keyboard.push([
+          { text: "❌ Отказаться", callback_data: `release_${order.id}` },
+          { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
+        ]);
+      }
+    }
+
+    // Кнопка для клиента
+    if (isClient) {
+      const orderAge = Date.now() - new Date(order.created_at).getTime();
+      if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
+        keyboard.push([{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]);
+      }
+    }
+
+    // Если заказ отменён — убираем кнопки и добавляем текст
+    let msgText = buildOrderMessage({
+      ...order,
+      courier_username: order.courier_username || "—"
+    });
+    if (order.status === "canceled") {
+      msgText += "\n\n❌ Заказ был отменён покупателем";
+      keyboard = [];
+    }
+
+    try {
+      await bot.sendMessage(userId, msgText, {
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+    } catch (err) {
+      console.error(`Ошибка отправки заказа №${order.id} для @${userName}:`, err.message);
+    }
   }
 }
+
 
 // ===== ВЫПОЛНЕННЫЕ ЗАКАЗЫ =====
 if (text === "Выполненные заказы") {
