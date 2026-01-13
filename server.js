@@ -1212,7 +1212,6 @@ return bot.sendMessage(
 );
 }
 
-
 // ===== Обработка выбора курьера для просмотра его заказов =====
 if (adminWaitingOrdersCourier.has(username)) {
   if (text === "Назад") {
@@ -1224,12 +1223,13 @@ if (adminWaitingOrdersCourier.has(username)) {
           [{ text: "Статистика" }, { text: "Курьеры" }],
           [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
           [{ text: "Список курьеров" }, { text: "Рассылка" }],
-          [{ text: "Выполненные заказы" }, { text: "Назад" }]
+          [{ text: "Назад" }]
         ],
         resize_keyboard: true
       }
     });
   }
+
 
   const selectedCourier = text.replace(/^@/, "").trim();
   if (!selectedCourier) {
@@ -1518,14 +1518,13 @@ if (text === "Выполненные заказы") {
 
 
   // ===== Панель администратора =====
-// ===== Панель администратора =====
 if (text === "Панель администратора" && id === ADMIN_ID) {
   const kb = {
     keyboard: [
       [{ text: "Статистика" }, { text: "Курьеры" }],
       [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-      [{ text: "Список курьеров" }, { text: "Все пользователи" }], // добавили кнопку
-      [{ text: "Рассылка" }, { text: "Выполненные заказы" }],
+      [{ text: "Список курьеров" }, { text: "Все пользователи" }], // оставляем
+      [{ text: "Рассылка" }], // убрали "Выполненные заказы"
       [{ text: "Назад" }]
     ],
     resize_keyboard: true
@@ -1752,12 +1751,11 @@ if (text === "Панель курьера" && (COURIERS[username] || id === ADMI
 // ===== Просмотр заказов курьера =====
 if ((text === "Активные заказы" || text === "Выполненные заказы") && await isCourier(username)) {
   const isActive = text === "Активные заказы";
-
   console.log(`${isActive ? "Активные" : "Выполненные"} заказы курьера @${username} (id: ${id})`);
 
-  // Запрос заказов для этого курьера
+  // Запрос заказов для курьера
   const query = isActive
-    ? "SELECT * FROM orders WHERE status IN ('new','taken') AND courier_username=? ORDER BY created_at DESC"
+    ? "SELECT * FROM orders WHERE status IN ('new','taken') AND (courier_username=? OR (status='new' AND courier_username IS NULL)) ORDER BY created_at DESC"
     : "SELECT * FROM orders WHERE status='delivered' AND courier_username=? ORDER BY delivered_at DESC";
 
   const [orders] = await db.execute(query, [username]);
@@ -1767,10 +1765,9 @@ if ((text === "Активные заказы" || text === "Выполненны�
     return bot.sendMessage(id, `Нет ${isActive ? "активных" : "выполненных"} заказов`);
   }
 
-  // Отправка заказов параллельно
-  await Promise.all(
-    orders.map(async (o) => {
-      // Приводим все поля к строкам, чтобы escapeMarkdownV2 не падал
+  if (isActive) {
+    // Активные заказы — отдельное сообщение на каждый заказ с кнопками
+    for (const o of orders) {
       const orderSafe = {
         ...o,
         orderText: o.orderText || "—",
@@ -1782,17 +1779,14 @@ if ((text === "Активные заказы" || text === "Выполненны�
         time: o.time || "—"
       };
 
-      // Inline-кнопки только для активных заказов
       let inlineKeyboard;
-      if (isActive) {
-        if (o.status === "new") {
-          inlineKeyboard = [[{ text: "Взять заказ", callback_data: `take_${o.id}` }]];
-        } else if (o.status === "taken") {
-          inlineKeyboard = [[
-            { text: "Доставлен", callback_data: `delivered_${o.id}` },
-            { text: "Отказаться", callback_data: `release_${o.id}` }
-          ]];
-        }
+      if (o.status === "new") {
+        inlineKeyboard = [[{ text: "Взять заказ", callback_data: `take_${o.id}` }]];
+      } else if (o.status === "taken") {
+        inlineKeyboard = [[
+          { text: "Доставлен", callback_data: `delivered_${o.id}` },
+          { text: "Отказаться", callback_data: `release_${o.id}` }
+        ]];
       }
 
       try {
@@ -1802,10 +1796,23 @@ if ((text === "Активные заказы" || text === "Выполненны�
           reply_markup: inlineKeyboard ? { inline_keyboard: inlineKeyboard } : undefined
         });
       } catch (err) {
-        console.error(`Ошибка отправки заказа №${o.id} курьеру @${username}:`, err.message);
+        console.error(`Ошибка отправки активного заказа №${o.id} курьеру @${username}:`, err.message);
       }
-    })
-  );
+    }
+  } else {
+    // Выполненные заказы — объединяем в одно сообщение
+    const msg = orders.map(o => {
+      const deliveredAt = o.delivered_at || o.created_at;
+      const d = new Date(deliveredAt);
+      return `Заказ №${o.id}\nДоставлен: ${d.toLocaleDateString("ru-RU")} ${d.toLocaleTimeString("ru-RU")}\n${o.orderText || "—"}`;
+    }).join("\n\n");
+
+    try {
+      await bot.sendMessage(id, msg);
+    } catch (err) {
+      console.error(`Ошибка отправки выполненных заказов курьеру @${username}:`, err.message);
+    }
+  }
 
   console.log(`Все ${isActive ? "активные" : "выполненные"} заказы отправлены курьеру @${username}`);
   return;
