@@ -689,12 +689,14 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
       [courierUsername]
     );
 
-    if (reviews.length === 0) {
-      return bot.sendMessage(
-        fromId,
-        `❌ У курьера @${courierUsername} пока нет отзывов`
-      );
-    }
+   if (!reviews || reviews.length === 0) {
+  return bot.sendMessage(
+    fromId,
+    `❌ У пользователя @${escapeMarkdownV2(courierUsername)} пока нет отзывов`,
+    { parse_mode: "MarkdownV2" }
+  );
+}
+
 
     const msg = reviews.map(r =>
   `*Заказ №${escapeMarkdownV2(r.order_id)}*\n` +
