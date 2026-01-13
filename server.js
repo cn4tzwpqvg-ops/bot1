@@ -1440,28 +1440,38 @@ if (text === "Назад") {
   });
 }
 
-//
 if (text === "Активные заказы") {
-  const courierUsername = username.replace(/^@/, "");
+  // Приводим username курьера к нижнему регистру и убираем @
+  const courierUsername = username.replace(/^@/, "").trim().toLowerCase();
 
-  // Берём все заказы со статусом new или taken
+  // SQL: берём только новые заказы без курьера и взятые этим курьером
   const [orders] = await db.query(
     `SELECT * FROM orders
-     WHERE status IN ('new','taken')
-     ORDER BY created_at DESC`
+     WHERE (status = 'new' AND courier_username IS NULL)
+        OR (status = 'taken' AND LOWER(courier_username) = ?)
+     ORDER BY created_at DESC`,
+    [courierUsername]
   );
 
-  // Фильтруем для конкретного курьера
+  console.log(`Все заказы new/taken для курьера @${courierUsername}:`, orders);
+
+  // JS фильтр на всякий случай
   const activeOrders = orders.filter(order => {
-    // Новый заказ без курьера — может взять любой курьер
-    if (order.status === "new" && !order.courier_username) return true;
-    // Заказ уже взят этим курьером
-    if (order.status === "taken" && order.courier_username?.replace(/^@/, "") === courierUsername) return true;
-    return false;
-  });
+  const orderCourier = (order.courier_username || "").replace(/^@/, "").trim().toLowerCase();
+  
+  // Новый заказ без курьера — может взять любой курьер
+  if (order.status === "new" && orderCourier === "") return true;
 
-  console.log(`Активные заказы курьера @${username} (id: ${id})`);
+  // Заказ уже взят этим курьером
+  if (order.status === "taken" && orderCourier === courierUsername) return true;
 
+  return false;
+});
+console.log(`activeOrders после фильтра:`, activeOrders.map(o => ({ id: o.id, status: o.status, courier: o.courier_username })));
+
+  console.log(`Активные заказы после фильтра для @${courierUsername}:`, activeOrders);
+
+  // Если активных заказов нет
   if (!activeOrders.length) {
     return bot.sendMessage(id, "Нет активных заказов у курьера", {
       reply_markup: {
@@ -1475,11 +1485,13 @@ if (text === "Активные заказы") {
     });
   }
 
-  // Отправляем каждый заказ отдельным сообщением
+  // Отправляем каждый заказ
   for (const order of activeOrders) {
-    await sendOrUpdateOrder(order); // кнопки и логика уже внутри функции
+    console.log(`Отправляем заказ №${order.id}, статус: ${order.status}`);
+    await sendOrUpdateOrder(order); // кнопки и логика внутри функции
   }
 }
+
 
 
 
