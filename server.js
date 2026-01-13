@@ -1453,20 +1453,16 @@ if (text === "Активные заказы") {
     `SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at DESC`
   );
 
-  // Фильтрация
+  // Фильтруем для конкретного курьера или показываем всё администратору
   const activeOrders = orders.filter(order => {
-    if (isAdmin) return true;
-    if (!isCourierUser) return false;
-
-    if (order.status === "new" && !order.courier_username) return true;
-
-    if (
-      order.status === "taken" &&
-      order.courier_username?.replace(/^@/, "") === courierName
-    ) return true;
-
+    if (isAdmin) return true; // админ видит все
+    if (!isCourierUser) return false; // обычный пользователь не видит
+    if (order.status === "new" && !order.courier_username) return true; // новый заказ без курьера
+    if (order.status === "taken" && order.courier_username?.replace(/^@/, "") === courierName) return true; // заказ взял курьер
     return false;
   });
+
+  console.log(`Все заказы new/taken для ${isAdmin ? "админа" : "курьера @" + userName}:`, activeOrders);
 
   if (!activeOrders.length) {
     return bot.sendMessage(userId, "Нет активных заказов", {
@@ -1481,10 +1477,59 @@ if (text === "Активные заказы") {
     });
   }
 
-  // ❗❗❗ ВАЖНО: ОТПРАВЛЯЕМ ТОЛЬКО ЧЕРЕЗ sendOrUpdateOrder
+  // Отправляем уведомление перед списком заказов
+  await bot.sendMessage(userId, "📦 Активные заказы:");
+
+  // Отправка заказов с кнопками как при новом приходе
   for (const order of activeOrders) {
-    await sendOrUpdateOrder(order);
+    const isClient = order.client_chat_id === userId;
+    const isOwnerCourier = order.courier_username?.replace(/^@/, "") === courierName;
+
+    // ================== Формируем кнопки ==================
+    let keyboard = [];
+
+    const canSeeButtons = !isClient && (isCourierUser || isAdmin);
+
+    if (canSeeButtons) {
+      if (order.status === "new") {
+        keyboard.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
+      } else if (order.status === "taken" && isOwnerCourier) {
+        keyboard.push([
+          { text: "❌ Отказаться", callback_data: `release_${order.id}` },
+          { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
+        ]);
+      }
+    }
+
+    // Кнопка для клиента
+    if (isClient) {
+      const orderAge = Date.now() - new Date(order.created_at).getTime();
+      if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
+        keyboard.push([{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]);
+      }
+    }
+
+    // Если заказ отменён — убираем кнопки и добавляем текст
+    let msgText = buildOrderMessage({
+      ...order,
+      courier_username: order.courier_username || "—"
+    });
+    if (order.status === "canceled") {
+      msgText += "\n\n❌ Заказ был отменён покупателем";
+      keyboard = [];
+    }
+
+    try {
+      await bot.sendMessage(userId, msgText, {
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+    } catch (err) {
+      console.error(`Ошибка отправки заказа №${order.id} для @${userName}:`, err.message);
+    }
   }
+
+  console.log(`Все активные заказы отправлены ${isAdmin ? "админу" : "курьеру @" + userName}`);
 }
 
 
