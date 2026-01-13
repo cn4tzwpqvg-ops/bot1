@@ -1444,7 +1444,9 @@ if (text === "Активные заказы") {
   // Приводим username курьера к нижнему регистру и убираем @
   const courierUsername = username.replace(/^@/, "").trim().toLowerCase();
 
-  // SQL: берём только новые заказы без курьера и взятые этим курьером
+  const isAdmin = fromId === ADMIN_ID; // проверка, админ ли
+
+  // SQL: берём новые заказы без курьера и взятые этим курьером
   const [orders] = await db.query(
     `SELECT * FROM orders
      WHERE (status = 'new' AND courier_username IS NULL)
@@ -1457,19 +1459,20 @@ if (text === "Активные заказы") {
 
   // JS фильтр на всякий случай
   const activeOrders = orders.filter(order => {
-  const orderCourier = (order.courier_username || "").replace(/^@/, "").trim().toLowerCase();
-  
-  // Новый заказ без курьера — может взять любой курьер
-  if (order.status === "new" && orderCourier === "") return true;
+    const orderCourier = (order.courier_username || "").replace(/^@/, "").trim().toLowerCase();
 
-  // Заказ уже взят этим курьером
-  if (order.status === "taken" && orderCourier === courierUsername) return true;
+    if (isAdmin) return true; // админ видит все заказы
 
-  return false;
-});
-console.log(`activeOrders после фильтра:`, activeOrders.map(o => ({ id: o.id, status: o.status, courier: o.courier_username })));
+    // Новый заказ без курьера — может взять любой курьер
+    if (order.status === "new" && orderCourier === "") return true;
 
-  console.log(`Активные заказы после фильтра для @${courierUsername}:`, activeOrders);
+    // Заказ уже взят этим курьером
+    if (order.status === "taken" && orderCourier === courierUsername) return true;
+
+    return false;
+  });
+
+  console.log(`activeOrders после фильтра для @${courierUsername}:`, activeOrders);
 
   // Если активных заказов нет
   if (!activeOrders.length) {
@@ -1491,8 +1494,6 @@ console.log(`activeOrders после фильтра:`, activeOrders.map(o => ({ 
     await sendOrUpdateOrder(order); // кнопки и логика внутри функции
   }
 }
-
-
 
 
 
