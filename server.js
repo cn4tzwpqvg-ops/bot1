@@ -697,13 +697,14 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
     }
 
     const msg = reviews.map(r =>
-      `*Заказ №${escapeMarkdownV2(r.order_id)}*\n` +
-      `👤 Клиент: @${escapeMarkdownV2(r.client_username)}\n` +
-      `🚚 Курьер: @${escapeMarkdownV2(r.courier_username)}\n` +
-      `⭐ Оценка: ${escapeMarkdownV2(r.rating)}/5\n` +
-      `📝 Отзыв: ${escapeMarkdownV2(r.review_text || "—")}\n` +
-      `📅 Дата: ${escapeMarkdownV2(new Date(r.created_at).toLocaleString("ru-RU"))}`
-    ).join("\n\n--------------------\n\n");
+  `*Заказ №${escapeMarkdownV2(r.order_id)}*\n` +
+  `👤 Клиент: @${escapeMarkdownV2(r.client_username)}\n` +
+  `🚚 Курьер: @${escapeMarkdownV2(r.courier_username)}\n` +
+  `⭐ Оценка: ${r.rating}/5\n` +  // число экранировать не нужно
+  `📝 Отзыв: ${escapeMarkdownV2(r.review_text || "—")}\n` +
+  `📅 Дата: ${escapeMarkdownV2(new Date(r.created_at).toLocaleString("ru-RU"))}`
+).join("\n\n--------------------\n\n");
+
 
     await bot.sendMessage(
       fromId,
@@ -1166,6 +1167,7 @@ const now = new Date().toISOString().slice(0, 19).replace("T", " "); // MySQL DA
 const courierNick = review.courier.replace(/^@/, "");
 const clientNick = review.client.replace(/^@/, "");
 
+// Сохраняем в БД (не меняем Markdown, БД спокойно хранит спецсимволы)
 await db.execute(
   `INSERT INTO reviews (
      order_id,
@@ -1182,18 +1184,24 @@ console.log(
   `Отзыв сохранён: заказ ${review.orderId}, рейтинг ${review.rating}, клиент @${clientNick}, курьер @${courierNick}`
 );
 
+// ===== Экранируем MarkdownV2 перед отправкой =====
+function escapeMarkdownV2(text) {
+  if (text == null) return "";
+  return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
+
 // отправляем админу
 await bot.sendMessage(
   ADMIN_ID,
   `Новый отзыв
 
 Заказ: №${review.orderId}
-Клиент: @${clientNick}
-Курьер: @${courierNick}
+Клиент: @${escapeMarkdownV2(clientNick)}
+Курьер: @${escapeMarkdownV2(courierNick)}
 Оценка: ${review.rating}/5
 
 Отзыв:
-${reviewText}`,
+${escapeMarkdownV2(reviewText)}`,
   { parse_mode: "MarkdownV2" }
 );
 
