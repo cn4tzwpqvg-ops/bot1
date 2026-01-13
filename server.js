@@ -1440,41 +1440,28 @@ if (text === "Назад") {
   });
 }
 
-
 // ===== АКТИВНЫЕ ЗАКАЗЫ =====
 if (text === "Активные заказы") {
-  const courierUsername = username.replace(/^@/, "").trim().toLowerCase();
+  const userId = id;
+  const userName = username;
+  const isAdmin = userId === ADMIN_ID;
 
-  // Проверка на админа
-  const isAdmin = id === ADMIN_ID; // <-- используем id, который у тебя есть
-
-  // Берём новые заказы без курьера и взятые этим курьером
   const [orders] = await db.query(
-    `SELECT * FROM orders
-     WHERE (status = 'new' AND courier_username IS NULL)
-        OR (status = 'taken' AND LOWER(courier_username) = ?)
-     ORDER BY created_at DESC`,
-    [courierUsername]
+    `SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at DESC`
   );
 
-  console.log(`Все заказы new/taken для курьера @${courierUsername}:`, orders);
-
-  // Фильтр заказов
   const activeOrders = orders.filter(order => {
-    const orderCourier = (order.courier_username || "").replace(/^@/, "").trim().toLowerCase();
-
-    if (isAdmin) return true; // админ видит все заказы
-
-    if (order.status === "new" && orderCourier === "") return true;
-    if (order.status === "taken" && orderCourier === courierUsername) return true;
-
+    if (isAdmin) return true;
+    const courierName = userName.replace(/^@/, "");
+    if (order.status === "new" && !order.courier_username) return true;
+    if (order.status === "taken" && order.courier_username?.replace(/^@/, "") === courierName) return true;
     return false;
   });
 
-  console.log(`activeOrders после фильтра для @${courierUsername}:`, activeOrders);
+  console.log(`Все заказы new/taken для ${isAdmin ? 'админа' : 'курьера @'+userName}:`, activeOrders);
 
   if (!activeOrders.length) {
-    return bot.sendMessage(id, "Нет активных заказов у курьера", {
+    return bot.sendMessage(userId, "Нет активных заказов", {
       reply_markup: {
         keyboard: [
           [{ text: "Активные заказы" }],
@@ -1486,29 +1473,30 @@ if (text === "Активные заказы") {
     });
   }
 
-  // Отправка каждого заказа
   for (const order of activeOrders) {
-    console.log(`Отправляем заказ №${order.id}, статус: ${order.status}`);
     await sendOrUpdateOrder(order);
   }
 }
 
-
-
-
-
-//
-// ---------- ВЫПОЛНЕННЫЕ ЗАКАЗЫ --------------
-//
+// ===== ВЫПОЛНЕННЫЕ ЗАКАЗЫ =====
 if (text === "Выполненные заказы") {
+  const userId = id;
+  const userName = username;
+  const isAdmin = userId === ADMIN_ID;
 
   const [orders] = await db.query(
-    "SELECT * FROM orders WHERE client_chat_id = ? AND status = 'delivered' ORDER BY delivered_at DESC",
-    [id]
+    `SELECT * FROM orders WHERE status = 'delivered' ORDER BY delivered_at DESC`
   );
 
-  if (!orders.length) {
-    return bot.sendMessage(id, "Выполненных заказов пока нет.", {
+  // Фильтруем по курьеру, если это не админ
+  const deliveredOrders = orders.filter(order => {
+    if (isAdmin) return true;
+    const courierName = userName.replace(/^@/, "");
+    return order.courier_username?.replace(/^@/, "") === courierName;
+  });
+
+  if (!deliveredOrders.length) {
+    return bot.sendMessage(userId, "Выполненных заказов пока нет.", {
       reply_markup: {
         keyboard: [
           [{ text: "Активные заказы" }],
@@ -1520,29 +1508,12 @@ if (text === "Выполненные заказы") {
     });
   }
 
-  const msg = orders.map(o => {
-  const deliveredAt = o.delivered_at || o.created_at;
-  const d = new Date(deliveredAt);
-
-  return (
-    `Заказ №${o.id}\n` +
-    `Доставлен: ${d.toLocaleDateString("ru-RU")} ${d.toLocaleTimeString("ru-RU")}\n` +
-    `${o.orderText || "—"}`
-  );
-}).join("\n\n");
-
-
-  return bot.sendMessage(id, msg, {
-    reply_markup: {
-      keyboard: [
-        [{ text: "Активные заказы" }],
-        [{ text: "Выполненные заказы" }],
-        [{ text: "Назад" }]
-      ],
-      resize_keyboard: true
-    }
-  });
+  // Формируем сообщение для каждого заказа
+  for (const order of deliveredOrders) {
+    await sendOrUpdateOrder(order);
+  }
 }
+
 
 
 
