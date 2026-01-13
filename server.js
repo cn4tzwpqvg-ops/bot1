@@ -1451,12 +1451,11 @@ if (text === "Активные заказы") {
   // username курьера без @
   const courierUsername = username.replace(/^@/, "");
 
+  // выбираем только заказы, которые не взяты и не доставлены
   const [orders] = await db.query(
     `SELECT * FROM orders
-     WHERE courier_username = ?
-       AND status != 'delivered'
-     ORDER BY created_at DESC`,
-    [courierUsername]
+     WHERE status = 'new'
+     ORDER BY created_at DESC`
   );
 
   if (!orders.length) {
@@ -1472,15 +1471,28 @@ if (text === "Активные заказы") {
     });
   }
 
-  const msg = orders
-    .map(o =>
+  // отправляем каждый заказ отдельным сообщением с кнопками "Взять / Отказаться"
+  for (const o of orders) {
+    const orderMsg = 
       `📦 Заказ №${o.id}\n` +
       `Статус: ${o.status}\n` +
-      `${o.orderText || "—"}`
-    )
-    .join("\n\n");
+      `${o.orderText || "—"}`;
 
-  return bot.sendMessage(id, msg, {
+    // здесь вставь свои кнопки, как они приходят при новом заказе
+    const buttons = {
+      inline_keyboard: [
+        [
+          { text: "Взять заказ", callback_data: `take_${o.id}` },
+          { text: "Отказаться", callback_data: `decline_${o.id}` }
+        ]
+      ]
+    };
+
+    await bot.sendMessage(id, orderMsg, { reply_markup: buttons });
+  }
+
+  // оставляем клавиатуру назад
+  return bot.sendMessage(id, "Выберите действие:", {
     reply_markup: {
       keyboard: [
         [{ text: "Активные заказы" }],
@@ -1491,6 +1503,7 @@ if (text === "Активные заказы") {
     }
   });
 }
+
 
 
 //
