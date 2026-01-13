@@ -1446,12 +1446,17 @@ if (text === "Назад") {
 
 //
 // ---------- АКТИВНЫЕ ЗАКАЗЫ --------------
-//
 if (text === "Активные заказы") {
 
+  // username курьера без @
+  const courierUsername = username.replace(/^@/, "");
+
   const [orders] = await db.query(
-    "SELECT * FROM orders WHERE client_chat_id = ? AND status != 'delivered' ORDER BY created_at DESC",
-    [id]
+    `SELECT * FROM orders
+     WHERE courier_username = ?
+       AND status != 'delivered'
+     ORDER BY created_at DESC`,
+    [courierUsername]
   );
 
   if (!orders.length) {
@@ -1468,7 +1473,11 @@ if (text === "Активные заказы") {
   }
 
   const msg = orders
-    .map(o => `#${o.id} — статус: ${o.status}\n${o.orderText || "—"}`)
+    .map(o =>
+      `📦 Заказ №${o.id}\n` +
+      `Статус: ${o.status}\n` +
+      `${o.orderText || "—"}`
+    )
     .join("\n\n");
 
   return bot.sendMessage(id, msg, {
@@ -1482,6 +1491,7 @@ if (text === "Активные заказы") {
     }
   });
 }
+
 
 //
 // ---------- ВЫПОЛНЕННЫЕ ЗАКАЗЫ --------------
@@ -1506,14 +1516,17 @@ if (text === "Выполненные заказы") {
     });
   }
 
-  const msg = orders
-    .map(o => {
-      const deliveredAt = o.delivered_at || o.created_at;
-      const d = new Date(deliveredAt);
+  const msg = orders.map(o => {
+  const deliveredAt = o.delivered_at || o.created_at;
+  const d = new Date(deliveredAt);
 
-      return `#${o.id} — доставлен: ${d.toLocaleDateString("ru-RU")} ${d.toLocaleTimeString("ru-RU")}\n${o.orderText || "—"}`;
-    })
-    .join("\n\n");
+  return (
+    `Заказ №${o.id}\n` +
+    `Доставлен: ${d.toLocaleDateString("ru-RU")} ${d.toLocaleTimeString("ru-RU")}\n` +
+    `${o.orderText || "—"}`
+  );
+}).join("\n\n");
+
 
   return bot.sendMessage(id, msg, {
     reply_markup: {
