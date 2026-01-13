@@ -1440,13 +1440,15 @@ if (text === "Назад") {
   });
 }
 
+
+// ===== АКТИВНЫЕ ЗАКАЗЫ =====
 if (text === "Активные заказы") {
-  // Приводим username курьера к нижнему регистру и убираем @
   const courierUsername = username.replace(/^@/, "").trim().toLowerCase();
 
-  const isAdmin = fromId === ADMIN_ID; // проверка, админ ли
+  // Проверка на админа
+  const isAdmin = id === ADMIN_ID; // <-- используем id, который у тебя есть
 
-  // SQL: берём новые заказы без курьера и взятые этим курьером
+  // Берём новые заказы без курьера и взятые этим курьером
   const [orders] = await db.query(
     `SELECT * FROM orders
      WHERE (status = 'new' AND courier_username IS NULL)
@@ -1457,16 +1459,13 @@ if (text === "Активные заказы") {
 
   console.log(`Все заказы new/taken для курьера @${courierUsername}:`, orders);
 
-  // JS фильтр на всякий случай
+  // Фильтр заказов
   const activeOrders = orders.filter(order => {
     const orderCourier = (order.courier_username || "").replace(/^@/, "").trim().toLowerCase();
 
     if (isAdmin) return true; // админ видит все заказы
 
-    // Новый заказ без курьера — может взять любой курьер
     if (order.status === "new" && orderCourier === "") return true;
-
-    // Заказ уже взят этим курьером
     if (order.status === "taken" && orderCourier === courierUsername) return true;
 
     return false;
@@ -1474,7 +1473,6 @@ if (text === "Активные заказы") {
 
   console.log(`activeOrders после фильтра для @${courierUsername}:`, activeOrders);
 
-  // Если активных заказов нет
   if (!activeOrders.length) {
     return bot.sendMessage(id, "Нет активных заказов у курьера", {
       reply_markup: {
@@ -1488,10 +1486,10 @@ if (text === "Активные заказы") {
     });
   }
 
-  // Отправляем каждый заказ
+  // Отправка каждого заказа
   for (const order of activeOrders) {
     console.log(`Отправляем заказ №${order.id}, статус: ${order.status}`);
-    await sendOrUpdateOrder(order); // кнопки и логика внутри функции
+    await sendOrUpdateOrder(order);
   }
 }
 
