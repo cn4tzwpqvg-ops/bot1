@@ -1444,21 +1444,26 @@ if (text === "Назад") {
 if (text === "Активные заказы") {
   const courierUsername = username.replace(/^@/, "");
 
-  // Берём новые заказы и уже взятые курьером
+  // Берём все заказы со статусом new или taken
   const [orders] = await db.query(
     `SELECT * FROM orders
      WHERE status IN ('new','taken')
      ORDER BY created_at DESC`
   );
 
-  // Фильтруем: новые без курьера или взятые этим курьером
+  // Фильтруем для конкретного курьера
   const activeOrders = orders.filter(order => {
-    return (order.status === "new" && !order.courier_username) ||
-           (order.status === "taken" && order.courier_username.replace(/^@/, "") === courierUsername);
+    // Новый заказ без курьера — может взять любой курьер
+    if (order.status === "new" && !order.courier_username) return true;
+    // Заказ уже взят этим курьером
+    if (order.status === "taken" && order.courier_username?.replace(/^@/, "") === courierUsername) return true;
+    return false;
   });
 
+  console.log(`Активные заказы курьера @${username} (id: ${id})`);
+
   if (!activeOrders.length) {
-    return bot.sendMessage(id, "Активных заказов пока нет 🙂", {
+    return bot.sendMessage(id, "Нет активных заказов у курьера", {
       reply_markup: {
         keyboard: [
           [{ text: "Активные заказы" }],
@@ -1472,7 +1477,7 @@ if (text === "Активные заказы") {
 
   // Отправляем каждый заказ отдельным сообщением
   for (const order of activeOrders) {
-    await sendOrUpdateOrder(order);
+    await sendOrUpdateOrder(order); // кнопки и логика уже внутри функции
   }
 }
 
