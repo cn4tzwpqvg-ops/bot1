@@ -789,11 +789,31 @@ if (data.startsWith("take_")) {
   // Получаем обновлённый заказ
   const updatedOrder = await getOrderById(orderId);
 
-  // Отправляем/обновляем сообщение всем получателям
-  await sendOrUpdateOrder(updatedOrder);
+  // Проверяем, есть ли message_id (т.е. callback от inline кнопки)
+  if (q.message && q.message.message_id) {
+    const msgText = buildOrderMessage(updatedOrder);        // формируем текст
+    const keyboard = buildOrderKeyboard(updatedOrder);      // строим inline-кнопки с эмодзи
+
+    try {
+      await bot.editMessageText(msgText, {
+        chat_id: q.message.chat.id,
+        message_id: q.message.message_id,
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+    } catch (err) {
+      console.error(`Ошибка редактирования заказа №${orderId}:`, err.message);
+      // Если редактировать не получилось, отправляем обычным сообщением
+      await sendOrUpdateOrder(updatedOrder);
+    }
+  } else {
+    // Если редактировать нечего — просто отправляем новое сообщение
+    await sendOrUpdateOrder(updatedOrder);
+  }
 
   return bot.answerCallbackQuery(q.id, { text: "Заказ взят" });
 }
+
 
 // ================== RELEASE ==================
 if (data.startsWith("release_")) {
@@ -808,7 +828,8 @@ if (data.startsWith("release_")) {
   }
 
   // Проверка: только курьер, который взял заказ, или админ
-  const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username || fromId === ADMIN_ID;
+  const isOwnerOrAdmin =
+    order.courier_username?.replace(/^@/, "") === username || fromId === ADMIN_ID;
   if (!isOwnerOrAdmin) {
     return bot.answerCallbackQuery(q.id, {
       text: "Вы не можете отказаться от этого заказа",
@@ -829,8 +850,27 @@ if (data.startsWith("release_")) {
 
     const updatedOrder = await getOrderById(orderId);
 
-    // Обновляем/отправляем всем
-    await sendOrUpdateOrder(updatedOrder);
+    // ✅ Обновляем именно текущее сообщение с заказом, если оно есть
+    if (q.message && q.message.message_id) {
+      const msgText = buildOrderMessage(updatedOrder);        // формируем текст
+      const keyboard = buildOrderKeyboard(updatedOrder);      // строим кнопки с эмодзи
+
+      try {
+        await bot.editMessageText(msgText, {
+          chat_id: q.message.chat.id,
+          message_id: q.message.message_id,
+          parse_mode: "MarkdownV2",
+          reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+        });
+      } catch (err) {
+        console.error(`Ошибка редактирования заказа №${orderId}:`, err.message);
+        // fallback: отправляем новое сообщение
+        await sendOrUpdateOrder(updatedOrder);
+      }
+    } else {
+      // Если редактировать нечего — просто отправляем новое сообщение
+      await sendOrUpdateOrder(updatedOrder);
+    }
 
     // Уведомление админа, если отказался курьер
     if (ADMIN_ID && oldCourier && oldCourier !== ADMIN_USERNAME) {
@@ -843,7 +883,6 @@ if (data.startsWith("release_")) {
     return bot.answerCallbackQuery(q.id, {
       text: "Вы отказались от заказа"
     });
-
   } catch (err) {
     console.error(`Ошибка при отказе от заказа ${orderId}:`, err.message);
     return bot.answerCallbackQuery(q.id, {
@@ -853,7 +892,8 @@ if (data.startsWith("release_")) {
   }
 }
 
-// 1️⃣ CONFIRM CANCEL
+
+/// 1️⃣ CONFIRM CANCEL
 if (data.startsWith("confirm_cancel_")) {
   const orderId = data.split("_")[2];
   const order = await getOrderById(orderId);
@@ -864,19 +904,21 @@ if (data.startsWith("confirm_cancel_")) {
     return bot.answerCallbackQuery(q.id, { text: "Заказ не отменяем", show_alert: true });
   }
 
+  // Используем inline-кнопки с эмодзи, как и в sendOrUpdateOrder
+  const keyboard = [
+    [
+      { text: "✅ Да, отменить", callback_data: `cancel_${order.id}` },
+      { text: "❌ Нет", callback_data: `no_cancel_${order.id}` }
+    ]
+  ];
+
   await bot.editMessageText(
     `Вы точно хотите отменить заказ #${order.id}?`,
     {
       chat_id: fromId,
       message_id: q.message.message_id,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Да, отменить", callback_data: `cancel_${order.id}` },
-            { text: "❌ Нет", callback_data: `no_cancel_${order.id}` }
-          ]
-        ]
-      }
+      parse_mode: "MarkdownV2",
+      reply_markup: { inline_keyboard: keyboard }
     }
   );
 
@@ -889,7 +931,9 @@ if (data.startsWith("no_cancel_")) {
   const order = await getOrderById(orderId);
   if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
 
-  await sendOrUpdateOrder(order); // возвращаем обычные кнопки
+  // Возвращаем кнопки через общую функцию, чтобы эмодзи совпадали
+  await sendOrUpdateOrder(order);
+
   return bot.answerCallbackQuery(q.id, { text: "Отмена отменена" });
 }
 
@@ -904,13 +948,12 @@ if (data.startsWith("cancel_")) {
   }
 
   try {
-    // Ставим статус canceled и убираем курьера
+    // Обновляем статус и курьера
     await db.execute("UPDATE orders SET status='canceled', courier_username=NULL WHERE id=?", [orderId]);
 
-    // Обновляем сообщения для всех (клиент + курьеры)
+    // Сразу обновляем текст и кнопки у всех
     const updatedOrder = await getOrderById(orderId);
     await sendOrUpdateOrder(updatedOrder);
-
 
     broadcastStock();
 
@@ -923,11 +966,13 @@ if (data.startsWith("cancel_")) {
 
 
 
-  // ================== DELIVERED ==================
-if (data.startsWith("delivered_")) {                  // ← открытие DELIVERED
+
+ // ================== DELIVERED ==================
+if (data.startsWith("delivered_")) {
   console.log(`DELIVERED заказ ${orderId} пользователем @${username}`);
 
-  if (order.courier_username !== username && fromId !== ADMIN_ID) {
+  // Проверка: только курьер, который взял заказ, или админ
+  if (order.courier_username?.replace(/^@/, "") !== username && fromId !== ADMIN_ID) {
     console.log(`Пользователь @${username} не может отметить заказ ${orderId} как доставленный`);
     return bot.answerCallbackQuery(q.id, {
       text: "Нельзя отметить",
@@ -935,22 +980,29 @@ if (data.startsWith("delivered_")) {                  // ← открытие DE
     });
   }
 
-  await updateOrderStatus(orderId, "delivered", username);
+  try {
+    // Обновляем статус заказа
+    await updateOrderStatus(orderId, "delivered", username);
 
-  const updatedOrder = await getOrderById(orderId);
-  await sendOrUpdateOrder(updatedOrder);
+    // Получаем обновлённый заказ
+    const updatedOrder = await getOrderById(orderId);
 
-  if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
-    await askForReview(updatedOrder);
+    // Сразу обновляем/отправляем сообщение всем (курьерам, клиенту, админу)
+    await sendOrUpdateOrder(updatedOrder);
+
+    // Если клиент ещё не оставил отзыв, спрашиваем его
+    if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
+      await askForReview(updatedOrder);
+    }
+
+    console.log(`Заказ ${orderId} помечен как доставленный`);
+
+    return bot.answerCallbackQuery(q.id, { text: "✅ Заказ доставлен" });
+  } catch (err) {
+    console.error(`Ошибка при отметке заказа ${orderId} как доставленного:`, err.message);
+    return bot.answerCallbackQuery(q.id, { text: "Ошибка при доставке", show_alert: true });
   }
-
-  console.log(`Заказ ${orderId} помечен как доставленный`);
-
-  return bot.answerCallbackQuery(q.id, {
-    text: "Заказ доставлен"
-  });
-}
-                                                    
+}                                                    
 });                                                   
 
 
