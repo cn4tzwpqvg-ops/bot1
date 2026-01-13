@@ -1450,11 +1450,16 @@ if (text === "Активные заказы") {
   // username курьера без @
   const courierUsername = username.replace(/^@/, "");
 
-  // Получаем только новые заказы (никто не взял)
+  // Берём заказы, которые:
+  // - ещё не доставлены
+  // - или свободные (new)
+  // - или взяты этим курьером
   const [orders] = await db.query(
     `SELECT * FROM orders
-     WHERE status = 'new'
-     ORDER BY created_at DESC`
+     WHERE status != 'delivered' 
+       AND (status = 'new' OR courier_username = ?)
+     ORDER BY created_at DESC`,
+    [courierUsername]
   );
 
   if (!orders.length) {
@@ -1470,22 +1475,24 @@ if (text === "Активные заказы") {
     });
   }
 
+  // Отправляем каждый заказ через ту же функцию, что и новые
   for (const order of orders) {
-    const msg = buildOrderMessage(order);
+    // Сбрасываем курьера для свободных заказов
+    if (order.status === "new") order.courier_username = null;
 
-    // Отправляем заказ с кнопками, как при новом заказе
-    await bot.sendMessage(id, msg, {
-      parse_mode: "MarkdownV2",
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Взять заказ", callback_data: `take_${order.id}` },
-            { text: "❌ Отказаться", callback_data: `decline_${order.id}` }
-          ]
-        ]
-      }
-    });
+    await sendOrUpdateOrder(order);
   }
+
+  return bot.sendMessage(id, "Все активные заказы показаны выше 👆", {
+    reply_markup: {
+      keyboard: [
+        [{ text: "Активные заказы" }],
+        [{ text: "Выполненные заказы" }],
+        [{ text: "Назад" }]
+      ],
+      resize_keyboard: true
+    }
+  });
 }
 
 
