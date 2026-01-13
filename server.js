@@ -431,6 +431,8 @@ async function releaseOrderTx(orderId) {
   }
 }
 
+
+
 // =================== Построение сообщения =================
 const deliveryMap = { "DHL": "DHL", "Курьер": "Курьер" };
 const paymentMap = {
@@ -1186,12 +1188,6 @@ await db.execute(
 console.log(
   `Отзыв сохранён: заказ ${review.orderId}, рейтинг ${review.rating}, клиент @${clientNick}, курьер @${courierNick}`
 );
-
-// ===== Экранируем MarkdownV2 перед отправкой =====
-function escapeMarkdownV2(text) {
-  if (text == null) return "";
-  return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
-}
 
 // отправляем админу
 await bot.sendMessage(
