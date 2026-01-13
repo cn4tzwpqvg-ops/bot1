@@ -677,6 +677,7 @@ bot.on("callback_query", async (q) => {
 // ================== Просмотр отзывов курьера ==================
 if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 
+  // username курьера БЕЗ @ (так как в БД без собачки)
   const courierUsername = data.replace("reviews_", "").replace(/^@/, "");
 
   try {
@@ -691,16 +692,15 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
     if (reviews.length === 0) {
       return bot.sendMessage(
         fromId,
-        `❌ У курьера @${escapeMarkdownV2(courierUsername)} пока нет отзывов`,
-        { parse_mode: "MarkdownV2" }
+        `❌ У курьера @${courierUsername} пока нет отзывов`
       );
     }
 
     const msg = reviews.map(r =>
-      `*Заказ №${escapeMarkdownV2(String(r.order_id))}*\n` +
+      `*Заказ №${escapeMarkdownV2(r.order_id)}*\n` +
       `👤 Клиент: @${escapeMarkdownV2(r.client_username)}\n` +
       `🚚 Курьер: @${escapeMarkdownV2(r.courier_username)}\n` +
-      `⭐ Оценка: ${escapeMarkdownV2(String(r.rating))}/5\n` +
+      `⭐ Оценка: ${escapeMarkdownV2(r.rating)}/5\n` +
       `📝 Отзыв: ${escapeMarkdownV2(r.review_text || "—")}\n` +
       `📅 Дата: ${escapeMarkdownV2(new Date(r.created_at).toLocaleString("ru-RU"))}`
     ).join("\n\n--------------------\n\n");
@@ -718,6 +718,7 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 
   return bot.answerCallbackQuery(q.id, { text: "Отзывы загружены" });
 }
+
 
 
 
@@ -1161,9 +1162,9 @@ try {
 // ===== сохраняем отзыв + рейтинг =====
 const now = new Date().toISOString().slice(0, 19).replace("T", " "); // MySQL DATETIME
 
-// 🔥 НОРМАЛИЗУЕМ username (ВСЕГДА БЕЗ @ В БД)
-const cleanClient = (review.client || "").replace(/^@/, "");
-const cleanCourier = (review.courier || "").replace(/^@/, "");
+// Убираем @ перед сохранением в БД
+const courierNick = review.courier.replace(/^@/, "");
+const clientNick = review.client.replace(/^@/, "");
 
 await db.execute(
   `INSERT INTO reviews (
@@ -1174,35 +1175,26 @@ await db.execute(
      review_text,
      created_at
    ) VALUES (?, ?, ?, ?, ?, ?)`,
-  [
-    review.orderId,
-    cleanClient,
-    cleanCourier,
-    review.rating,
-    reviewText,
-    now
-  ]
+  [review.orderId, clientNick, courierNick, review.rating, reviewText, now]
 );
 
 console.log(
-  `Отзыв сохранён: заказ ${review.orderId}, ` +
-  `рейтинг ${review.rating}, ` +
-  `клиент @${cleanClient}, ` +
-  `курьер @${cleanCourier}`
+  `Отзыв сохранён: заказ ${review.orderId}, рейтинг ${review.rating}, клиент @${clientNick}, курьер @${courierNick}`
 );
 
-// ===== отправляем админу =====
+// отправляем админу
 await bot.sendMessage(
   ADMIN_ID,
   `Новый отзыв
 
 Заказ: №${review.orderId}
-Клиент: @${cleanClient}
-Курьер: @${cleanCourier}
+Клиент: @${clientNick}
+Курьер: @${courierNick}
 Оценка: ${review.rating}/5
 
 Отзыв:
-${reviewText}`
+${reviewText}`,
+  { parse_mode: "MarkdownV2" }
 );
 
 waitingReview.delete(id);
