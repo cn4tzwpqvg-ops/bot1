@@ -698,14 +698,15 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 }
 
 
-    const msg = reviews.map(r =>
+   const msg = reviews.map(r =>
   `*Заказ №${escapeMarkdownV2(r.order_id)}*\n` +
   `👤 Клиент: @${escapeMarkdownV2(r.client_username)}\n` +
   `🚚 Курьер: @${escapeMarkdownV2(r.courier_username)}\n` +
-  `⭐ Оценка: ${r.rating}/5\n` +  // число экранировать не нужно
+  `⭐ Оценка: ${r.rating}/5\n` +
   `📝 Отзыв: ${escapeMarkdownV2(r.review_text || "—")}\n` +
   `📅 Дата: ${escapeMarkdownV2(new Date(r.created_at).toLocaleString("ru-RU"))}`
-).join("\n\n--------------------\n\n");
+).join("\n\n\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\\n\n");
+
 
 
     await bot.sendMessage(
