@@ -12,7 +12,7 @@ const pLimit = require("p-limit").default; // убедиться, что уст�
 
 
 
-// ================= Настройки =================
+// ================= Настройки1 =================
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 7664644901;
@@ -389,6 +389,24 @@ function buildKeyboardForRecipient(order, { role, username }) {
   // delivered / canceled — без кнопок
   return [];
 }
+
+function buildOrderMessage(order) {
+  const lines = [
+    `🧾 Заказ №${escapeMarkdownV2(order.id)}`,
+    `👤 Клиент: ${escapeMarkdownV2(withAt(order.tgNick))}`,
+    `🏙 Город: ${escapeMarkdownV2(order.city || "—")}`,
+    `🚚 Доставка: ${escapeMarkdownV2(order.delivery || "—")}`,
+    `💰 Оплата: ${escapeMarkdownV2(order.payment || "—")}`,
+    `📝 Заказ: ${escapeMarkdownV2(order.orderText || "—")}`,
+    `📅 Дата: ${escapeMarkdownV2(order.date || "—")}`,
+    `⏰ Время: ${escapeMarkdownV2(order.time || "—")}`,
+    `🚚 Курьер: ${escapeMarkdownV2(withAt(order.courier_username || "—"))}`,
+    `📌 Статус: ${escapeMarkdownV2(order.status || "—")}`
+  ];
+
+  return lines.join("\n");
+}
+
 
 function buildTextForOrder(order) {
   let msgText = buildOrderMessage({
