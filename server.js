@@ -18,8 +18,7 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 7664644901;
 const PORT = 3000;
 const HOST = "0.0.0.0";
-// Хранилище сообщений заказов: { [orderId]: { chatId, messageId } }
-const orderMessages = {};
+
 
 // ================= Состояние =================
 const adminWaitingOrdersCourier = new Map();
@@ -223,11 +222,18 @@ async function addOrder(order) {
 
   const now = new Date();
   const mysqlDate = order.date ? parseDateForMySQL(order.date) : formatMySQLDate(now);
-  const mysqlTime = order.time ? order.time : `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`;
+
+  // время в формате HH:MM:SS
+  const pad = n => String(n).padStart(2, "0");
+  const mysqlTime = order.time
+    ? order.time
+    : `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
   const createdAt = formatMySQLDateTime(now);
 
   // Вставляем или обновляем заказ
-  await db.execute(`
+  await db.execute(
+    `
     INSERT INTO orders
       (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -241,29 +247,23 @@ async function addOrder(order) {
       time = VALUES(time),
       status = VALUES(status),
       client_chat_id = VALUES(client_chat_id)
-  `, [
-    order.id,
-    order.tgNick,
-    order.city,
-    order.delivery,
-    order.payment,
-    order.orderText,
-    mysqlDate,
-    mysqlTime,
-    order.status || "new",
-    createdAt,
-    order.client_chat_id || null
-  ]);
-
-  // Проверяем, было ли уже сообщение клиенту
-  const messages = await getOrderMessages(order.id);
-  const clientAlreadyNotified = messages.some(m => m.chat_id === order.client_chat_id);
-
-  if (!clientAlreadyNotified) {
-    const updatedOrder = await getOrderById(order.id);
-    await sendOrUpdateOrder(updatedOrder);
-  }
+    `,
+    [
+      order.id,
+      order.tgNick,
+      order.city,
+      order.delivery,
+      order.payment,
+      order.orderText,
+      mysqlDate,
+      mysqlTime,
+      order.status || "new",
+      createdAt,
+      order.client_chat_id || null
+    ]
+  );
 }
+
 
 
 async function getOrderById(id) {
@@ -328,118 +328,202 @@ async function saveOrderMessage(orderId, chatId, messageId) {
 async function clearOrderMessage(orderId, chatId) {
   await db.execute("DELETE FROM order_messages WHERE order_id=? AND chat_id=?", [orderId, chatId]);
 }
+
+async function getOrderMessageForChat(orderId, chatId) {
+  const [rows] = await db.execute(
+    "SELECT message_id FROM order_messages WHERE order_id=? AND chat_id=? LIMIT 1",
+    [orderId, chatId]
+  );
+  return rows[0]?.message_id || null;
+}
+
+async function deleteOrderMessageForChat(orderId, chatId) {
+  const messageId = await getOrderMessageForChat(orderId, chatId);
+  if (!messageId) return;
+
+  try {
+    await bot.deleteMessage(chatId, messageId);
+  } catch (e) {
+    // иногда Telegram не даст удалить — не страшно, просто чистим запись
+  }
+  await clearOrderMessage(orderId, chatId);
+}
+
+function buildKeyboardForRecipient(order, { role, username }) {
+  const owner = order.courier_username?.replace(/^@/, "") || null;
+  const isAdmin = role === "admin";
+  const isCourier = role === "courier";
+  const isClient = role === "client";
+
+  const me = (username || "").replace(/^@/, "");
+  const isOwner = owner && me && owner === me;
+
+  // По умолчанию кнопок нет
+  let keyboard = [];
+
+  // Клиент — только отмена в первые 20 минут и только пока new
+  if (isClient) {
+    const orderAge = Date.now() - new Date(order.created_at).getTime();
+    if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
+      keyboard = [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
+    }
+    return keyboard;
+  }
+
+  // Админ/курьеры
+  if (order.status === "new") {
+    keyboard = [[{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]];
+    return keyboard;
+  }
+
+  if (order.status === "taken") {
+    if (isAdmin || (isCourier && isOwner)) {
+      keyboard = [[
+        { text: "❌ Отказаться", callback_data: `release_${order.id}` },
+        { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
+      ]];
+    }
+    return keyboard;
+  }
+
+  // delivered / canceled — без кнопок
+  return [];
+}
+
+function buildTextForOrder(order) {
+  let msgText = buildOrderMessage({
+    ...order,
+    courier_username: order.courier_username || "—"
+  });
+
+  if (order.status === "canceled") {
+    msgText += "\n\n" + escapeMarkdownV2("❌ Заказ был отменён покупателем");
+  }
+
+  return msgText;
+}
+
+// =================== Отправка / обновление заказа в ОДИН чат ===================
+async function sendOrUpdateOrderToChat(order, chatId, role, username) {
+  const msgText = buildTextForOrder(order);
+  const keyboard = buildKeyboardForRecipient(order, { role, username });
+
+  const existingMsgId = await getOrderMessageForChat(order.id, chatId);
+
+  try {
+    if (existingMsgId) {
+      await bot.editMessageText(msgText, {
+        chat_id: chatId,
+        message_id: existingMsgId,
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+    } else {
+      const sent = await bot.sendMessage(chatId, msgText, {
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+      await saveOrderMessage(order.id, chatId, sent.message_id);
+    }
+  } catch (err) {
+    const emsg = String(err?.message || "");
+
+    // Нормальная ситуация — Telegram ругается, что текст не изменился
+    if (emsg.includes("message is not modified")) return;
+
+    // Если старое сообщение уже удалено/не найдено — чистим запись и шлём заново
+    if (
+      emsg.includes("message to edit not found") ||
+      emsg.includes("message identifier is not specified") ||
+      emsg.includes("message can't be edited") ||
+      emsg.includes("MESSAGE_ID_INVALID")
+    ) {
+      await clearOrderMessage(order.id, chatId);
+    }
+
+    // Пытаемся отправить заново и сохранить новый message_id
+    try {
+      const sent = await bot.sendMessage(chatId, msgText, {
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+      await saveOrderMessage(order.id, chatId, sent.message_id);
+    } catch (e2) {
+      console.error(`[ERROR] sendOrUpdateOrderToChat ${order.id} -> ${chatId}:`, e2.message);
+    }
+  }
+}
+
+// =================== ГЛАВНОЕ: разослать/обновить всем участникам ===================
+async function sendOrUpdateOrderAll(order) {
+  // Собираем получателей без дублей
+  const recipientsMap = new Map();
+
+  // Админ
+  if (ADMIN_ID) {
+    recipientsMap.set(ADMIN_ID, {
+      chatId: ADMIN_ID,
+      role: "admin",
+      username: ADMIN_USERNAME
+    });
+  }
+
+  // Курьеры
+  const [couriers] = await db.execute(
+    "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
+  );
+  for (const c of couriers) {
+    recipientsMap.set(c.chat_id, {
+      chatId: c.chat_id,
+      role: "courier",
+      username: c.username
+    });
+  }
+
+  // Клиент
+  if (order.client_chat_id) {
+    recipientsMap.set(order.client_chat_id, {
+      chatId: order.client_chat_id,
+      role: "client",
+      username: order.tgNick?.replace(/^@/, "") || ""
+    });
+  }
+
+  const recipients = Array.from(recipientsMap.values());
+  const owner = order.courier_username?.replace(/^@/, "") || null;
+
+  for (const r of recipients) {
+    const isCourier = r.role === "courier";
+    const isAdmin = r.role === "admin";
+
+    // 1) Если заказ отменён — убираем у всех курьеров (админу/клиенту оставляем)
+    if (order.status === "canceled" && isCourier && !isAdmin) {
+      await deleteOrderMessageForChat(order.id, r.chatId);
+      continue;
+    }
+
+    // 2) Если заказ взят — убираем у других курьеров (кроме владельца и админа)
+    if (order.status === "taken" && isCourier && !isAdmin) {
+      const courierUname = (r.username || "").replace(/^@/, "");
+      if (owner && courierUname !== owner) {
+        await deleteOrderMessageForChat(order.id, r.chatId);
+        continue;
+      }
+    }
+
+    // 3) В остальных случаях — обновляем/отправляем
+    await sendOrUpdateOrderToChat(order, r.chatId, r.role, r.username);
+  }
+}
+
+
+
+
 // =================== Вспомогательная функция ===================
 function escapeMarkdownV2(text) {
   if (text == null) return "";
   return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }
-
-// =================== Построение inline-клавиатуры заказа ===================
-function buildOrderKeyboard(order, username = null, fromId = null, ADMIN_ID = null) {
-  if (!order) return [];
-
-  const buttons = [];
-
-  if (order.status === "new") {
-    buttons.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
-  } else if (order.status === "taken") {
-    const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username || fromId === ADMIN_ID;
-
-    if (isOwnerOrAdmin) {
-      buttons.push([{ text: "❌ Отказаться", callback_data: `release_${order.id}` }]);
-      buttons.push([{ text: "✅ Доставлено", callback_data: `delivered_${order.id}` }]);
-    } else {
-      // если username null — рассылка всем, показываем просто "🚚 Взят"
-      buttons.push([{ text: "🚚 Взят", callback_data: `noop` }]);
-    }
-  } else if (order.status === "canceled") {
-    buttons.push([{ text: "❌ Отменён", callback_data: `noop` }]);
-  }
-
-  return buttons;
-}
-
-
-// =================== Экранирование текста кнопок ===================
-function escapeButton(text) {
-  return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
-}
-
-// =================== Обновление или отправка сообщения заказа ===================
-async function updateOrderMessage(order, chatId = null, messageId = null, username = null, fromId = null, ADMIN_ID = null) {
-  if (!order) return;
-
-  // Экранируем текст заказа один раз
-  const msgText = escapeMarkdownV2(buildOrderMessage(order));
-
-  // Построение кнопок (только кнопки экранируем через escapeButton)
-  const keyboard = buildOrderKeyboard(order, username, fromId, ADMIN_ID).map(row =>
-    row.map(btn => ({ text: escapeButton(btn.text), callback_data: btn.callback_data }))
-  );
-
-  try {
-    if (chatId && messageId) {
-      await bot.editMessageText(msgText, { // <--- здесь используем уже готовый msgText
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-      });
-    } else if (order.client_chat_id) {
-      const sentMsg = await bot.sendMessage(order.client_chat_id, msgText, { // <--- тоже
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-      });
-
-      // Сохраняем сообщение
-      if (!orderMessages[order.id]) orderMessages[order.id] = {};
-
-// Сохраняем сообщение по chatId участника
-orderMessages[order.id][sentMsg.chat.id] = {
-  chatId: sentMsg.chat.id,
-  messageId: sentMsg.message_id
-};
-    }
-  } catch (err) {
-    console.error(`Ошибка обновления сообщения заказа №${order.id}:`, err.message);
-    if (order.client_chat_id) {
-      await sendOrUpdateOrder(order);
-    }
-  }
-}
-
-
-// =================== Отправка/обновление заказа всем участникам ===================
-async function sendOrUpdateOrder(order, ADMIN_ID = null) {
-  if (!order) return;
-
-  // ================= 1️⃣ Админ =================
-  if (ADMIN_ID) {
-    // Берем chatId админа как ключ
-    const adminMsg = orderMessages[order.id]?.[ADMIN_ID];
-    await updateOrderMessage(order, adminMsg?.chatId, adminMsg?.messageId, null, ADMIN_ID, ADMIN_ID);
-  }
-
-  // ================= 2️⃣ Все курьеры =================
-  const [couriers] = await db.execute("SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL");
-  for (const courier of couriers) {
-    const msg = orderMessages[order.id]?.[courier.chat_id];
-    await updateOrderMessage(order, msg?.chatId, msg?.messageId, courier.username, courier.chat_id, ADMIN_ID);
-  }
-
-  // ================= 3️⃣ Клиент =================
-  if (order.client_chat_id) {
-    const msg = orderMessages[order.id]?.[order.client_chat_id];
-    await updateOrderMessage(order, msg?.chatId, msg?.messageId);
-  }
-}
-
-
-
-
-
-
-
 
 
 // =================== Восстановление заказов для клиентов ===================
@@ -463,7 +547,7 @@ async function restoreOrdersForClients() {
           const alreadySent = messages.some(m => m.chat_id === client.chat_id);
           if (alreadySent) return;
 
-          const text = escapeMarkdownV2(buildOrderMessage(order));
+          const text = buildTextForOrder(order);
           const sent = await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
 
           await saveOrderMessage(order.id, client.chat_id, sent.message_id);
@@ -488,17 +572,16 @@ async function restoreOrdersForClients() {
 async function restoreOrdersForCouriers() {
   console.log("[INFO] Восстановление заказов для курьеров...");
 
-  const [orders] = await db.execute("SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at ASC");
+  const [orders] = await db.execute(
+    "SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at ASC"
+  );
+
   const limit = pLimit(5);
 
   const tasks = orders.map(order =>
     limit(async () => {
       try {
-        const messages = await getOrderMessages(order.id);
-        if (messages.some(m => !!COURIERS[m.username])) return; // если курьеры уже получили, пропускаем
-
-        const text = escapeMarkdownV2(buildOrderMessage(order));
-        await sendOrUpdateOrder(order, text);
+        await sendOrUpdateOrderAll(order);
       } catch (err) {
         console.error(`[ERROR] Ошибка восстановления заказа №${order.id}:`, err.message);
       }
@@ -525,224 +608,6 @@ async function restoreOrdersForCouriers() {
   console.log("Бот и сервер запущены");
 })();
 
-// ================= Транзакция для отмены заказа =================
-async function releaseOrderTx(orderId) {
-  const conn = await db.getConnection();
-  try {
-    await conn.beginTransaction();
-    await updateOrderStatus(orderId, "new");
-    await conn.commit();
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-
-
-// =================== Построение сообщения =================
-const deliveryMap = { "DHL": "DHL", "Курьер": "Курьер" };
-const paymentMap = {
-  "Наличные": "Наличные",
-  "Карта": "Банковская карта",
-  "Криптовалюта": "Крипто"
-};
-
-function buildOrderMessage(order) {
-  const statusMap = {
-    new: "Новый",
-    taken: "Взято",
-    delivered: "Доставлен"
-  };
-
-  const courierName = order.courier_username ? '@' + order.courier_username.replace(/^@/, '') : "—";
-
-  return [
-    `*Заказ №${escapeMarkdownV2(String(order.id))}*`,
-    `*Клиент:* ${escapeMarkdownV2(withAt(order.tgNick))}`,
-    `*Город:* ${escapeMarkdownV2(order.city || "—")}`,
-    `*Доставка:* ${escapeMarkdownV2(deliveryMap[order.delivery] || order.delivery || "—")}`,
-    `*Оплата:* ${escapeMarkdownV2(paymentMap[order.payment] || order.payment || "—")}`,
-    `*Дата:* ${escapeMarkdownV2(order.date || "—")}`,
-    `*Время:* ${escapeMarkdownV2(order.time || "—")}`,
-    "",
-    `*Состав заказа:*`,
-    `${escapeMarkdownV2(order.orderText || "")}`,
-    "",
-    `Статус: *${escapeMarkdownV2(statusMap[order.status] || "—")}*`,
-    `Курьер: ${escapeMarkdownV2(courierName)}`
-  ].join("\n");
-}
-
-async function askForReview(order) {
-  if (!order.client_chat_id) {
-    console.log("НЕТ client_chat_id — отзыв невозможен");
-    return;
-  }
-
- waitingReview.set(order.client_chat_id, {
-  orderId: order.id,
-  courier: order.courier_username
-    ? order.courier_username.replace(/^@/, "")
-    : "",
-  client: order.tgNick.replace(/^@/, ""),
-  rating: null
-});
-
-  const courierEscaped = order.courier_username 
-    ? '@' + escapeMarkdownV2(order.courier_username.replace(/^@/, '')) 
-    : '—';
-  const orderIdEscaped = escapeMarkdownV2(String(order.id));
-
-  await bot.sendMessage(
-    order.client_chat_id,
-    `Заказ №${orderIdEscaped} доставлен\n\nКурьер: ${courierEscaped}\n\nПоставьте оценку курьеру:`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "⭐1", callback_data: `rate_${order.id}_1` },
-            { text: "⭐2", callback_data: `rate_${order.id}_2` },
-            { text: "⭐3", callback_data: `rate_${order.id}_3` },
-            { text: "⭐4", callback_data: `rate_${order.id}_4` },
-            { text: "⭐5", callback_data: `rate_${order.id}_5` }
-          ]
-        ]
-      },
-      parse_mode: "MarkdownV2"
-    }
-  );
-
-  console.log(`Запрос отзыва отправлен клиенту @${order.tgNick}`);
-}
-
-async function sendOrUpdateOrder(order, text = null) {
-  console.log(`[INFO] Начало отправки/обновления заказа №${order.id}, статус: ${order.status}`);
-
-  // Получаем список курьеров с chat_id
-  const [courierRows] = await db.execute(
-    "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
-  );
-
-  // Формируем уникальный список получателей
-  const recipientsMap = new Map();
-
-  // Админ
-  if (ADMIN_ID && ADMIN_USERNAME) {
-    recipientsMap.set(ADMIN_ID, { username: ADMIN_USERNAME, chatId: ADMIN_ID });
-  }
-
-  // Курьеры
-  courierRows.forEach(r => {
-    if (r.chat_id) recipientsMap.set(r.chat_id, { username: r.username, chatId: r.chat_id });
-  });
-
-  // Клиент
-  if (order.client_chat_id) {
-    recipientsMap.set(order.client_chat_id, {
-      username: order.tgNick.replace(/^@/, ""),
-      chatId: order.client_chat_id
-    });
-  }
-
-  const recipients = Array.from(recipientsMap.values());
-  const limit = pLimit(5); // ограничение параллельных отправок
-
-  const tasks = recipients.map(recipient =>
-    limit(async () => {
-      if (!recipient.chatId) return;
-
-      const isClient = recipient.chatId === order.client_chat_id;
-      const isAdmin = recipient.chatId === ADMIN_ID;
-      const isCourier = !!COURIERS[recipient.username];
-      const isOwnerCourier = order.courier_username?.replace(/^@/, "") === recipient.username;
-
-     // ================== Кнопки ==================
-let keyboard = [];
-
-// Курьеры и админ
-const canSeeButtons = !isClient && (isCourier || isAdmin);
-
-if (canSeeButtons) {
-  if (order.status === "new") {
-    keyboard.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
-  } 
-  else if (order.status === "taken" && isOwnerCourier) {
-    keyboard.push([
-      { text: "❌ Отказаться", callback_data: `release_${order.id}` },
-      { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
-    ]);
-  }
-}
-
-// ===== Кнопка для клиента =====
-if (isClient) {
-  const orderAge = Date.now() - new Date(order.created_at).getTime();
-
-  // ❗ ТОЛЬКО подтверждение отмены
-  if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
-    keyboard.push([
-      { text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }
-    ]);
-  }
-}
-
-// ❗ Если заказ отменён — НИКАКИХ кнопок ни у кого
-if (order.status === "canceled") {
-  keyboard = [];
-}
-
-
-     // Формируем текст
-let msgText = text || buildOrderMessage({
-  ...order,
-  courier_username: order.courier_username || "—"
-});
-
-// ❗ Если заказ отменён — добавляем уведомление прямо в том же сообщении
-if (order.status === "canceled") {
-  msgText += "\n\n❌ Заказ был отменён покупателем";
-  keyboard = []; // убираем кнопки полностью
-}
-
-
-      try {
-        // Проверяем существующие сообщения
-        const messages = await getOrderMessages(order.id);
-        const existingMsg = messages.find(m => m.chat_id === recipient.chatId);
-
-        if (existingMsg) {
-          await bot.editMessageText(msgText, {
-            chat_id: recipient.chatId,
-            message_id: existingMsg.message_id,
-            parse_mode: "MarkdownV2",
-            reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-          });
-        } else {
-          const sent = await bot.sendMessage(recipient.chatId, msgText, {
-            parse_mode: "MarkdownV2",
-            reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-          });
-          await saveOrderMessage(order.id, recipient.chatId, sent.message_id);
-        }
-
-        if (keyboard.length) {
-          console.log(`[INFO] @${recipient.username} видит кнопки: ${keyboard.map(k => k.map(b => b.text).join(",")).join(" | ")}`);
-        }
-      } catch (err) {
-        if (!err.message.includes("message is not modified") &&
-            !err.message.includes("chat not found")) {
-          console.error(`[ERROR] Ошибка отправки заказа №${order.id} для @${recipient.username}:`, err.message);
-        }
-      }
-    })
-  );
-
-  await Promise.all(tasks);
-  console.log(`[INFO] Завершена отправка/обновление заказа №${order.id}`);
-}
 
 // ============== Telegram: callback =================
 bot.on("callback_query", async (q) => {
@@ -889,7 +754,7 @@ if (data.startsWith("take_")) {
 
   if (!success) {
     // Заказ уже взят другим курьером — обновляем сообщение у всех участников
-    await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
+    await sendOrUpdateOrderAll(updatedOrder);
     return bot.answerCallbackQuery(q.id, {
       text: "Заказ уже взят другим курьером!",
       show_alert: true
@@ -897,7 +762,7 @@ if (data.startsWith("take_")) {
   }
 
   // Заказ успешно взят — обновляем сообщение у всех участников
-  await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
+  await sendOrUpdateOrderAll(updatedOrder);
 
   return bot.answerCallbackQuery(q.id, { text: "✅ Заказ взят" });
 }
@@ -935,7 +800,7 @@ if (data.startsWith("release_")) {
     const updatedOrder = await getOrderById(orderId);
 
     // ✅ Обновляем сообщение у всех участников
-    await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
+    await sendOrUpdateOrderAll(updatedOrder);
 
     // Уведомляем админа, если курьер отказался
     if (ADMIN_ID && oldCourier && oldCourier !== ADMIN_USERNAME) {
@@ -965,7 +830,7 @@ if (data.startsWith("delivered_")) {
     const updatedOrder = await getOrderById(orderId);
 
     // ✅ Обновляем сообщение у всех участников
-    await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
+    await sendOrUpdateOrderAll(updatedOrder);
 
     // Если клиент ещё не оставил отзыв — спрашиваем
     if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
@@ -1035,8 +900,7 @@ if (data.startsWith("no_cancel_")) {
     return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
   }
 
-  // Обновляем сообщение заказа у всех пользователей
-  await updateOrderMessage(order, q.message?.chat.id, q.message?.message_id, username, fromId, ADMIN_ID);
+  await sendOrUpdateOrderAll(order);
 
   return bot.answerCallbackQuery(q.id, { text: "Отмена отменена" });
 }
@@ -1054,14 +918,11 @@ if (data.startsWith("cancel_")) {
   }
 
   try {
-    // Обновляем статус заказа и удаляем курьера
     await db.execute("UPDATE orders SET status='canceled', courier_username=NULL WHERE id=?", [orderId]);
     const updatedOrder = await getOrderById(orderId);
 
-    // Обновляем сообщение заказа у всех пользователей
-    await updateOrderMessage(updatedOrder, q.message?.chat.id, q.message?.message_id, username, fromId, ADMIN_ID);
+    await sendOrUpdateOrderAll(updatedOrder);
 
-    // Обновляем склад или активные заказы
     broadcastStock();
 
     return bot.answerCallbackQuery(q.id, { text: "✅ Заказ успешно отменен" });
@@ -1334,8 +1195,9 @@ return bot.sendMessage(
 
 // ===== Обработка выбора курьера для просмотра его заказов =====
 if (adminWaitingOrdersCourier.has(username)) {
+
+  // 1) Нажали "Назад" — выйти и вернуть админ-меню
   if (text === "Назад") {
-    // Пользователь отменил выбор курьера, возвращаем панель админа
     adminWaitingOrdersCourier.delete(username);
     return bot.sendMessage(id, "Панель администратора", {
       reply_markup: {
@@ -1350,47 +1212,44 @@ if (adminWaitingOrdersCourier.has(username)) {
     });
   }
 
-
   const selectedCourier = text.replace(/^@/, "").trim();
   if (!selectedCourier) {
     return bot.sendMessage(id, "Пожалуйста, введите ник курьера, например @username");
   }
 
- // Проверка существования курьера
-const [rows] = await db.execute("SELECT 1 FROM couriers WHERE username = ?", [selectedCourier]);
+  // Проверка существования курьера
+  const [rows] = await db.execute("SELECT 1 FROM couriers WHERE username = ?", [selectedCourier]);
+  if (rows.length === 0) {
+    return bot.sendMessage(id, `Курьер @${selectedCourier} не найден`);
+  }
 
-if (rows.length === 0) {
-  return bot.sendMessage(id, `Курьер @${selectedCourier} не найден`);
-}
-
-  // Получаем состояние просмотра: "active" или "done"
+  // Тип просмотра: "active" или "done"
   const state = adminWaitingOrdersCourier.get(username);
   const showDone = state.type === "done";
-  
-// Получаем заказы в зависимости от типа
-const query = showDone
-  ? "SELECT * FROM orders WHERE status='delivered' AND courier_username=?"
-  : "SELECT * FROM orders WHERE status IN ('new','taken') AND courier_username=?";
 
-const [orders] = await db.execute(query, [selectedCourier]);
+  const query = showDone
+    ? "SELECT * FROM orders WHERE status='delivered' AND courier_username=? ORDER BY delivered_at DESC"
+    : "SELECT * FROM orders WHERE status IN ('new','taken') AND courier_username=? ORDER BY created_at DESC";
 
-if (!orders || orders.length === 0) {
-  return bot.sendMessage(
+  const [orders] = await db.execute(query, [selectedCourier]);
+
+  if (!orders || orders.length === 0) {
+    // ✅ ВАЖНО: если заказов нет — тоже выходим из режима выбора
+    adminWaitingOrdersCourier.delete(username);
+    return bot.sendMessage(
+      id,
+      `Курьер @${selectedCourier} пока не имеет ${showDone ? "выполненных" : "активных"} заказов`
+    );
+  }
+
+  await bot.sendMessage(
     id,
-    `Курьер @${selectedCourier} пока не имеет ${showDone ? "выполненных" : "активных"} заказов`
+    `${showDone ? "Выполненные" : "Активные"} заказы курьера @${selectedCourier}:`
   );
-}
 
-// Отправка заголовка
-await bot.sendMessage(
-  id,
-  `${showDone ? "Выполненные" : "Активные"} заказы курьера @${selectedCourier}:`
-);
-
-// Отправка заказов параллельно с гарантией строк
-await Promise.all(
-  orders.map(async (o) => {
-    // Приводим все важные поля к строкам
+  // Отправляем заказы
+  for (const o of orders) {
+    // чтобы не падало на null
     o.orderText = o.orderText || "—";
     o.tgNick = o.tgNick || "—";
     o.city = o.city || "—";
@@ -1400,23 +1259,60 @@ await Promise.all(
     o.time = o.time || "—";
 
     try {
-      const text = String(buildOrderMessage(o)); // гарантируем строку
-      await bot.sendMessage(id, text, { parse_mode: "MarkdownV2" });
+      const msgText = String(buildOrderMessage(o));
+      await bot.sendMessage(id, msgText, { parse_mode: "MarkdownV2" });
     } catch (err) {
       console.error(`Ошибка отправки заказа №${o.id} @${selectedCourier}:`, err.message);
     }
-  })
-);
+  }
 
-  // Состояние оставляем, чтобы админ мог выбрать следующего курьера
+  // ✅ Вариант B: после просмотра — выходим из режима выбора
+  adminWaitingOrdersCourier.delete(username);
   return;
 }
+
 
 // Если админ в состоянии ожидания ввода ника, но нажал кнопку меню
 const menuCommands = ["Список курьеров", "Назад", "Панель администратора"];
 if (adminWaitingCourier.has(username) && menuCommands.includes(text)) {
   adminWaitingCourier.delete(username); // сброс ожидания
   console.log(`Состояние ожидания ника сброшено для @${username} из-за меню`);
+}
+
+// ✅ ✅ ✅ ВОТ СЮДА ВСТАВЛЯЕШЬ ОБРАБОТЧИК "НАЗАД"
+if (text === "Назад") {
+  if (id === ADMIN_ID) {
+    return bot.sendMessage(id, "Главное меню админа", {
+      reply_markup: {
+        keyboard: [
+          [{ text: "Панель администратора" }, { text: "Панель курьера" }]
+        ],
+        resize_keyboard: true
+      }
+    });
+  }
+
+  if (isCourier(username)) {
+    return bot.sendMessage(id, "Главное меню курьера", {
+      reply_markup: {
+        keyboard: [
+          [{ text: "Личный кабинет" }, { text: "Поддержка" }],
+          [{ text: "Панель курьера" }]
+        ],
+        resize_keyboard: true
+      }
+    });
+  }
+
+  return bot.sendMessage(id, "Главное меню", {
+    reply_markup: {
+      keyboard: [
+        [{ text: "Личный кабинет" }, { text: "Поддержка" }],
+        [{ text: "Мои заказы" }]
+      ],
+      resize_keyboard: true
+    }
+  });
 }
 
 // ===== Просмотр всех курьеров (кнопка 📈 Курьеры) =====
@@ -1448,43 +1344,6 @@ const isNew = rows.length === 0;
   // Добавляем или обновляем клиента
 await addOrUpdateClient(username, first_name, id);
 const client = await getClient(username);
-
- // ===== Главное меню =====
-if (text === "Назад") {
-  if (id === ADMIN_ID) {
-    return bot.sendMessage(id, "Главное меню админа", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Панель администратора" }, { text: "Панель курьера" }]
-        ],
-        resize_keyboard: true
-      }
-    });
-  }
-
-  if (COURIERS[username]) {
-    return bot.sendMessage(id, "Главное меню курьера", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Панель курьера" }]
-        ],
-        resize_keyboard: true
-      }
-    });
-  }
-
-  // Главное меню для обычного пользователя
-  return bot.sendMessage(id, "Главное меню", {
-    reply_markup: {
-      keyboard: [
-        [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-        [{ text: "Мои заказы" }]
-      ],
-      resize_keyboard: true
-    }
-  });
-}
-
 
 // ===== Команды бан/разбан =====
 if (text.startsWith("/ban ") && id === ADMIN_ID) {
@@ -1548,150 +1407,6 @@ if (text === "Мои заказы") {
     }
   });
 }
-
-if (text === "Назад") {
-  return bot.sendMessage(id, "Главное меню", {  
-    reply_markup: {
-      keyboard: [
-        [{ text: "Личный кабинет" }, { text: "Поддержка" }, { text: "Мои заказы" }]
-      ],
-      resize_keyboard: true
-    }
-  });
-}
-
-// ===== АКТИВНЫЕ ЗАКАЗЫ =====
-if (text === "Активные заказы") {
-  const userId = id;
-  const userName = username;
-  const isAdmin = userId === ADMIN_ID;
-  const isCourierUser = await isCourier(userName);
-  const courierName = userName.replace(/^@/, "");
-
-  // Берём все активные заказы
-  const [orders] = await db.query(
-    `SELECT * FROM orders WHERE status IN ('new','taken') ORDER BY created_at DESC`
-  );
-
-  // Фильтруем для конкретного курьера или показываем всё администратору
-  const activeOrders = orders.filter(order => {
-    if (isAdmin) return true; // админ видит все
-    if (!isCourierUser) return false; // обычный пользователь не видит
-    if (order.status === "new" && !order.courier_username) return true; // новый заказ без курьера
-    if (order.status === "taken" && order.courier_username?.replace(/^@/, "") === courierName) return true; // заказ взял курьер
-    return false;
-  });
-
-  console.log(`Все заказы new/taken для ${isAdmin ? "админа" : "курьера @" + userName}:`, activeOrders);
-
-  if (!activeOrders.length) {
-    return bot.sendMessage(userId, "Нет активных заказов", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Активные заказы" }],
-          [{ text: "Выполненные заказы" }],
-          [{ text: "Назад" }]
-        ],
-        resize_keyboard: true
-      }
-    });
-  }
-
-  // Отправляем уведомление перед списком заказов
-  await bot.sendMessage(userId, "📦 Активные заказы:");
-
-  // Отправка заказов с кнопками как при новом приходе
-  for (const order of activeOrders) {
-    const isClient = order.client_chat_id === userId;
-    const isOwnerCourier = order.courier_username?.replace(/^@/, "") === courierName;
-
-    // ================== Формируем кнопки ==================
-    let keyboard = [];
-
-    const canSeeButtons = !isClient && (isCourierUser || isAdmin);
-
-    if (canSeeButtons) {
-      if (order.status === "new") {
-        keyboard.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
-      } else if (order.status === "taken" && isOwnerCourier) {
-        keyboard.push([
-          { text: "❌ Отказаться", callback_data: `release_${order.id}` },
-          { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
-        ]);
-      }
-    }
-
-    // Кнопка для клиента
-    if (isClient) {
-      const orderAge = Date.now() - new Date(order.created_at).getTime();
-      if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
-        keyboard.push([{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]);
-      }
-    }
-
-    // Если заказ отменён — убираем кнопки и добавляем текст
-    let msgText = buildOrderMessage({
-      ...order,
-      courier_username: order.courier_username || "—"
-    });
-    if (order.status === "canceled") {
-      msgText += "\n\n❌ Заказ был отменён покупателем";
-      keyboard = [];
-    }
-
-    try {
-      await bot.sendMessage(userId, msgText, {
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-      });
-    } catch (err) {
-      console.error(`Ошибка отправки заказа №${order.id} для @${userName}:`, err.message);
-    }
-  }
-
-  console.log(`Все активные заказы отправлены ${isAdmin ? "админу" : "курьеру @" + userName}`);
-}
-
-
-
-// ===== ВЫПОЛНЕННЫЕ ЗАКАЗЫ =====
-if (text === "Выполненные заказы") {
-  const userId = id;
-  const userName = username;
-  const isAdmin = userId === ADMIN_ID;
-
-  const [orders] = await db.query(
-    `SELECT * FROM orders WHERE status = 'delivered' ORDER BY delivered_at DESC`
-  );
-
-  // Фильтруем по курьеру, если это не админ
-  const deliveredOrders = orders.filter(order => {
-    if (isAdmin) return true;
-    const courierName = userName.replace(/^@/, "");
-    return order.courier_username?.replace(/^@/, "") === courierName;
-  });
-
-  if (!deliveredOrders.length) {
-    return bot.sendMessage(userId, "Выполненных заказов пока нет.", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Активные заказы" }],
-          [{ text: "Выполненные заказы" }],
-          [{ text: "Назад" }]
-        ],
-        resize_keyboard: true
-      }
-    });
-  }
-
-  // Формируем сообщение для каждого заказа
-  for (const order of deliveredOrders) {
-    await sendOrUpdateOrder(order);
-  }
-}
-
-
-
 
   // ===== Панель администратора =====
 if (text === "Панель администратора" && id === ADMIN_ID) {
@@ -1927,7 +1642,7 @@ if (text === "Панель курьера" && (COURIERS[username] || id === ADMI
 // ===== ПРОСМОТР ЗАКАЗОВ КУРЬЕРА (ЕДИНАЯ ЛОГИКА) =====
 if (
   (text === "Активные заказы" || text === "Выполненные заказы") &&
-  await isCourier(username)
+ isCourier(username)
 ) {
   const isActive = text === "Активные заказы";
   const courierName = username?.replace(/^@/, "");
@@ -1966,9 +1681,9 @@ if (
   // ❗❗❗ ВАЖНО:
   // НИКАКИХ bot.sendMessage / Markdown / escape
   // ТОЛЬКО sendOrUpdateOrder — тот же стиль, что при обычном приходе заказа
-  for (const order of orders) {
-    await sendOrUpdateOrder(order);
-  }
+ for (const order of orders) {
+  await sendOrUpdateOrderToChat(order, id, "courier", username);
+}
 
   console.log(
     `Все ${isActive ? "активные" : "выполненные"} заказы отправлены курьеру @${courierName}`
@@ -2101,7 +1816,7 @@ if (banned) {
     const updated = await getOrderById(id);
 
     // ===== Отправляем уведомления в Telegram =====
-    await sendOrUpdateOrder(updated);
+    await sendOrUpdateOrderAll(updated);
     console.log(`Уведомления отправлены для заказа ${id}`);
 
     // ===== WebSocket: обновление stock =====
@@ -2134,7 +1849,7 @@ app.post("/fix-all-new-orders", async (req, res) => {
     for (const order of orders) {
       try {
         // Повторная отправка уведомлений в Telegram
-        await sendOrUpdateOrder(order);
+        await sendOrUpdateOrderAll(order);
         console.log(`Заказ #${order.id} успешно обновлен`);
         successCount++;
       } catch (err) {
