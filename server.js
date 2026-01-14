@@ -334,67 +334,73 @@ function escapeMarkdownV2(text) {
   return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }
 
-async function updateOrderMessage(order, chatId = null, messageId = null) {
-  const msgText = escapeMarkdownV2(buildOrderMessage(order));
-  const keyboard = buildOrderKeyboard(order);
+// =================== Построение inline-клавиатуры заказа ===================
+function buildOrderKeyboard(order, username = null, fromId = null, ADMIN_ID = null) {
+  if (!order) return [];
 
-  // Если есть chatId и messageId — пробуем редактировать
-  if (chatId && messageId) {
-    try {
-      await bot.editMessageText(msgText, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-      });
-      return;
-    } catch (err) {
-      console.error(`Ошибка редактирования заказа №${order.id}:`, err.message);
-      // Если редактировать не удалось — отправим новое сообщение
+  const buttons = [];
+
+  if (order.status === "new") {
+    buttons.push([{ text: "🚚 Взять заказ", callback_data: `take_${order.id}` }]);
+  } else if (order.status === "taken") {
+    const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username || fromId === ADMIN_ID;
+
+    if (isOwnerOrAdmin) {
+      buttons.push([{ text: "❌ Отказаться", callback_data: `release_${order.id}` }]);
+      buttons.push([{ text: "✅ Доставлено", callback_data: `delivered_${order.id}` }]);
+    } else {
+      buttons.push([{ text: "🚚 Взят", callback_data: `noop` }]);
     }
+  } else if (order.status === "canceled") {
+    buttons.push([{ text: "❌ Отменён", callback_data: `noop` }]);
   }
 
-  // Если редактировать нельзя — отправляем новое
-  const sentMsg = await bot.sendMessage(chatId || order.client_chat_id, msgText, {
-    parse_mode: "MarkdownV2",
-    reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
-  });
-
-  // Сохраняем сообщение в orderMessages
-  orderMessages[order.id] = {
-    chatId: sentMsg.chat.id,
-    messageId: sentMsg.message_id
-  };
+  return buttons;
 }
 
-
+// =================== Экранирование текста кнопок ===================
 function escapeButton(text) {
-  // Экранируем спецсимволы для кнопок
   return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }
 
-async function updateOrderMessage(order, chatId, messageId) {
+// =================== Обновление или отправка сообщения заказа ===================
+async function updateOrderMessage(order, chatId = null, messageId = null, username = null, fromId = null, ADMIN_ID = null) {
+  if (!order) return;
+
   const msgText = escapeMarkdownV2(buildOrderMessage(order));
-  const keyboard = buildOrderKeyboard(order).map(row =>
+  const keyboard = buildOrderKeyboard(order, username, fromId, ADMIN_ID).map(row =>
     row.map(btn => ({ text: escapeButton(btn.text), callback_data: btn.callback_data }))
   );
 
   try {
-    if (messageId) {
+    if (chatId && messageId) {
       await bot.editMessageText(msgText, {
         chat_id: chatId,
         message_id: messageId,
         parse_mode: "MarkdownV2",
         reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
       });
-    } else {
-      await sendOrUpdateOrder(order);
+    } else if (order.client_chat_id) {
+      // fallback: если редактировать нельзя — отправляем новое сообщение
+      const sentMsg = await bot.sendMessage(order.client_chat_id, msgText, {
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+      });
+
+      // Сохраняем ID сообщения, чтобы в будущем редактировать
+      orderMessages[order.id] = {
+        chatId: sentMsg.chat.id,
+        messageId: sentMsg.message_id
+      };
     }
   } catch (err) {
-    console.error(`Ошибка обновления заказа №${order.id}:`, err.message);
-    await sendOrUpdateOrder(order);
+    console.error(`Ошибка обновления сообщения заказа №${order.id}:`, err.message);
+    if (order.client_chat_id) {
+      await sendOrUpdateOrder(order);
+    }
   }
 }
+
 
 
 // =================== Восстановление заказов для клиентов ===================
