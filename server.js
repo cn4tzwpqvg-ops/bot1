@@ -543,6 +543,70 @@ function escapeMarkdownV2(text) {
   return String(text).replace(/([\\_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }
 
+// =================== Запрос отзыва у клиента (оценка + пропуск) ===================
+async function hasReviewForOrder(orderId) {
+  try {
+    const [rows] = await db.execute(
+      "SELECT 1 FROM reviews WHERE order_id = ? LIMIT 1",
+      [String(orderId)]
+    );
+    return rows.length > 0;
+  } catch (e) {
+    console.error("hasReviewForOrder error:", e.message);
+    return false;
+  }
+}
+
+async function askForReview(order) {
+  if (!order?.client_chat_id) return;
+
+  const orderId = String(order.id);
+  const clientId = order.client_chat_id;
+
+  // 1) не спрашиваем, если отзыв по заказу уже есть
+  const already = await hasReviewForOrder(orderId);
+  if (already) return;
+
+  // 2) не спрашиваем второй раз, если уже ждём отзыв от этого клиента
+  if (waitingReview.has(clientId)) return;
+
+  // сохраняем состояние ожидания
+  waitingReview.set(clientId, {
+    orderId,
+    courier: order.courier_username ? `@${String(order.courier_username).replace(/^@/, "")}` : "—",
+    client: order.tgNick ? `@${String(order.tgNick).replace(/^@/, "")}` : "—",
+    rating: null
+  });
+
+  const kb = {
+    inline_keyboard: [
+      [
+        { text: "⭐ 1", callback_data: `rate_${orderId}_1` },
+        { text: "⭐ 2", callback_data: `rate_${orderId}_2` },
+        { text: "⭐ 3", callback_data: `rate_${orderId}_3` },
+        { text: "⭐ 4", callback_data: `rate_${orderId}_4` },
+        { text: "⭐ 5", callback_data: `rate_${orderId}_5` }
+      ],
+      [
+        { text: "⏭ Пропустить", callback_data: `skip_review_${orderId}` }
+      ]
+    ]
+  };
+
+  const courier = order.courier_username ? withAt(order.courier_username) : "—";
+
+  await bot.sendMessage(
+    clientId,
+    `✅ Заказ №${escapeMarkdownV2(orderId)} доставлен.\n` +
+      `🚚 Курьер: ${escapeMarkdownV2(courier)}\n\n` +
+      `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
+      `Если не хотите — нажмите «Пропустить».`,
+    { parse_mode: "MarkdownV2", reply_markup: kb }
+  );
+}
+
+
+
 
 // =================== Восстановление заказов для клиентов ===================
 async function restoreOrdersForClients() {
@@ -667,6 +731,66 @@ bot.on("callback_query", async (q) => {
       text: `Оценка ${rating} сохранена`
     });
   }
+
+// ================== ПРОПУСТИТЬ ОТЗЫВ ==================
+if (data.startsWith("skip_review_")) {
+  const orderId = String(data.split("_")[2] || "").trim();
+  const review = waitingReview.get(fromId);
+
+  if (!review || review.orderId !== orderId) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Отзыв уже обработан или устарел",
+      show_alert: true
+    });
+  }
+
+  // ✅ Если отзыв уже есть в БД — просто выходим (чтобы не было дублей)
+  const already = await hasReviewForOrder(orderId);
+  if (already) {
+    waitingReview.delete(fromId);
+    await bot.sendMessage(fromId, "Ок ✅ Отзыв по этому заказу уже был сохранён ранее.");
+    return bot.answerCallbackQuery(q.id, { text: "Готово" });
+  }
+
+  // Если успел выбрать оценку — сохраняем только рейтинг (без текста)
+  if (review.rating !== null) {
+    try {
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      const courierNick = String(review.courier || "").replace(/^@/, "");
+      const clientNick = String(review.client || "").replace(/^@/, "");
+
+      await db.execute(
+        `INSERT INTO reviews (order_id, client_username, courier_username, rating, review_text, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [review.orderId, clientNick, courierNick, Number(review.rating), null, now]
+      );
+
+      // админу — уведомление
+      if (ADMIN_ID) {
+        await bot.sendMessage(
+          ADMIN_ID,
+          `⚠️ Клиент @${escapeMarkdownV2(clientNick)} поставил оценку ${review.rating}/5 по заказу №${escapeMarkdownV2(review.orderId)}, но пропустил текст отзыва.`,
+          { parse_mode: "MarkdownV2" }
+        );
+      }
+    } catch (e) {
+      console.error("[skip_review] save rating only error:", e.message);
+    }
+  }
+
+  waitingReview.delete(fromId);
+
+  // Если оценки не было — просто закрываем
+  if (review.rating === null) {
+    await bot.sendMessage(fromId, "Ок, отзыв пропущен ✅ (оценка не выбрана)");
+  } else {
+    await bot.sendMessage(fromId, "Ок, отзыв пропущен ✅");
+  }
+
+  return bot.answerCallbackQuery(q.id, { text: "Пропущено" });
+}
+
+
 
 // ================== Просмотр отзывов курьера ==================
 if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
