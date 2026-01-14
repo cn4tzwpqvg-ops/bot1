@@ -914,7 +914,6 @@ if (data.startsWith("confirm_cancel_")) {
     return bot.answerCallbackQuery(q.id, { text: "Заказ не отменяем", show_alert: true });
   }
 
-  // Используем inline-кнопки с эмодзи, как и в sendOrUpdateOrder
   const keyboard = [
     [
       { text: "✅ Да, отменить", callback_data: `cancel_${order.id}` },
@@ -922,18 +921,31 @@ if (data.startsWith("confirm_cancel_")) {
     ]
   ];
 
-  await bot.editMessageText(
-    `Вы точно хотите отменить заказ #${order.id}?`,
-    {
-      chat_id: fromId,
-      message_id: q.message.message_id,
-      parse_mode: "MarkdownV2",
-      reply_markup: { inline_keyboard: keyboard }
+  try {
+    if (q.message && q.message.message_id) {
+      await bot.editMessageText(
+        `Вы точно хотите отменить заказ #${order.id}?`,
+        {
+          chat_id: q.message.chat.id,
+          message_id: q.message.message_id,
+          parse_mode: "MarkdownV2",
+          reply_markup: { inline_keyboard: keyboard }
+        }
+      );
+    } else {
+      await bot.sendMessage(fromId, `Вы точно хотите отменить заказ #${order.id}?`, {
+        parse_mode: "MarkdownV2",
+        reply_markup: { inline_keyboard: keyboard }
+      });
     }
-  );
+  } catch (err) {
+    console.error(`Ошибка при confirm_cancel для заказа ${orderId}:`, err.message);
+    // Не падаем, просто игнорируем
+  }
 
   return bot.answerCallbackQuery(q.id);
 }
+
 
 // 2️⃣ NO CANCEL
 if (data.startsWith("no_cancel_")) {
@@ -941,11 +953,20 @@ if (data.startsWith("no_cancel_")) {
   const order = await getOrderById(orderId);
   if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
 
-  // Возвращаем кнопки через общую функцию, чтобы эмодзи совпадали
-  await sendOrUpdateOrder(order);
+  try {
+    if (q.message && q.message.message_id) {
+      await updateOrderMessage(order, q.message.chat.id, q.message.message_id);
+    } else {
+      await sendOrUpdateOrder(order);
+    }
+  } catch (err) {
+    console.error(`Ошибка при no_cancel для заказа ${orderId}:`, err.message);
+    await sendOrUpdateOrder(order);
+  }
 
   return bot.answerCallbackQuery(q.id, { text: "Отмена отменена" });
 }
+
 
 // 3️⃣ FINAL CANCEL
 if (data.startsWith("cancel_")) {
@@ -958,21 +979,27 @@ if (data.startsWith("cancel_")) {
   }
 
   try {
-    // Обновляем статус и курьера
+    // Обновляем статус и убираем курьера
     await db.execute("UPDATE orders SET status='canceled', courier_username=NULL WHERE id=?", [orderId]);
 
-    // Сразу обновляем текст и кнопки у всех
+    // Сразу обновляем текст и кнопки у всех пользователей
     const updatedOrder = await getOrderById(orderId);
-    await sendOrUpdateOrder(updatedOrder);
+    try {
+      await updateOrderMessage(updatedOrder); // обновит у курьеров и клиента
+    } catch (err) {
+      console.error(`Ошибка при обновлении сообщения после cancel для заказа ${orderId}:`, err.message);
+      await sendOrUpdateOrder(updatedOrder);
+    }
 
     broadcastStock();
 
     return bot.answerCallbackQuery(q.id, { text: "Заказ успешно отменен" });
   } catch (err) {
-    console.error(err);
+    console.error(`Ошибка при cancel заказа ${orderId}:`, err.message);
     return bot.answerCallbackQuery(q.id, { text: "Ошибка при отмене", show_alert: true });
   }
 }
+
 
 })
 
