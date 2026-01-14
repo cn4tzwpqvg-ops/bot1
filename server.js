@@ -1881,11 +1881,13 @@ app.post("/api/send-order", async (req, res) => {
     console.log(`Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`);
 
     // ===== ГАРАНТИРОВАННО РЕГИСТРИРУЕМ ПОЛЬЗОВАТЕЛЯ =====
-    await db.execute(`
-      INSERT INTO clients (chat_id, username, banned)
-      VALUES (?, ?, 0)
-      ON DUPLICATE KEY UPDATE username = VALUES(username)
-    `, [client_chat_id, cleanUsername]);
+await db.execute(`
+  INSERT INTO clients (chat_id, username, banned)
+  VALUES (?, ?, 0)
+  ON DUPLICATE KEY UPDATE
+    chat_id = VALUES(chat_id),
+    username = VALUES(username)
+`, [client_chat_id, cleanUsername]);
 
  // ===== ПРОВЕРКА БАНА =====
 let banned = false;
@@ -1950,6 +1952,14 @@ if (banned) {
     if (!existing.length) {
       await addOrder(order);
       console.log(`Заказ ${id} добавлен в базу`);
+
+      // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа
+  if (client_chat_id) {
+    await db.execute(
+      "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+      [client_chat_id, id]
+    );
+  }
     } else {
       console.log(`Заказ ${id} уже в базе, пропускаем добавление`);
     }
