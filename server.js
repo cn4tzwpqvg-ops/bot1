@@ -921,30 +921,31 @@ if (data.startsWith("confirm_cancel_")) {
     ]
   ];
 
+  // Формируем текст с экранированием MarkdownV2
+  const text = escapeMarkdownV2(`Вы точно хотите отменить заказ #${order.id}?`);
+
   try {
     if (q.message && q.message.message_id) {
-      await bot.editMessageText(
-        `Вы точно хотите отменить заказ #${order.id}?`,
-        {
-          chat_id: q.message.chat.id,
-          message_id: q.message.message_id,
-          parse_mode: "MarkdownV2",
-          reply_markup: { inline_keyboard: keyboard }
-        }
-      );
+      await bot.editMessageText(text, {
+        chat_id: q.message.chat.id,
+        message_id: q.message.message_id,
+        parse_mode: "MarkdownV2",
+        reply_markup: { inline_keyboard: keyboard }
+      });
     } else {
-      await bot.sendMessage(fromId, `Вы точно хотите отменить заказ #${order.id}?`, {
+      await bot.sendMessage(fromId, text, {
         parse_mode: "MarkdownV2",
         reply_markup: { inline_keyboard: keyboard }
       });
     }
   } catch (err) {
     console.error(`Ошибка при confirm_cancel для заказа ${orderId}:`, err.message);
-    // Не падаем, просто игнорируем
+    // Не падаем, просто логируем
   }
 
   return bot.answerCallbackQuery(q.id);
 }
+
 
 
 // 2️⃣ NO CANCEL
