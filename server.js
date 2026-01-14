@@ -349,6 +349,7 @@ function buildOrderKeyboard(order, username = null, fromId = null, ADMIN_ID = nu
       buttons.push([{ text: "❌ Отказаться", callback_data: `release_${order.id}` }]);
       buttons.push([{ text: "✅ Доставлено", callback_data: `delivered_${order.id}` }]);
     } else {
+      // если username null — рассылка всем, показываем просто "🚚 Взят"
       buttons.push([{ text: "🚚 Взят", callback_data: `noop` }]);
     }
   } else if (order.status === "canceled") {
@@ -357,6 +358,7 @@ function buildOrderKeyboard(order, username = null, fromId = null, ADMIN_ID = nu
 
   return buttons;
 }
+
 
 // =================== Экранирование текста кнопок ===================
 function escapeButton(text) {
@@ -367,31 +369,36 @@ function escapeButton(text) {
 async function updateOrderMessage(order, chatId = null, messageId = null, username = null, fromId = null, ADMIN_ID = null) {
   if (!order) return;
 
+  // Экранируем текст заказа один раз
   const msgText = escapeMarkdownV2(buildOrderMessage(order));
+
+  // Построение кнопок (только кнопки экранируем через escapeButton)
   const keyboard = buildOrderKeyboard(order, username, fromId, ADMIN_ID).map(row =>
     row.map(btn => ({ text: escapeButton(btn.text), callback_data: btn.callback_data }))
   );
 
   try {
     if (chatId && messageId) {
-      await bot.editMessageText(msgText, {
+      await bot.editMessageText(msgText, { // <--- здесь используем уже готовый msgText
         chat_id: chatId,
         message_id: messageId,
         parse_mode: "MarkdownV2",
         reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
       });
     } else if (order.client_chat_id) {
-      // fallback: если редактировать нельзя — отправляем новое сообщение
-      const sentMsg = await bot.sendMessage(order.client_chat_id, msgText, {
+      const sentMsg = await bot.sendMessage(order.client_chat_id, msgText, { // <--- тоже
         parse_mode: "MarkdownV2",
         reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
       });
 
-      // Сохраняем ID сообщения, чтобы в будущем редактировать
-      orderMessages[order.id] = {
-        chatId: sentMsg.chat.id,
-        messageId: sentMsg.message_id
-      };
+      // Сохраняем сообщение
+      if (!orderMessages[order.id]) orderMessages[order.id] = {};
+
+// Сохраняем сообщение по chatId участника
+orderMessages[order.id][sentMsg.chat.id] = {
+  chatId: sentMsg.chat.id,
+  messageId: sentMsg.message_id
+};
     }
   } catch (err) {
     console.error(`Ошибка обновления сообщения заказа №${order.id}:`, err.message);
@@ -400,6 +407,38 @@ async function updateOrderMessage(order, chatId = null, messageId = null, userna
     }
   }
 }
+
+
+// =================== Отправка/обновление заказа всем участникам ===================
+async function sendOrUpdateOrder(order, ADMIN_ID = null) {
+  if (!order) return;
+
+  // ================= 1️⃣ Админ =================
+  if (ADMIN_ID) {
+    // Берем chatId админа как ключ
+    const adminMsg = orderMessages[order.id]?.[ADMIN_ID];
+    await updateOrderMessage(order, adminMsg?.chatId, adminMsg?.messageId, null, ADMIN_ID, ADMIN_ID);
+  }
+
+  // ================= 2️⃣ Все курьеры =================
+  const [couriers] = await db.execute("SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL");
+  for (const courier of couriers) {
+    const msg = orderMessages[order.id]?.[courier.chat_id];
+    await updateOrderMessage(order, msg?.chatId, msg?.messageId, courier.username, courier.chat_id, ADMIN_ID);
+  }
+
+  // ================= 3️⃣ Клиент =================
+  if (order.client_chat_id) {
+    const msg = orderMessages[order.id]?.[order.client_chat_id];
+    await updateOrderMessage(order, msg?.chatId, msg?.messageId);
+  }
+}
+
+
+
+
+
+
 
 
 
@@ -833,42 +872,72 @@ if (orderId) {
 if (data.startsWith("take_")) {
   console.log(`TAKE заказ ${orderId} пользователем @${username}`);
 
+  // Проверка: только курьер или админ
   const canTake = (await isCourier(username)) || fromId === ADMIN_ID;
-  if (!canTake) return bot.answerCallbackQuery(q.id, { text: "Только курьеры могут брать заказ", show_alert: true });
+  if (!canTake) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Только курьеры могут брать заказ",
+      show_alert: true
+    });
+  }
 
-  const success = await takeOrderAtomic(orderId, username);
+  // Пытаемся взять заказ атомарно
+  const success = await takeOrderAtomic(orderId, username.replace(/^@/, ""));
+
+  // Получаем свежий заказ
   const updatedOrder = await getOrderById(orderId);
 
   if (!success) {
-    // Заказ уже взят, обновляем сообщение с текущим курьером
-    await updateOrderMessage(updatedOrder, q.message?.chat.id, q.message?.message_id);
-    return bot.answerCallbackQuery(q.id, { text: "Заказ уже взят другим курьером!", show_alert: true });
+    // Заказ уже взят другим курьером — обновляем сообщение у всех участников
+    await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
+    return bot.answerCallbackQuery(q.id, {
+      text: "Заказ уже взят другим курьером!",
+      show_alert: true
+    });
   }
 
-  await updateOrderMessage(updatedOrder, q.message?.chat.id, q.message?.message_id);
+  // Заказ успешно взят — обновляем сообщение у всех участников
+  await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
+
   return bot.answerCallbackQuery(q.id, { text: "✅ Заказ взят" });
 }
+
 
 
 // ================== RELEASE ==================
 if (data.startsWith("release_")) {
   console.log(`RELEASE заказ ${orderId} пользователем @${username}`);
 
+  // Проверка: заказ должен быть взят
   if (order.status !== "taken") {
-    return bot.answerCallbackQuery(q.id, { text: "От этого заказа уже отказались", show_alert: true });
+    return bot.answerCallbackQuery(q.id, {
+      text: "От этого заказа уже отказались",
+      show_alert: true
+    });
   }
 
-  const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username || fromId === ADMIN_ID;
-  if (!isOwnerOrAdmin) return bot.answerCallbackQuery(q.id, { text: "Вы не можете отказаться от этого заказа", show_alert: true });
+  // Проверка: только курьер, который взял заказ, или админ
+  const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username.replace(/^@/, "") || fromId === ADMIN_ID;
+  if (!isOwnerOrAdmin) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Вы не можете отказаться от этого заказа",
+      show_alert: true
+    });
+  }
 
   const oldCourier = order.courier_username;
 
   try {
-    await db.execute("UPDATE orders SET status='new', courier_username=NULL WHERE id=?", [orderId]);
+    // Сбрасываем заказ в статус 'new' и убираем курьера
+    await updateOrderStatus(orderId, "new");
+
+    // Получаем свежий заказ
     const updatedOrder = await getOrderById(orderId);
 
-    await updateOrderMessage(updatedOrder, q.message?.chat.id, q.message?.message_id);
+    // ✅ Обновляем сообщение у всех участников
+    await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
 
+    // Уведомляем админа, если курьер отказался
     if (ADMIN_ID && oldCourier && oldCourier !== ADMIN_USERNAME) {
       await bot.sendMessage(ADMIN_ID, `Курьер @${oldCourier} отказался от заказа №${orderId}`);
     }
@@ -880,21 +949,25 @@ if (data.startsWith("release_")) {
   }
 }
 
-
-
 // ================== DELIVERED ==================
 if (data.startsWith("delivered_")) {
   console.log(`DELIVERED заказ ${orderId} пользователем @${username}`);
 
-  const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username || fromId === ADMIN_ID;
-  if (!isOwnerOrAdmin) return bot.answerCallbackQuery(q.id, { text: "Нельзя отметить", show_alert: true });
+  // Проверка: только курьер, который взял заказ, или админ
+  const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username.replace(/^@/, "") || fromId === ADMIN_ID;
+  if (!isOwnerOrAdmin) {
+    return bot.answerCallbackQuery(q.id, { text: "Нельзя отметить", show_alert: true });
+  }
 
   try {
-    await updateOrderStatus(orderId, "delivered", username);
+    // Обновляем статус на 'delivered'
+    await updateOrderStatus(orderId, "delivered", username.replace(/^@/, ""));
     const updatedOrder = await getOrderById(orderId);
 
-    await updateOrderMessage(updatedOrder, q.message?.chat.id, q.message?.message_id);
+    // ✅ Обновляем сообщение у всех участников
+    await sendOrUpdateOrder(updatedOrder, ADMIN_ID);
 
+    // Если клиент ещё не оставил отзыв — спрашиваем
     if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
       await askForReview(updatedOrder);
     }
@@ -909,11 +982,15 @@ if (data.startsWith("delivered_")) {
 
 
 
+
+
 // ================== CONFIRM CANCEL ==================
 if (data.startsWith("confirm_cancel_")) {
   const orderId = data.split("_")[2];
   const order = await getOrderById(orderId);
-  if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+  if (!order) {
+    return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+  }
 
   const orderAge = Date.now() - new Date(order.created_at).getTime();
   if (orderAge > 20 * 60 * 1000 || order.status !== "new") {
@@ -927,7 +1004,7 @@ if (data.startsWith("confirm_cancel_")) {
     ]
   ];
 
-  const msg = `Вы точно хотите отменить заказ \\#${order.id}?`; // экранируем #
+  const msg = escapeMarkdownV2(`Вы точно хотите отменить заказ #${order.id}?`);
 
   try {
     if (q.message && q.message.message_id) {
@@ -954,9 +1031,13 @@ if (data.startsWith("confirm_cancel_")) {
 if (data.startsWith("no_cancel_")) {
   const orderId = data.split("_")[2];
   const order = await getOrderById(orderId);
-  if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+  if (!order) {
+    return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+  }
 
-  await sendOrUpdateOrder(order);
+  // Обновляем сообщение заказа у всех пользователей
+  await updateOrderMessage(order, q.message?.chat.id, q.message?.message_id, username, fromId, ADMIN_ID);
+
   return bot.answerCallbackQuery(q.id, { text: "Отмена отменена" });
 }
 
@@ -964,20 +1045,26 @@ if (data.startsWith("no_cancel_")) {
 if (data.startsWith("cancel_")) {
   const orderId = data.split("_")[1];
   const order = await getOrderById(orderId);
-  if (!order) return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+  if (!order) {
+    return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
+  }
 
   if (order.client_chat_id !== fromId) {
     return bot.answerCallbackQuery(q.id, { text: "Вы не можете отменить этот заказ", show_alert: true });
   }
 
   try {
+    // Обновляем статус заказа и удаляем курьера
     await db.execute("UPDATE orders SET status='canceled', courier_username=NULL WHERE id=?", [orderId]);
     const updatedOrder = await getOrderById(orderId);
 
-    await sendOrUpdateOrder(updatedOrder);
+    // Обновляем сообщение заказа у всех пользователей
+    await updateOrderMessage(updatedOrder, q.message?.chat.id, q.message?.message_id, username, fromId, ADMIN_ID);
+
+    // Обновляем склад или активные заказы
     broadcastStock();
 
-    return bot.answerCallbackQuery(q.id, { text: "Заказ успешно отменен" });
+    return bot.answerCallbackQuery(q.id, { text: "✅ Заказ успешно отменен" });
   } catch (err) {
     console.error(`Ошибка при cancel для заказа ${orderId}:`, err.message);
     return bot.answerCallbackQuery(q.id, { text: "Ошибка при отмене", show_alert: true });
