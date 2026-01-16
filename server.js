@@ -311,6 +311,15 @@ async function takeOrderAtomic(orderId, username) {
   return res.affectedRows === 1;
 }
 
+async function reassignOrderCourier(orderId, newCourierUsername) {
+  const now = formatMySQLDateTime();
+  await db.execute(
+    "UPDATE orders SET courier_username=?, status='taken', taken_at=? WHERE id=?",
+    [newCourierUsername, now, orderId]
+  );
+}
+
+
 // ================= Order Messages =================
 async function getOrderMessages(orderId) {
   const [rows] = await db.execute("SELECT * FROM order_messages WHERE order_id=?", [orderId]);
@@ -377,14 +386,19 @@ function buildKeyboardForRecipient(order, { role, username }) {
   }
 
   if (order.status === "taken") {
-    if (isAdmin || (isCourier && isOwner)) {
-      keyboard = [[
-        { text: "❌ Отказаться", callback_data: `release_${order.id}` },
-        { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
-      ]];
+  if (isAdmin || (isCourier && isOwner)) {
+    keyboard = [[
+      { text: "❌ Отказаться", callback_data: `release_${order.id}` },
+      { text: "✅ Доставлено", callback_data: `delivered_${order.id}` }
+    ]];
+
+    if (isAdmin) {
+      keyboard.push([{ text: "🔁 Переназначить курьера", callback_data: `reassign_${order.id}` }]);
     }
-    return keyboard;
   }
+  return keyboard;
+}
+
 
   // delivered / canceled — без кнопок
   return [];
@@ -842,6 +856,49 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 }
 
 
+// ================== REASSIGN (админ) ==================
+if (data.startsWith("reassign_") && fromId === ADMIN_ID) {
+  const orderId = data.split("_")[1];
+
+  const [couriers] = await db.execute("SELECT username FROM couriers ORDER BY username ASC");
+
+  const kb = {
+    inline_keyboard: [
+      ...couriers.map(c => ([
+        { text: `@${c.username}`, callback_data: `setcourier_${orderId}_${c.username}` }
+      ])),
+      [{ text: "Отмена", callback_data: `reassign_cancel_${orderId}` }]
+    ]
+  };
+
+  await bot.sendMessage(fromId, `Выберите курьера для заказа №${orderId}:`, { reply_markup: kb });
+  return bot.answerCallbackQuery(q.id);
+}
+
+if (data.startsWith("setcourier_") && fromId === ADMIN_ID) {
+  const parts = data.split("_");
+  const orderId = parts[1];
+  const newCourier = parts.slice(2).join("_").replace(/^@/, "");
+
+  const [rows] = await db.execute("SELECT 1 FROM couriers WHERE username=? LIMIT 1", [newCourier]);
+  if (!rows.length) {
+    await bot.answerCallbackQuery(q.id, { text: "Курьер не найден", show_alert: true });
+    return;
+  }
+
+  await reassignOrderCourier(orderId, newCourier);
+  const updatedOrder = await getOrderById(orderId);
+
+  await sendOrUpdateOrderAll(updatedOrder);
+
+  await bot.answerCallbackQuery(q.id, { text: `Назначено: @${newCourier}` });
+  return;
+}
+
+if (data.startsWith("reassign_cancel_") && fromId === ADMIN_ID) {
+  await bot.answerCallbackQuery(q.id, { text: "Отменено" });
+  return;
+}
 
 
 
@@ -1117,12 +1174,15 @@ bot.onText(/\/start/, async (msg) => {
     if (username === ADMIN_USERNAME) {
   welcomeText += "\nПанель администратора и Панель курьера доступны через текстовые кнопки ниже.";
   keyboard = [
-    [{ text: "Статистика" }, { text: "Курьеры" }],
-    [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-    [{ text: "Список курьеров" }, { text: "Все пользователи" }],
-    [{ text: "Рассылка" }], // убрали "Выполненные заказы"
-    [{ text: "Назад" }]
-  ];
+  [{ text: "Статистика" }, { text: "Курьеры" }],
+  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+  [{ text: "Рассылка" }],
+  [{ text: "Назад" }]
+];
+
   console.log(`Админ @${username} видит админ меню`);
 } else if (await isCourier(username)) {
       welcomeText += "\nПанель курьера доступна через текстовые кнопки ниже.";
@@ -1343,12 +1403,15 @@ if (adminWaitingOrdersCourier.has(username)) {
     adminWaitingOrdersCourier.delete(username);
     return bot.sendMessage(id, "Панель администратора", {
       reply_markup: {
-        keyboard: [
-          [{ text: "Статистика" }, { text: "Курьеры" }],
-          [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-          [{ text: "Список курьеров" }, { text: "Рассылка" }],
-          [{ text: "Назад" }]
-        ],
+       keyboard: [
+  [{ text: "Статистика" }, { text: "Курьеры" }],
+  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+  [{ text: "Рассылка" }],
+  [{ text: "Назад" }]
+],
         resize_keyboard: true
       }
     });
@@ -1369,9 +1432,10 @@ if (adminWaitingOrdersCourier.has(username)) {
   const state = adminWaitingOrdersCourier.get(username);
   const showDone = state.type === "done";
 
-  const query = showDone
-    ? "SELECT * FROM orders WHERE status='delivered' AND courier_username=? ORDER BY delivered_at DESC"
-    : "SELECT * FROM orders WHERE status IN ('new','taken') AND courier_username=? ORDER BY created_at DESC";
+const query = showDone
+  ? "SELECT * FROM orders WHERE status='delivered' AND courier_username=? ORDER BY delivered_at DESC"
+  : "SELECT * FROM orders WHERE status='taken' AND courier_username=? ORDER BY taken_at DESC";
+
 
   const [orders] = await db.execute(query, [selectedCourier]);
 
@@ -1554,12 +1618,15 @@ if (text === "Мои заказы") {
 if (text === "Панель администратора" && id === ADMIN_ID) {
   const kb = {
     keyboard: [
-      [{ text: "Статистика" }, { text: "Курьеры" }],
-      [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-      [{ text: "Список курьеров" }, { text: "Все пользователи" }], // оставляем
-      [{ text: "Рассылка" }], // убрали "Выполненные заказы"
-      [{ text: "Назад" }]
-    ],
+  [{ text: "Статистика" }, { text: "Курьеры" }],
+  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+  [{ text: "Рассылка" }],
+  [{ text: "Назад" }]
+],
+
     resize_keyboard: true
   };
   return bot.sendMessage(id, "Панель администратора", { reply_markup: kb });
@@ -1654,7 +1721,7 @@ if (text === "Список курьеров" && id === ADMIN_ID) {
 
 
 // ===== Выбор курьера и просмотр его заказов =====
-if (text === "Заказы курьера" && id === ADMIN_ID) {
+if (text === "Активные по курьеру" && id === ADMIN_ID) {
   // Получаем список курьеров из MySQL
   const [couriers] = await db.execute("SELECT username FROM couriers");
   
@@ -1674,7 +1741,7 @@ if (text === "Заказы курьера" && id === ADMIN_ID) {
   return;
 }
 // ===== Выполненные заказы (выбор курьера) =====
-if (text === "Выполненные заказы" && id === ADMIN_ID) {
+if (text === "Выполненные по курьеру" && id === ADMIN_ID) {
   const [couriers] = await db.execute("SELECT username FROM couriers");
   if (couriers.length === 0) return bot.sendMessage(id, "Нет курьеров для выбора");
 
@@ -1718,6 +1785,44 @@ if (text === "Статистика" && id === ADMIN_ID) {
     await bot.sendMessage(id, "Ошибка при получении статистики заказов");
   }
 }
+
+
+// ===== Взятые сейчас =====
+if (text === "Взятые сейчас" && id === ADMIN_ID) {
+  const [orders] = await db.execute(
+    "SELECT * FROM orders WHERE status='taken' ORDER BY taken_at DESC"
+  );
+
+  if (!orders.length) return bot.sendMessage(id, "Сейчас нет взятых заказов");
+
+  for (const o of orders) {
+    await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
+  }
+  return;
+}
+
+// ===== Сводка курьеров =====
+if (text === "Сводка курьеров" && id === ADMIN_ID) {
+  const [rows] = await db.execute(`
+    SELECT
+      c.username,
+      SUM(o.status='taken') AS taken_cnt,
+      SUM(o.status='delivered' AND DATE(o.delivered_at)=CURDATE()) AS delivered_today
+    FROM couriers c
+    LEFT JOIN orders o ON o.courier_username = c.username
+    GROUP BY c.username
+    ORDER BY taken_cnt DESC, delivered_today DESC
+  `);
+
+  if (!rows.length) return bot.sendMessage(id, "Нет курьеров");
+
+  const lines = rows.map(r =>
+    `@${r.username}: взято=${r.taken_cnt || 0}, выполнено сегодня=${r.delivered_today || 0}`
+  ).join("\n");
+
+  return bot.sendMessage(id, "📌 Сводка курьеров:\n" + lines);
+}
+
 
 
 // ===== Кнопка "Рассылка" =====
@@ -1773,7 +1878,8 @@ if (adminWaitingBroadcast.has(username)) {
 if (text === "Панель курьера" && (COURIERS[username] || id === ADMIN_ID)) {
   const kb = {
     keyboard: [
-      [{ text: "Активные заказы" }, { text: "Выполненные заказы" }],
+      [{ text: "Новые заказы" }, { text: "Взятые заказы" }],
+      [{ text: "Выполненные заказы" }],
       [{ text: "Назад" }]
     ],
     resize_keyboard: true
@@ -1781,55 +1887,56 @@ if (text === "Панель курьера" && (COURIERS[username] || id === ADMI
   return bot.sendMessage(id, "Панель курьера", { reply_markup: kb });
 }
 
+
 // ===== ПРОСМОТР ЗАКАЗОВ КУРЬЕРА (ЕДИНАЯ ЛОГИКА) =====
+// ===== ПРОСМОТР ЗАКАЗОВ КУРЬЕРА (НОВЫЕ / ВЗЯТЫЕ / ВЫПОЛНЕННЫЕ) =====
 if (
-  (text === "Активные заказы" || text === "Выполненные заказы") &&
- isCourier(username)
+  (text === "Новые заказы" || text === "Взятые заказы" || text === "Выполненные заказы") &&
+  isCourier(username)
 ) {
-  const isActive = text === "Активные заказы";
-  const courierName = username?.replace(/^@/, "");
+  const courierName = (username || "").replace(/^@/, "");
 
-  console.log(
-    `${isActive ? "Активные" : "Выполненные"} заказы курьера @${courierName} (id: ${id})`
-  );
+  let query = "";
+  let params = [];
+  let emptyText = "";
 
-  const query = isActive
-    ? `
+  if (text === "Новые заказы") {
+    emptyText = "Нет новых заказов";
+    query = `
       SELECT * FROM orders
-      WHERE status IN ('new','taken')
-        AND (
-          (status='new' AND courier_username IS NULL)
-          OR courier_username=?
-        )
+      WHERE status='new' AND courier_username IS NULL
       ORDER BY created_at DESC
-    `
-    : `
-      SELECT * FROM orders
-      WHERE status='delivered'
-        AND courier_username=?
-      ORDER BY delivered_at DESC
     `;
-
-  const [orders] = await db.execute(query, [courierName]);
-
-  if (!orders.length) {
-    console.log(`Нет ${isActive ? "активных" : "выполненных"} заказов у курьера`);
-    return bot.sendMessage(
-      id,
-      `Нет ${isActive ? "активных" : "выполненных"} заказов`
-    );
   }
 
-  // ❗❗❗ ВАЖНО:
-  // НИКАКИХ bot.sendMessage / Markdown / escape
-  // ТОЛЬКО sendOrUpdateOrder — тот же стиль, что при обычном приходе заказа
- for (const order of orders) {
-  await sendOrUpdateOrderToChat(order, id, "courier", username);
-}
+  if (text === "Взятые заказы") {
+    emptyText = "Нет взятых заказов";
+    query = `
+      SELECT * FROM orders
+      WHERE status='taken' AND courier_username=?
+      ORDER BY taken_at DESC
+    `;
+    params = [courierName];
+  }
 
-  console.log(
-    `Все ${isActive ? "активные" : "выполненные"} заказы отправлены курьеру @${courierName}`
-  );
+  if (text === "Выполненные заказы") {
+    emptyText = "Нет выполненных заказов";
+    query = `
+      SELECT * FROM orders
+      WHERE status='delivered' AND courier_username=?
+      ORDER BY delivered_at DESC
+    `;
+    params = [courierName];
+  }
+
+  const [orders] = await db.execute(query, params);
+
+  if (!orders.length) return bot.sendMessage(id, emptyText);
+
+  for (const order of orders) {
+    await sendOrUpdateOrderToChat(order, id, "courier", username);
+  }
+
   return;
 }
 });
