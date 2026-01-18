@@ -1758,14 +1758,14 @@ if (text === "Личный кабинет") {
       `🆕 Новые: *${newCnt || 0}*\n` +
       `🚚 В пути: *${takenCnt || 0}*\n` +
       `✅ Выполнено: *${deliveredCnt || 0}*\n\n` +
-      `🕒 Последняя активность: *${escapeMarkdownV2(formatRu(client?.last_active))}*\n` +
+      `🕒 Последняя активность: *${lastActiveStr}*\n` +
       (lastOrder
         ? `📦 Последний заказ: *№${escapeMarkdownV2(String(lastOrder.id))}* (${escapeMarkdownV2(lastOrder.status)})\n` +
-          `📅 Создан: *${escapeMarkdownV2(formatRu(lastOrder.created_at))}*`
+          `📅 Создан: *${lastCreatedStr}*`
         : `📦 Последний заказ: —`);
 
     try {
-     await bot.sendMessage(id, msgMarkdown.replace(/\*/g, ""));
+     await bot.sendMessage(id, msgMarkdown, { parse_mode: "MarkdownV2" });
       return;
     } catch (e) {
       // 2) Если Markdown сломался — логируем и отправляем обычным текстом (без parse_mode)
