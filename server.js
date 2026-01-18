@@ -714,24 +714,22 @@ if (waitingReview.has(clientId)) {
 
   const courier = order.courier_username ? withAt(order.courier_username) : "—";
 
-   try {
-    await bot.sendMessage(
-      clientId,
-      `✅ Заказ №${escapeMarkdownV2(orderId)} доставлен.\n` +
-        `🚚 Курьер: ${escapeMarkdownV2(courier)}\n\n` +
-        `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
-        `Если не хотите — нажмите «Пропустить».`,
-      { parse_mode: "MarkdownV2", reply_markup: kb }
-    );
+  try {
+  const courier = order.courier_username ? withAt(order.courier_username) : "—";
 
-    console.log("[DEBUG] review request sent to client:", clientId, "order:", orderId);
-  } catch (e) {
-    console.error("[ERROR] cannot send review request:", e?.message || e, {
-      clientId,
-      orderId,
-      tgNick: order.tgNick
-    });
-  }
+  await bot.sendMessage(
+    clientId,
+    `✅ Заказ №${orderId} доставлен.\n` +
+      `🚚 Курьер: ${courier}\n\n` +
+      `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
+      `Если не хотите — нажмите «Пропустить».`,
+    { reply_markup: kb }
+  );
+
+  console.log("[DEBUG] review request sent to client:", clientId, "order:", orderId);
+} catch (e) {
+  console.error("[ERROR] cannot send review request:", e?.message || e, { clientId, orderId });
+}
 }
 
 
@@ -1239,6 +1237,7 @@ if (data.startsWith("no_cancel_")) {
 if (data.startsWith("cancel_")) {
   const orderId = data.split("_")[1];
   const order = await getOrderById(orderId);
+  const oldCourierUsername = order.courier_username ? String(order.courier_username).replace(/^@/, "") : null
   if (!order) {
     return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
   }
@@ -1257,6 +1256,40 @@ if (data.startsWith("cancel_")) {
 
     await sendOrUpdateOrderAll(updatedOrder);
 
+    // ✅ Уведомление админа всегда
+try {
+  await bot.sendMessage(
+    ADMIN_ID,
+    `❌ Клиент отменил заказ №${orderId} (в течение 20 минут).`
+  );
+} catch (e) {
+  console.error("[ERROR] notify admin cancel:", e?.message || e);
+}
+
+// ✅ Уведомление курьера, который взял
+if (oldCourierUsername) {
+  try {
+    // ищем chat_id курьера
+    let courierChatId = COURIERS[oldCourierUsername];
+
+    if (!courierChatId) {
+      const [rows] = await db.execute(
+        "SELECT chat_id FROM couriers WHERE username=? LIMIT 1",
+        [oldCourierUsername]
+      );
+      courierChatId = rows[0]?.chat_id;
+    }
+
+    if (courierChatId) {
+      await bot.sendMessage(
+        courierChatId,
+        `⚠️ Заказ №${orderId} отменён клиентом.`
+      );
+    }
+  } catch (e) {
+    console.error("[ERROR] notify courier cancel:", e?.message || e);
+  }
+}
     broadcastStock();
 
     return bot.answerCallbackQuery(q.id, { text: "✅ Заказ успешно отменен" });
@@ -1872,6 +1905,43 @@ if (text === "Мои заказы") {
     }
   });
 }
+
+// ===== Мои заказы: Активные (new/taken) =====
+if (text === "Активные заказы") {
+  const uname = (username || "").replace(/^@/, "");
+
+  const [orders] = await db.execute(
+    "SELECT * FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('new','taken') ORDER BY created_at DESC",
+    [uname]
+  );
+
+  if (!orders.length) return bot.sendMessage(id, "Активных заказов нет");
+
+  for (const o of orders) {
+    await clearOrderMessage(o.id, id); // чтобы прислало заново
+    await sendOrUpdateOrderToChat(o, id, "client", uname);
+  }
+  return;
+}
+
+// ===== Мои заказы: Выполненные (delivered) =====
+if (text === "Выполненные заказы") {
+  const uname = (username || "").replace(/^@/, "");
+
+  const [orders] = await db.execute(
+    "SELECT * FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('delivered','canceled') ORDER BY created_at DESC",
+    [uname]
+  );
+
+  if (!orders.length) return bot.sendMessage(id, "Выполненных заказов нет");
+
+  for (const o of orders) {
+    await clearOrderMessage(o.id, id);
+    await sendOrUpdateOrderToChat(o, id, "client", uname);
+  }
+  return;
+}
+
 
   // ===== Панель администратора =====
 if (text === "Панель администратора" && id === ADMIN_ID) {
