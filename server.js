@@ -1308,13 +1308,20 @@ if (text === "Взятые сейчас" && id === ADMIN_ID) {
     "SELECT * FROM orders WHERE status='taken' ORDER BY taken_at DESC"
   );
 
-  if (!orders.length) return bot.sendMessage(id, "Сейчас нет взятых заказов");
+  if (!orders.length) {
+    await bot.sendMessage(id, "Сейчас нет взятых заказов");
+    return;
+  }
+
+  await bot.sendMessage(id, `Взятые сейчас: ${orders.length}`);
 
   for (const o of orders) {
+    await clearOrderMessage(o.id, id);              // ✅ чтобы прислало заново как новое
     await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
   }
   return;
 }
+
 
 // ===== Админ: Сводка курьеров =====
 if (text === "Сводка курьеров" && id === ADMIN_ID) {
