@@ -370,14 +370,17 @@ function buildKeyboardForRecipient(order, { role, username }) {
   // По умолчанию кнопок нет
   let keyboard = [];
 
-  // Клиент — только отмена в первые 20 минут и только пока new
-  if (isClient) {
-    const orderAge = Date.now() - new Date(order.created_at).getTime();
-    if (order.status === "new" && orderAge <= 20 * 60 * 1000) {
-      keyboard = [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
-    }
-    return keyboard;
+  // Клиент — отмена в первые 20 минут, пока заказ NEW или TAKEN
+if (isClient) {
+  const orderAge = Date.now() - new Date(order.created_at).getTime();
+  const canCancelByTime = orderAge <= 20 * 60 * 1000;
+  const canCancelByStatus = (order.status === "new" || order.status === "taken");
+
+  if (canCancelByTime && canCancelByStatus) {
+    keyboard = [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
   }
+  return keyboard;
+}
 
   // Админ/курьеры
   if (order.status === "new") {
@@ -572,7 +575,30 @@ async function hasReviewForOrder(orderId) {
 }
 
 async function askForReview(order) {
-  if (!order?.client_chat_id) return;
+  if (!order) return;
+
+  // ✅ Если client_chat_id пустой — пробуем достать по tgNick из clients
+  if (!order.client_chat_id && order.tgNick) {
+    try {
+      const cleanNick = String(order.tgNick).replace(/^@+/, "").trim();
+      const client = await getClient(cleanNick);
+
+      if (client?.chat_id) {
+        order.client_chat_id = client.chat_id;
+
+        // ✅ сохраняем в заказ (чтобы потом всегда было)
+        await db.execute(
+          "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+          [client.chat_id, order.id]
+        );
+      }
+    } catch (e) {
+      console.error("[askForReview] lookup client_chat_id error:", e?.message || e);
+    }
+  }
+
+  // если так и не нашли chat_id — выходим
+  if (!order.client_chat_id) return;
 
   const orderId = String(order.id);
   const clientId = order.client_chat_id;
@@ -601,9 +627,7 @@ async function askForReview(order) {
         { text: "⭐ 4", callback_data: `rate_${orderId}_4` },
         { text: "⭐ 5", callback_data: `rate_${orderId}_5` }
       ],
-      [
-        { text: "⏭ Пропустить", callback_data: `skip_review_${orderId}` }
-      ]
+      [{ text: "⏭ Пропустить", callback_data: `skip_review_${orderId}` }]
     ]
   };
 
@@ -618,6 +642,7 @@ async function askForReview(order) {
     { parse_mode: "MarkdownV2", reply_markup: kb }
   );
 }
+
 
 
 
@@ -1031,10 +1056,8 @@ if (data.startsWith("delivered_")) {
     // ✅ Обновляем сообщение у всех участников
     await sendOrUpdateOrderAll(updatedOrder);
 
-    // Если клиент ещё не оставил отзыв — спрашиваем
-    if (updatedOrder.client_chat_id && !waitingReview.has(updatedOrder.client_chat_id)) {
-      await askForReview(updatedOrder);
-    }
+    // ✅ Спрашиваем отзыв (функция сама проверит дубли и сама найдёт client_chat_id если его нет)
+await askForReview(updatedOrder);
 
     return bot.answerCallbackQuery(q.id, { text: "✅ Заказ доставлен" });
   } catch (err) {
@@ -1057,9 +1080,11 @@ if (data.startsWith("confirm_cancel_")) {
   }
 
   const orderAge = Date.now() - new Date(order.created_at).getTime();
-  if (orderAge > 20 * 60 * 1000 || order.status !== "new") {
-    return bot.answerCallbackQuery(q.id, { text: "Заказ не отменяем", show_alert: true });
-  }
+const okStatus = (order.status === "new" || order.status === "taken");
+if (orderAge > 20 * 60 * 1000 || !okStatus) {
+  return bot.answerCallbackQuery(q.id, { text: "Заказ не отменяем", show_alert: true });
+}
+
 
   const keyboard = [
     [
@@ -1117,7 +1142,11 @@ if (data.startsWith("cancel_")) {
   }
 
   try {
-    await db.execute("UPDATE orders SET status='canceled', courier_username=NULL WHERE id=?", [orderId]);
+   await db.execute(
+  "UPDATE orders SET status='canceled', courier_username=NULL, taken_at=NULL, delivered_at=NULL WHERE id=?",
+  [orderId]
+);
+
     const updatedOrder = await getOrderById(orderId);
 
     await sendOrUpdateOrderAll(updatedOrder);
