@@ -372,7 +372,29 @@ function buildKeyboardForRecipient(order, { role, username }) {
 
   // Клиент — отмена в первые 20 минут, пока заказ NEW или TAKEN
 if (isClient) {
-  const orderAge = Date.now() - new Date(order.created_at).getTime();
+  const createdMs = order.created_at ? new Date(order.created_at).getTime() : Date.now();
+const orderAge = Date.now() - createdMs;
+if (isClient) {
+  const createdMs = order.created_at ? new Date(order.created_at).getTime() : Date.now();
+  const orderAge = Date.now() - createdMs;
+  const canCancelByTime = orderAge <= 20 * 60 * 1000;
+  const canCancelByStatus = (order.status === "new" || order.status === "taken");
+
+  console.log("[DEBUG cancel btn]", {
+    orderId: order.id,
+    status: order.status,
+    created_at: order.created_at,
+    orderAgeMin: Math.round(orderAge / 60000),
+    canCancelByTime,
+    canCancelByStatus
+  });
+
+  if (canCancelByTime && canCancelByStatus) {
+    keyboard = [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
+  }
+  return keyboard;
+}
+
   const canCancelByTime = orderAge <= 20 * 60 * 1000;
   const canCancelByStatus = (order.status === "new" || order.status === "taken");
 
@@ -515,6 +537,26 @@ async function sendOrUpdateOrderAll(order) {
     });
   }
 
+    // ✅ Если client_chat_id пустой — пытаемся найти по tgNick и сохранить в orders
+  if (!order.client_chat_id && order.tgNick) {
+    try {
+      const cleanNick = String(order.tgNick).replace(/^@+/, "").trim();
+      const client = await getClient(cleanNick);
+
+      if (client?.chat_id) {
+        order.client_chat_id = client.chat_id;
+
+        await db.execute(
+          "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+          [client.chat_id, order.id]
+        );
+      }
+    } catch (e) {
+      console.error("[sendOrUpdateOrderAll] resolve client_chat_id error:", e?.message || e);
+    }
+  }
+
+
   // Клиент
   if (order.client_chat_id) {
     recipientsMap.set(order.client_chat_id, {
@@ -525,6 +567,14 @@ async function sendOrUpdateOrderAll(order) {
   }
 
   const recipients = Array.from(recipientsMap.values());
+  console.log("[DEBUG sendOrUpdateOrderAll]", {
+  orderId: order.id,
+  status: order.status,
+  tgNick: order.tgNick,
+  client_chat_id: order.client_chat_id,
+  recipients: recipients.map(r => `${r.role}:${r.username}:${r.chatId}`)
+});
+
   const owner = order.courier_username?.replace(/^@/, "") || null;
 
   for (const r of recipients) {
