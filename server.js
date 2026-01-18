@@ -556,6 +556,28 @@ async function sendOrUpdateOrderAll(order) {
     }
   }
 
+  // ✅ Если client_chat_id пустой — пытаемся найти по tgNick и сохранить в orders
+if (!order.client_chat_id && order.tgNick) {
+  try {
+    const cleanNick = String(order.tgNick).replace(/^@+/, "").trim();
+    const client = await getClient(cleanNick);
+
+    if (client?.chat_id) {
+      order.client_chat_id = client.chat_id;
+
+      await db.execute(
+        "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+        [client.chat_id, order.id]
+      );
+
+      console.log("[DEBUG] resolved client_chat_id from clients:", client.chat_id, "for", cleanNick);
+    }
+  } catch (e) {
+    console.error("[sendOrUpdateOrderAll] resolve client_chat_id error:", e?.message || e);
+  }
+}
+
+
 
   // Клиент
   if (order.client_chat_id) {
@@ -2253,6 +2275,10 @@ async function generateOrderId() {
 app.post("/api/send-order", async (req, res) => {
   try {
     const { tgNick, city, delivery, payment, orderText, date, time, client_chat_id } = req.body;
+    console.log("[DEBUG api body]", req.body);
+console.log("[DEBUG api client_chat_id]", client_chat_id, "type:", typeof client_chat_id);
+const clientChatIdNum = client_chat_id ? Number(client_chat_id) : null;
+
 
     // ===== ПРОВЕРКА ВХОДНЫХ ДАННЫХ =====
    if (!tgNick || !orderText) {
@@ -2272,7 +2298,7 @@ await db.execute(`
   ON DUPLICATE KEY UPDATE
     chat_id = VALUES(chat_id),
     username = VALUES(username)
-`, [client_chat_id, cleanUsername]);
+`, [clientChatIdNum, cleanUsername]);
 
  // ===== ПРОВЕРКА БАНА =====
 let banned = false;
@@ -2308,7 +2334,7 @@ if (banned) {
     // ===== Проверка существующего заказа =====
     const [existing] = await db.execute(
       "SELECT id FROM orders WHERE client_chat_id=? AND orderText=?",
-      [client_chat_id, orderText]
+      [clientChatIdNum, orderText]
     );
 
     let id;
@@ -2330,7 +2356,7 @@ if (banned) {
       date,
       time,
       status: "new",
-      client_chat_id
+      client_chat_id: clientChatIdNum
     };
 
     // ===== Добавляем заказ в базу, если его ещё нет =====
