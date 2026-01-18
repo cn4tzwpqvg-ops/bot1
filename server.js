@@ -1498,6 +1498,11 @@ const query = showDone
 
 
   const [orders] = await db.execute(query, [selectedCourier]);
+  console.log("[DEBUG admin orders] courier:", selectedCourier, "showDone:", showDone, "count:", orders.length);
+if (orders.length) {
+  console.log("[DEBUG admin orders] first:", orders[0].id, orders[0].status, orders[0].courier_username);
+}
+
 
   if (!orders || orders.length === 0) {
     // ✅ ВАЖНО: если заказов нет — тоже выходим из режима выбора
@@ -1983,15 +1988,22 @@ if (id === ADMIN_ID) {
     params = [courierName];
   }
 
-  const [orders] = await db.execute(query, params);
+const [orders] = await db.execute(query, params);
 
-  if (!orders.length) return bot.sendMessage(id, emptyText);
-
-  for (const order of orders) {
-    await sendOrUpdateOrderToChat(order, id, "courier", username);
-  }
-
+if (!orders.length) {
+  await bot.sendMessage(id, emptyText);
   return;
+}
+
+await bot.sendMessage(id, `Найдено заказов: ${orders.length}`);
+
+for (const order of orders) {
+  await clearOrderMessage(order.id, id); // ✅ чтобы прислало заново
+  await sendOrUpdateOrderToChat(order, id, "courier", username);
+}
+
+return;
+
 }
  });
 
