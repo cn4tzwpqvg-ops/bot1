@@ -2274,10 +2274,18 @@ async function generateOrderId() {
 // ================= API: отправка заказа =================
 app.post("/api/send-order", async (req, res) => {
   try {
-    const { tgNick, city, delivery, payment, orderText, date, time, client_chat_id } = req.body;
-    console.log("[DEBUG api body]", req.body);
-console.log("[DEBUG api client_chat_id]", client_chat_id, "type:", typeof client_chat_id);
+    let { tgNick, city, delivery, payment, orderText, date, time, client_chat_id, tgUser } = req.body;
+
+// ✅ если сайт не прислал client_chat_id — берём из Telegram WebApp user.id
+if (!client_chat_id && tgUser?.id) {
+  client_chat_id = tgUser.id;
+}
+
+// ✅ приводим к числу (Telegram id — число)
 const clientChatIdNum = client_chat_id ? Number(client_chat_id) : null;
+
+console.log("[DEBUG api body]", req.body);
+console.log("[DEBUG api client_chat_id FIXED]", client_chat_id, "=>", clientChatIdNum, "type:", typeof clientChatIdNum);
 
 
     // ===== ПРОВЕРКА ВХОДНЫХ ДАННЫХ =====
@@ -2365,12 +2373,12 @@ if (banned) {
       console.log(`Заказ ${id} добавлен в базу`);
 
       // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа
-  if (client_chat_id) {
-    await db.execute(
-      "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-      [client_chat_id, id]
-    );
-  }
+  if (clientChatIdNum) {
+  await db.execute(
+    "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+    [clientChatIdNum, id]
+  );
+}
     } else {
       console.log(`Заказ ${id} уже в базе, пропускаем добавление`);
     }
