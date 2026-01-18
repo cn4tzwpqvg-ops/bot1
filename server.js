@@ -1251,6 +1251,66 @@ bot.on("message", async (msg) => {
   if (!msg.text) return;
   const text = msg.text.trim();
 
+  // ✅ чтобы кнопки меню не перехватывались режимами "ожидания"
+if (id === ADMIN_ID) {
+  const adminMenuClicks = [
+    "Панель курьера",
+    "Панель администратора",
+    "Новые заказы",
+    "Взятые заказы",
+    "Выполненные заказы",
+    "Взятые сейчас",
+    "Сводка курьеров",
+    "Активные по курьеру",
+    "Выполненные по курьеру",
+    "Назад"
+  ];
+
+  if (adminMenuClicks.includes(text)) {
+    adminWaitingOrdersCourier.delete(username);
+    adminWaitingBroadcast.delete(username);
+    adminWaitingCourier.delete(username);
+  }
+}
+
+// ===== Админ: Взятые сейчас (все заказы status='taken') =====
+if (text === "Взятые сейчас" && id === ADMIN_ID) {
+  const [orders] = await db.execute(
+    "SELECT * FROM orders WHERE status='taken' ORDER BY taken_at DESC"
+  );
+
+  if (!orders.length) return bot.sendMessage(id, "Сейчас нет взятых заказов");
+
+  for (const o of orders) {
+    await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
+  }
+  return;
+}
+
+// ===== Админ: Сводка курьеров =====
+if (text === "Сводка курьеров" && id === ADMIN_ID) {
+  const [rows] = await db.execute(`
+    SELECT
+      c.username,
+      SUM(o.status='taken') AS taken_cnt,
+      SUM(o.status='delivered' AND DATE(o.delivered_at)=CURDATE()) AS delivered_today
+    FROM couriers c
+    LEFT JOIN orders o ON o.courier_username = c.username
+    GROUP BY c.username
+    ORDER BY taken_cnt DESC, delivered_today DESC
+  `);
+
+  if (!rows.length) return bot.sendMessage(id, "Нет курьеров");
+
+  const lines = rows.map(r =>
+    `@${r.username}: взято=${r.taken_cnt || 0}, выполнено сегодня=${r.delivered_today || 0}`
+  ).join("\n");
+
+  return bot.sendMessage(id, "📌 Сводка курьеров:\n" + lines);
+}
+
+
+
   // Проверка username
   if (!username) {
     console.log(`[WARN] Пользователь с chat_id ${id} не имеет username`);
@@ -1455,23 +1515,8 @@ const query = showDone
 
   // Отправляем заказы
   for (const o of orders) {
-    // чтобы не падало на null
-    o.orderText = o.orderText || "—";
-    o.tgNick = o.tgNick || "—";
-    o.city = o.city || "—";
-    o.delivery = o.delivery || "—";
-    o.payment = o.payment || "—";
-    o.date = o.date || "—";
-    o.time = o.time || "—";
-
-    try {
-      const msgText = String(buildOrderMessage(o));
-      await bot.sendMessage(id, msgText, { parse_mode: "MarkdownV2" });
-    } catch (err) {
-      console.error(`Ошибка отправки заказа №${o.id} @${selectedCourier}:`, err.message);
-    }
-  }
-
+  await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
+}
   // ✅ Вариант B: после просмотра — выходим из режима выбора
   adminWaitingOrdersCourier.delete(username);
   return;
@@ -1892,8 +1937,17 @@ if (text === "Панель курьера" && (COURIERS[username] || id === ADMI
 // ===== ПРОСМОТР ЗАКАЗОВ КУРЬЕРА (НОВЫЕ / ВЗЯТЫЕ / ВЫПОЛНЕННЫЕ) =====
 if (
   (text === "Новые заказы" || text === "Взятые заказы" || text === "Выполненные заказы") &&
-  isCourier(username)
+  (isCourier(username) || id === ADMIN_ID)
 ) {
+
+console.log("[DEBUG] courier panel click:", text, "user:", username, "id:", id);
+
+  // если админ — сбрасываем режимы админки, чтобы не мешали панели курьера
+if (id === ADMIN_ID) {
+  adminWaitingOrdersCourier.delete(username);
+  adminWaitingBroadcast.delete(username);
+}
+
   const courierName = (username || "").replace(/^@/, "");
 
   let query = "";
@@ -1939,10 +1993,7 @@ if (
 
   return;
 }
-});
-
-
-
+ });
 
 
 // ================= Express / WebSocket =================
