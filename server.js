@@ -1697,18 +1697,22 @@ if (text === "/banned" && id === ADMIN_ID) {
 }
 
 
-// ===== Личный кабинет =====
+// ===== Личный кабинет (с защитой от Markdown) =====
 if (text === "Личный кабинет") {
-  try {
-    const uname = username.replace(/^@/, "");
+  console.log("[DEBUG] Личный кабинет нажали:", { id, username });
 
-    // Всего заказов
+  try {
+    const uname = (username || "").replace(/^@/, "");
+
+    const roleLabel =
+      (id === ADMIN_ID) ? "👑 Админ" :
+      (isCourier(username) ? "🚚 Курьер" : "🧑 Клиент");
+
     const [[{ cnt: totalOrders }]] = await db.execute(
       "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ?",
       [uname]
     );
 
-    // Статусы заказов
     const [[{ cnt: newCnt }]] = await db.execute(
       "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='new'",
       [uname]
@@ -1724,14 +1728,14 @@ if (text === "Личный кабинет") {
       [uname]
     );
 
-    // Последний заказ
     const [lastOrders] = await db.execute(
       "SELECT id, status, created_at FROM orders WHERE REPLACE(tgNick,'@','')=? ORDER BY created_at DESC LIMIT 1",
       [uname]
     );
     const lastOrder = lastOrders[0];
 
-    // Формат времени “по-человечески”
+    const client = await getClient(uname);
+
     const formatRu = (dt) => {
       if (!dt) return "—";
       return new Date(dt).toLocaleString("ru-RU", {
@@ -1744,15 +1748,8 @@ if (text === "Личный кабинет") {
       });
     };
 
-    // Получаем клиента (у тебя уже есть getClient)
-    const client = await getClient(uname);
-
-    const roleLabel =
-  (id === ADMIN_ID) ? "👑 Админ" :
-  (isCourier(username) ? "🚚 Курьер" : "🧑 Клиент");
-
-
-    const msgText =
+    // 1) Сначала делаем красивый MarkdownV2
+    const msgMarkdown =
       `👤 *Личный кабинет*\n\n` +
       `🧑 Имя: *${escapeMarkdownV2(client?.first_name || "—")}*\n` +
       `🔗 Ник: @${escapeMarkdownV2(uname)}\n` +
@@ -1767,10 +1764,34 @@ if (text === "Личный кабинет") {
           `📅 Создан: *${escapeMarkdownV2(formatRu(lastOrder.created_at))}*`
         : `📦 Последний заказ: —`);
 
-    return bot.sendMessage(id, msgText, { parse_mode: "MarkdownV2" });
+    try {
+      await bot.sendMessage(id, msgMarkdown, { parse_mode: "MarkdownV2" });
+      return;
+    } catch (e) {
+      // 2) Если Markdown сломался — логируем и отправляем обычным текстом (без parse_mode)
+      console.error("[ERROR] ЛК MarkdownV2 failed:", e?.message || e);
+
+      const msgPlain =
+        `Личный кабинет\n\n` +
+        `Имя: ${client?.first_name || "—"}\n` +
+        `Ник: @${uname}\n` +
+        `Статус: ${roleLabel}\n\n` +
+        `Всего заказов: ${totalOrders || 0}\n` +
+        `Новые: ${newCnt || 0}\n` +
+        `В пути: ${takenCnt || 0}\n` +
+        `Выполнено: ${deliveredCnt || 0}\n\n` +
+        `Последняя активность: ${formatRu(client?.last_active)}\n` +
+        (lastOrder
+          ? `Последний заказ: №${lastOrder.id} (${lastOrder.status}), создан: ${formatRu(lastOrder.created_at)}`
+          : `Последний заказ: —`);
+
+      await bot.sendMessage(id, msgPlain);
+      return;
+    }
+
   } catch (err) {
-    console.error(`Ошибка получения ЛК для @${username}:`, err.message);
-    return bot.sendMessage(id, "Ошибка при получении личного кабинета.");
+    console.error("[ERROR] Личный кабинет общий:", err?.message || err);
+    return bot.sendMessage(id, "Ошибка при открытии личного кабинета. (Смотри консоль сервера)");
   }
 }
 
