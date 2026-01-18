@@ -2410,19 +2410,10 @@ if (banned) {
 
 
     // ===== Проверка существующего заказа =====
-    const [existing] = await db.execute(
-      "SELECT id FROM orders WHERE client_chat_id=? AND orderText=?",
-      [clientChatIdNum, orderText]
-    );
+    // ✅ Всегда создаём новый заказ (иначе ловим старые delivered и “ничего не приходит”)
+const id = await generateOrderId();
+console.log(`Присвоен новый ID заказа: ${id}`);
 
-    let id;
-    if (existing.length) {
-      id = existing[0].id;
-      console.log(`Заказ уже существует, используем ID: ${id}`);
-    } else {
-      id = await generateOrderId();
-      console.log(`Присвоен новый ID заказа: ${id}`);
-    }
 
     const order = {
       id,
@@ -2438,10 +2429,14 @@ if (banned) {
     };
 
     // ===== Добавляем заказ в базу, если его ещё нет =====
-    if (!existing.length) {
-      await addOrder(order);
-      console.log(`Заказ ${id} добавлен в базу`);
+   await addOrder(order);
+console.log(`Заказ ${id} добавлен в базу`);
 
+if (clientChatIdNum) {
+  await db.execute(
+    "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+    [clientChatIdNum, id]
+  );
       // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа
   if (clientChatIdNum) {
   await db.execute(
@@ -2455,6 +2450,9 @@ if (banned) {
 
     // ===== Получаем заказ из базы =====
     const updated = await getOrderById(id);
+
+    // ✅ тест: принудительно слать новым сообщением всем (сброс message_id)
+await clearOrderMessage(updated.id, ADMIN_ID);
 
     // ===== Отправляем уведомления в Telegram =====
     await sendOrUpdateOrderAll(updated);
