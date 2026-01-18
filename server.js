@@ -608,7 +608,16 @@ async function askForReview(order) {
   if (already) return;
 
   // 2) не спрашиваем второй раз, если уже ждём отзыв от этого клиента
-  if (waitingReview.has(clientId)) return;
+// но если ждём по другому заказу — сбрасываем и спрашиваем заново
+if (waitingReview.has(clientId)) {
+  const cur = waitingReview.get(clientId);
+  if (cur && String(cur.orderId) !== String(orderId)) {
+    waitingReview.delete(clientId);
+  } else {
+    return;
+  }
+}
+
 
   // сохраняем состояние ожидания
   waitingReview.set(clientId, {
@@ -633,15 +642,26 @@ async function askForReview(order) {
 
   const courier = order.courier_username ? withAt(order.courier_username) : "—";
 
-  await bot.sendMessage(
-    clientId,
-    `✅ Заказ №${escapeMarkdownV2(orderId)} доставлен.\n` +
-      `🚚 Курьер: ${escapeMarkdownV2(courier)}\n\n` +
-      `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
-      `Если не хотите — нажмите «Пропустить».`,
-    { parse_mode: "MarkdownV2", reply_markup: kb }
-  );
+   try {
+    await bot.sendMessage(
+      clientId,
+      `✅ Заказ №${escapeMarkdownV2(orderId)} доставлен.\n` +
+        `🚚 Курьер: ${escapeMarkdownV2(courier)}\n\n` +
+        `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
+        `Если не хотите — нажмите «Пропустить».`,
+      { parse_mode: "MarkdownV2", reply_markup: kb }
+    );
+
+    console.log("[DEBUG] review request sent to client:", clientId, "order:", orderId);
+  } catch (e) {
+    console.error("[ERROR] cannot send review request:", e?.message || e, {
+      clientId,
+      orderId,
+      tgNick: order.tgNick
+    });
+  }
 }
+
 
 
 
@@ -1043,7 +1063,10 @@ if (data.startsWith("delivered_")) {
   console.log(`DELIVERED заказ ${orderId} пользователем @${username}`);
 
   // Проверка: только курьер, который взял заказ, или админ
-  const isOwnerOrAdmin = order.courier_username?.replace(/^@/, "") === username.replace(/^@/, "") || fromId === ADMIN_ID;
+  const isOwnerOrAdmin =
+    order.courier_username?.replace(/^@/, "") === username.replace(/^@/, "") ||
+    fromId === ADMIN_ID;
+
   if (!isOwnerOrAdmin) {
     return bot.answerCallbackQuery(q.id, { text: "Нельзя отметить", show_alert: true });
   }
@@ -1056,8 +1079,19 @@ if (data.startsWith("delivered_")) {
     // ✅ Обновляем сообщение у всех участников
     await sendOrUpdateOrderAll(updatedOrder);
 
-    // ✅ Спрашиваем отзыв (функция сама проверит дубли и сама найдёт client_chat_id если его нет)
-await askForReview(updatedOrder);
+    // ✅ Просим отзыв (1 раз) + лог
+    try {
+      console.log("[DEBUG] delivered -> askForReview", {
+        orderId: updatedOrder.id,
+        tgNick: updatedOrder.tgNick,
+        client_chat_id: updatedOrder.client_chat_id,
+        status: updatedOrder.status
+      });
+      await askForReview(updatedOrder);
+      console.log("[DEBUG] askForReview done for order", updatedOrder.id);
+    } catch (e) {
+      console.error("[ERROR] askForReview failed:", e?.message || e);
+    }
 
     return bot.answerCallbackQuery(q.id, { text: "✅ Заказ доставлен" });
   } catch (err) {
@@ -1550,14 +1584,19 @@ if (orders.length) {
   }
 
   await bot.sendMessage(
-    id,
-    `${showDone ? "Выполненные" : "Активные"} заказы курьера @${selectedCourier}:`
-  );
+  id,
+  `${showDone ? "Выполненные" : "Активные"} заказы курьера @${selectedCourier}:`
+);
 
-  // Отправляем заказы
-  for (const o of orders) {
+await bot.sendMessage(id, `Найдено: ${orders.length}`);
+
+for (const o of orders) {
+  await clearOrderMessage(o.id, id);
   await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
 }
+
+
+
   // ✅ Вариант B: после просмотра — выходим из режима выбора
   adminWaitingOrdersCourier.delete(username);
   return;
