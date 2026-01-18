@@ -1911,45 +1911,6 @@ if (text === "Статистика" && id === ADMIN_ID) {
   }
 }
 
-
-// ===== Взятые сейчас =====
-if (text === "Взятые сейчас" && id === ADMIN_ID) {
-  const [orders] = await db.execute(
-    "SELECT * FROM orders WHERE status='taken' ORDER BY taken_at DESC"
-  );
-
-  if (!orders.length) return bot.sendMessage(id, "Сейчас нет взятых заказов");
-
-  for (const o of orders) {
-    await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
-  }
-  return;
-}
-
-// ===== Сводка курьеров =====
-if (text === "Сводка курьеров" && id === ADMIN_ID) {
-  const [rows] = await db.execute(`
-    SELECT
-      c.username,
-      SUM(o.status='taken') AS taken_cnt,
-      SUM(o.status='delivered' AND DATE(o.delivered_at)=CURDATE()) AS delivered_today
-    FROM couriers c
-    LEFT JOIN orders o ON o.courier_username = c.username
-    GROUP BY c.username
-    ORDER BY taken_cnt DESC, delivered_today DESC
-  `);
-
-  if (!rows.length) return bot.sendMessage(id, "Нет курьеров");
-
-  const lines = rows.map(r =>
-    `@${r.username}: взято=${r.taken_cnt || 0}, выполнено сегодня=${r.delivered_today || 0}`
-  ).join("\n");
-
-  return bot.sendMessage(id, "📌 Сводка курьеров:\n" + lines);
-}
-
-
-
 // ===== Кнопка "Рассылка" =====
 if (text === "Рассылка" && id === ADMIN_ID) {
   adminWaitingBroadcast.set(username, true); // <-- устанавливаем флаг ожидания
@@ -2078,10 +2039,9 @@ for (const order of orders) {
 }
 
 return;
+} // закрыли IF
 
-}
- });
-
+}); // ✅ закрыли bot.on("message", async (msg) => { ... })
 
 // ================= Express / WebSocket =================
 const app = express();
