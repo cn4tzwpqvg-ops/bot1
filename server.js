@@ -1697,7 +1697,7 @@ if (text === "/banned" && id === ADMIN_ID) {
 }
 
 
-// ===== Личный кабинет (с защитой от Markdown) =====
+// ===== Личный кабинет (красиво, без Markdown, без слешей) =====
 if (text === "Личный кабинет") {
   console.log("[DEBUG] Личный кабинет нажали:", { id, username });
 
@@ -1708,11 +1708,13 @@ if (text === "Личный кабинет") {
       (id === ADMIN_ID) ? "👑 Админ" :
       (isCourier(username) ? "🚚 Курьер" : "🧑 Клиент");
 
+    // Всего заказов
     const [[{ cnt: totalOrders }]] = await db.execute(
       "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ?",
       [uname]
     );
 
+    // Статусы заказов
     const [[{ cnt: newCnt }]] = await db.execute(
       "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='new'",
       [uname]
@@ -1728,14 +1730,17 @@ if (text === "Личный кабинет") {
       [uname]
     );
 
+    // Последний заказ
     const [lastOrders] = await db.execute(
       "SELECT id, status, created_at FROM orders WHERE REPLACE(tgNick,'@','')=? ORDER BY created_at DESC LIMIT 1",
       [uname]
     );
     const lastOrder = lastOrders[0];
 
+    // Клиент из БД (у тебя уже есть getClient)
     const client = await getClient(uname);
 
+    // Человекопонятная дата
     const formatRu = (dt) => {
       if (!dt) return "—";
       return new Date(dt).toLocaleString("ru-RU", {
@@ -1748,50 +1753,31 @@ if (text === "Личный кабинет") {
       });
     };
 
-    // 1) Сначала делаем красивый MarkdownV2
-    const msgMarkdown =
-      `👤 *Личный кабинет*\n\n` +
-      `🧑 Имя: *${escapeMarkdownV2(client?.first_name || "—")}*\n` +
-      `🔗 Ник: @${escapeMarkdownV2(uname)}\n` +
-      `🏷 Статус: *${escapeMarkdownV2(roleLabel)}*\n\n` +
-      `🧾 Всего заказов: *${totalOrders || 0}*\n` +
-      `🆕 Новые: *${newCnt || 0}*\n` +
-      `🚚 В пути: *${takenCnt || 0}*\n` +
-      `✅ Выполнено: *${deliveredCnt || 0}*\n\n` +
-      `🕒 Последняя активность: *${lastActiveStr}*\n` +
+    const lastActiveStr = formatRu(client?.last_active);
+    const lastCreatedStr = lastOrder ? formatRu(lastOrder.created_at) : "—";
+
+    // Собираем текст без Markdown
+    const msg =
+      `👤 Личный кабинет\n\n` +
+      `🧑 Имя: ${client?.first_name || "—"}\n` +
+      `🔗 Ник: @${uname || "—"}\n` +
+      `🏷 Статус: ${roleLabel}\n\n` +
+      `🧾 Всего заказов: ${totalOrders || 0}\n` +
+      `🆕 Новые: ${newCnt || 0}\n` +
+      `🚚 В пути: ${takenCnt || 0}\n` +
+      `✅ Выполнено: ${deliveredCnt || 0}\n\n` +
+      `🕒 Последняя активность: ${lastActiveStr}\n` +
       (lastOrder
-        ? `📦 Последний заказ: *№${escapeMarkdownV2(String(lastOrder.id))}* (${escapeMarkdownV2(lastOrder.status)})\n` +
-          `📅 Создан: *${lastCreatedStr}*`
+        ? `📦 Последний заказ: №${lastOrder.id} (${lastOrder.status})\n` +
+          `📅 Создан: ${lastCreatedStr}`
         : `📦 Последний заказ: —`);
 
-    try {
-     await bot.sendMessage(id, msgMarkdown, { parse_mode: "MarkdownV2" });
-      return;
-    } catch (e) {
-      // 2) Если Markdown сломался — логируем и отправляем обычным текстом (без parse_mode)
-      console.error("[ERROR] ЛК MarkdownV2 failed:", e?.message || e);
-
-      const msgPlain =
-        `Личный кабинет\n\n` +
-        `Имя: ${client?.first_name || "—"}\n` +
-        `Ник: @${uname}\n` +
-        `Статус: ${roleLabel}\n\n` +
-        `Всего заказов: ${totalOrders || 0}\n` +
-        `Новые: ${newCnt || 0}\n` +
-        `В пути: ${takenCnt || 0}\n` +
-        `Выполнено: ${deliveredCnt || 0}\n\n` +
-        `Последняя активность: ${formatRu(client?.last_active)}\n` +
-        (lastOrder
-          ? `Последний заказ: №${lastOrder.id} (${lastOrder.status}), создан: ${formatRu(lastOrder.created_at)}`
-          : `Последний заказ: —`);
-
-      await bot.sendMessage(id, msgPlain);
-      return;
-    }
+    await bot.sendMessage(id, msg);
+    return;
 
   } catch (err) {
     console.error("[ERROR] Личный кабинет общий:", err?.message || err);
-    return bot.sendMessage(id, "Ошибка при открытии личного кабинета. (Смотри консоль сервера)");
+    return bot.sendMessage(id, "Ошибка при открытии личного кабинета.");
   }
 }
 
