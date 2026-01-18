@@ -1700,25 +1700,80 @@ if (text === "/banned" && id === ADMIN_ID) {
 // ===== Личный кабинет =====
 if (text === "Личный кабинет") {
   try {
-    // Получаем количество заказов пользователя
+    const uname = username.replace(/^@/, "");
+
+    // Всего заказов
     const [[{ cnt: totalOrders }]] = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE tgNick = ?",
-      [username]
+      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ?",
+      [uname]
     );
 
-    const info = [
-      `Имя: ${client.first_name || "—"}`,
-      `Город: ${client.city || "—"}`,
-      `Последняя активность: ${client.last_active || "—"}`,
-      `Всего заказов: ${totalOrders || 0}`
-    ].join("\n");
+    // Статусы заказов
+    const [[{ cnt: newCnt }]] = await db.execute(
+      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='new'",
+      [uname]
+    );
 
-    return bot.sendMessage(id, info);
+    const [[{ cnt: takenCnt }]] = await db.execute(
+      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='taken'",
+      [uname]
+    );
+
+    const [[{ cnt: deliveredCnt }]] = await db.execute(
+      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='delivered'",
+      [uname]
+    );
+
+    // Последний заказ
+    const [lastOrders] = await db.execute(
+      "SELECT id, status, created_at FROM orders WHERE REPLACE(tgNick,'@','')=? ORDER BY created_at DESC LIMIT 1",
+      [uname]
+    );
+    const lastOrder = lastOrders[0];
+
+    // Формат времени “по-человечески”
+    const formatRu = (dt) => {
+      if (!dt) return "—";
+      return new Date(dt).toLocaleString("ru-RU", {
+        timeZone: "Europe/Zaporozhye",
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+    };
+
+    // Получаем клиента (у тебя уже есть getClient)
+    const client = await getClient(uname);
+
+    const roleLabel =
+  (id === ADMIN_ID) ? "👑 Админ" :
+  (isCourier(username) ? "🚚 Курьер" : "🧑 Клиент");
+
+
+    const msgText =
+      `👤 *Личный кабинет*\n\n` +
+      `🧑 Имя: *${escapeMarkdownV2(client?.first_name || "—")}*\n` +
+      `🔗 Ник: @${escapeMarkdownV2(uname)}\n` +
+      `🏷 Статус: *${escapeMarkdownV2(roleLabel)}*\n\n` +
+      `🧾 Всего заказов: *${totalOrders || 0}*\n` +
+      `🆕 Новые: *${newCnt || 0}*\n` +
+      `🚚 В пути: *${takenCnt || 0}*\n` +
+      `✅ Выполнено: *${deliveredCnt || 0}*\n\n` +
+      `🕒 Последняя активность: *${escapeMarkdownV2(formatRu(client?.last_active))}*\n` +
+      (lastOrder
+        ? `📦 Последний заказ: *№${escapeMarkdownV2(String(lastOrder.id))}* (${escapeMarkdownV2(lastOrder.status)})\n` +
+          `📅 Создан: *${escapeMarkdownV2(formatRu(lastOrder.created_at))}*`
+        : `📦 Последний заказ: —`);
+
+    return bot.sendMessage(id, msgText, { parse_mode: "MarkdownV2" });
   } catch (err) {
-    console.error(`Ошибка получения данных личного кабинета для @${username}:`, err.message);
-    return bot.sendMessage(id, "Ошибка при получении информации о личном кабинете.");
+    console.error(`Ошибка получения ЛК для @${username}:`, err.message);
+    return bot.sendMessage(id, "Ошибка при получении личного кабинета.");
   }
 }
+
 
 
   // ===== Поддержка =====
@@ -1918,46 +1973,114 @@ if (text === "Рассылка" && id === ADMIN_ID) {
 }
 
 
-// ===== Рассылка с лимитом =====
+// ===== Рассылка с лимитом (без дублей + отчет по никам) =====
 if (adminWaitingBroadcast.has(username)) {
   const msgText = text;
 
   try {
-    const [allClients] = await db.execute(
-      "SELECT chat_id, username FROM clients WHERE subscribed=1 AND chat_id IS NOT NULL"
-    );
+    // 1) Берем уникальные chat_id (если в базе дубли — они схлопнутся)
+    const [rows] = await db.execute(`
+      SELECT chat_id, MAX(username) AS username
+      FROM clients
+      WHERE subscribed=1 AND chat_id IS NOT NULL
+      GROUP BY chat_id
+    `);
 
     console.log(`Начало рассылки от @${username}, текст: "${msgText}"`);
-    console.log(`Всего получателей: ${allClients.length}`);
+    console.log(`Уникальных получателей: ${rows.length}`);
+
+    const safeMsg = escapeMarkdownV2(msgText);
 
     const limit = pLimit(5);
-    let successCount = 0;
 
-    const tasks = allClients.map(c => limit(async () => {
+    const okUsers = [];
+    const failUsers = [];
+
+    // 2) На всякий случай еще защита от дублей в коде
+    const sentSet = new Set();
+
+    const tasks = rows.map(r => limit(async () => {
+      const chatId = r.chat_id;
+      const uname = r.username ? String(r.username) : "";
+
+      if (!chatId) return;
+
+      // если каким-то чудом chatId повторился — пропускаем
+      if (sentSet.has(chatId)) return;
+      sentSet.add(chatId);
+
       try {
-        const safeMsg = escapeMarkdownV2(msgText);
-        await bot.sendMessage(c.chat_id, safeMsg, { parse_mode: 'MarkdownV2' });
-        successCount++;
-        console.log(`Отправлено пользователю chat_id: ${c.chat_id}`);
+        await bot.sendMessage(chatId, safeMsg, { parse_mode: "MarkdownV2" });
+        okUsers.push(uname ? `@${uname.replace(/^@/, "")}` : `chat_id:${chatId}`);
+        console.log(`✅ Отправлено: ${uname || chatId}`);
       } catch (err) {
-        console.error(`Ошибка при отправке @${c.username} (chat_id: ${c.chat_id}):`, err.message);
+        failUsers.push(uname ? `@${uname.replace(/^@/, "")}` : `chat_id:${chatId}`);
+        console.error(`❌ Ошибка отправки ${uname || chatId}:`, err.message);
       }
     }));
 
     await Promise.all(tasks);
 
-    const safeReport = escapeMarkdownV2(`Рассылка завершена\nУспешно отправлено: ${successCount} из ${allClients.length}`);
-    await bot.sendMessage(ADMIN_ID, safeReport, { parse_mode: 'MarkdownV2' });
-
     adminWaitingBroadcast.delete(username);
-    console.log(`Рассылка от @${username} завершена`);
+
+    // 3) Отчет админу (может быть длинный — шлем частями)
+    const makeChunks = (arr, maxLen = 3500) => {
+      const out = [];
+      let cur = "";
+      for (const x of arr) {
+        const add = (cur ? "\n" : "") + x;
+        if ((cur + add).length > maxLen) {
+          out.push(cur);
+          cur = x;
+        } else {
+          cur += add;
+        }
+      }
+      if (cur) out.push(cur);
+      return out;
+    };
+
+    const header =
+      `📣 Рассылка завершена\n` +
+      `Успешно: ${okUsers.length} из ${rows.length}\n` +
+      `Ошибки: ${failUsers.length}\n`;
+
+    await bot.sendMessage(ADMIN_ID, escapeMarkdownV2(header), { parse_mode: "MarkdownV2" });
+
+    if (okUsers.length) {
+      const okChunks = makeChunks(okUsers);
+      for (let i = 0; i < okChunks.length; i++) {
+        await bot.sendMessage(
+          ADMIN_ID,
+          escapeMarkdownV2(`✅ Доставлено (часть ${i + 1}/${okChunks.length}):\n${okChunks[i]}`),
+          { parse_mode: "MarkdownV2" }
+        );
+      }
+    }
+
+    if (failUsers.length) {
+      const failChunks = makeChunks(failUsers);
+      for (let i = 0; i < failChunks.length; i++) {
+        await bot.sendMessage(
+          ADMIN_ID,
+          escapeMarkdownV2(`❌ Не доставлено (часть ${i + 1}/${failChunks.length}):\n${failChunks[i]}`),
+          { parse_mode: "MarkdownV2" }
+        );
+      }
+    }
+
   } catch (err) {
     console.error(`Ошибка при рассылке от @${username}:`, err.message);
-    await bot.sendMessage(ADMIN_ID, `Ошибка при рассылке: ${escapeMarkdownV2(err.message)}`, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(
+      ADMIN_ID,
+      `Ошибка при рассылке: ${escapeMarkdownV2(err.message)}`,
+      { parse_mode: "MarkdownV2" }
+    );
   }
 
   return;
 }
+
 
 
 // ===== Панель курьера =====
