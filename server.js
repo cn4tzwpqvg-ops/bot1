@@ -1765,7 +1765,7 @@ if (text === "Личный кабинет") {
         : `📦 Последний заказ: —`);
 
     try {
-      await bot.sendMessage(id, msgMarkdown, { parse_mode: "MarkdownV2" });
+     await bot.sendMessage(id, msgMarkdown.replace(/\*/g, ""));
       return;
     } catch (e) {
       // 2) Если Markdown сломался — логируем и отправляем обычным текстом (без parse_mode)
