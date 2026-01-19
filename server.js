@@ -841,12 +841,6 @@ bot.on("callback_query", async (q) => {
     return bot.answerCallbackQuery(q.id);
   }
 
-  if (data === "back_to_menu") {
-    // просто закрываем кнопку (без меню, чтобы не ломать)
-    return bot.answerCallbackQuery(q.id, { text: "Ок" });
-  }
-
-
   if (!username) {
     console.log("У пользователя нет username");
     return bot.answerCallbackQuery(q.id, {
@@ -1913,7 +1907,6 @@ if (text === "Поддержка") {
     inline_keyboard: [
       [{ text: "💬 Написать в поддержку", url: "https://t.me/crazycloud_manager" }],
       [{ text: "❓ Частые вопросы", callback_data: "faq" }],
-      [{ text: "⬅️ Назад", callback_data: "back_to_menu" }]
     ]
   };
 
