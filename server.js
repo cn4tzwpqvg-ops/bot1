@@ -105,6 +105,8 @@ async function initDB() {
     )
   `);
 
+
+
   // ===== Индексы =====
   const indexes = [
     ["orders", "idx_orders_status", "status"],
@@ -118,6 +120,49 @@ async function initDB() {
   for (const [table, index, column] of indexes) {
     await db.execute(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${column})`).catch(() => {});
   }
+
+    // ===== ДОБАВЛЯЕМ КОЛОНКИ ДЛЯ РЕФЕРАЛКИ =====
+
+  // clients.referrer
+  try {
+    await db.execute(
+      "ALTER TABLE clients ADD COLUMN referrer VARCHAR(255) DEFAULT NULL"
+    );
+    console.log("clients.referrer добавлена");
+  } catch (e) {}
+
+  // clients.referral_bonus_available
+  try {
+    await db.execute(
+      "ALTER TABLE clients ADD COLUMN referral_bonus_available INT DEFAULT 0"
+    );
+    console.log("clients.referral_bonus_available добавлена");
+  } catch (e) {}
+
+  // orders.original_price
+  try {
+    await db.execute(
+      "ALTER TABLE orders ADD COLUMN original_price DECIMAL(10,2) DEFAULT 15"
+    );
+    console.log("orders.original_price добавлена");
+  } catch (e) {}
+
+  // orders.final_price
+  try {
+    await db.execute(
+      "ALTER TABLE orders ADD COLUMN final_price DECIMAL(10,2) DEFAULT 15"
+    );
+    console.log("orders.final_price добавлена");
+  } catch (e) {}
+
+  // orders.discount_type
+  try {
+    await db.execute(
+      "ALTER TABLE orders ADD COLUMN discount_type VARCHAR(50) DEFAULT NULL"
+    );
+    console.log("orders.discount_type добавлена");
+  } catch (e) {}
+
 
   console.log("База данных и таблицы готовы");
 }
