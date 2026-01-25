@@ -105,6 +105,20 @@ async function initDB() {
     )
   `);
 
+  // ===== ЛОГИ ПОДОЗРИТЕЛЬНЫХ ДЕЙСТВИЙ =====
+await db.execute(`
+  CREATE TABLE IF NOT EXISTS referral_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    type VARCHAR(50),
+    username VARCHAR(255),
+    details TEXT,
+    created_at DATETIME
+  )
+`);
+
+
+
+
 
 
   // ===== Индексы =====
@@ -276,37 +290,57 @@ async function addOrder(order) {
 
   const createdAt = formatMySQLDateTime(now);
 
-  // Вставляем или обновляем заказ
-  await db.execute(
-    `
-    INSERT INTO orders
-      (id, tgNick, city, delivery, payment, orderText, date, time, status, created_at, client_chat_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      tgNick = VALUES(tgNick),
-      city = VALUES(city),
-      delivery = VALUES(delivery),
-      payment = VALUES(payment),
-      orderText = VALUES(orderText),
-      date = VALUES(date),
-      time = VALUES(time),
-      status = VALUES(status),
-      client_chat_id = VALUES(client_chat_id)
-    `,
-    [
-      order.id,
-      order.tgNick,
-      order.city,
-      order.delivery,
-      order.payment,
-      order.orderText,
-      mysqlDate,
-      mysqlTime,
-      order.status || "new",
-      createdAt,
-      order.client_chat_id || null
-    ]
-  );
+ // Вставляем или обновляем заказ
+await db.execute(
+  `
+  INSERT INTO orders (
+    id,
+    tgNick,
+    city,
+    delivery,
+    payment,
+    orderText,
+    date,
+    time,
+    status,
+    created_at,
+    client_chat_id,
+    original_price,
+    final_price,
+    discount_type
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON DUPLICATE KEY UPDATE
+    tgNick = VALUES(tgNick),
+    city = VALUES(city),
+    delivery = VALUES(delivery),
+    payment = VALUES(payment),
+    orderText = VALUES(orderText),
+    date = VALUES(date),
+    time = VALUES(time),
+    status = VALUES(status),
+    client_chat_id = VALUES(client_chat_id),
+    original_price = VALUES(original_price),
+    final_price = VALUES(final_price),
+    discount_type = VALUES(discount_type)
+  `,
+  [
+    order.id,
+    order.tgNick,
+    order.city,
+    order.delivery,
+    order.payment,
+    order.orderText,
+    mysqlDate,
+    mysqlTime,
+    order.status || "new",
+    createdAt,
+    order.client_chat_id || null,
+    order.original_price ?? 15,
+    order.final_price ?? 15,
+    order.discount_type || null
+  ]
+);
 }
 
 
@@ -463,11 +497,15 @@ if (isClient) {
     ]];
 
     if (isAdmin) {
-      keyboard.push([{ text: "🔁 Переназначить курьера", callback_data: `reassign_${order.id}` }]);
+      keyboard.push(
+        [{ text: "🔁 Переназначить курьера", callback_data: `reassign_${order.id}` }],
+        [{ text: "🗑 Удалить заказ", callback_data: `admin_delete_${order.id}` }]
+      );
     }
   }
   return keyboard;
 }
+
 
 
   // delivered / canceled — без кнопок
@@ -488,8 +526,28 @@ function buildOrderMessage(order) {
     `📌 Статус: ${escapeMarkdownV2(order.status || "—")}`
   ];
 
+  // ===== ЦЕНА И СКИДКА =====
+  if (order.original_price && order.final_price) {
+    if (order.final_price < order.original_price) {
+      lines.push(
+        `💸 Цена: ${order.final_price}€ (вместо ${order.original_price}€)`
+      );
+
+      if (order.discount_type === "first_order") {
+        lines.push("🎁 Скидка применена: первый заказ по приглашению");
+      }
+
+      if (order.discount_type === "referral_bonus") {
+        lines.push("🎁 Скидка применена: бонус за приглашённого друга");
+      }
+    } else {
+      lines.push(`💸 Цена: ${order.original_price}€`);
+    }
+  }
+
   return lines.join("\n");
 }
+
 
 
 function buildTextForOrder(order) {
@@ -1074,6 +1132,48 @@ if (data.startsWith("reassign_cancel_") && fromId === ADMIN_ID) {
 }
 
 
+// ================== ADMIN DELETE ORDER ==================
+if (data.startsWith("admin_delete_") && fromId === ADMIN_ID) {
+  const orderId = data.split("_")[2];
+
+  const order = await getOrderById(orderId);
+  if (!order) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Заказ уже удалён",
+      show_alert: true
+    });
+  }
+
+  // 🔥 удаляем сообщения заказа у всех
+  const msgs = await getOrderMessages(orderId);
+  for (const m of msgs) {
+    try {
+      await bot.deleteMessage(m.chat_id, m.message_id);
+    } catch (e) {}
+  }
+
+  // 🔥 чистим таблицу order_messages
+  await db.execute("DELETE FROM order_messages WHERE order_id=?", [orderId]);
+
+  // 🔥 удаляем заказ из БД
+  await db.execute("DELETE FROM orders WHERE id=?", [orderId]);
+
+  // 🔥 лог (по желанию)
+  await db.execute(
+    `INSERT INTO referral_logs (type, username, details, created_at)
+     VALUES ('admin_delete', ?, ?, NOW())`,
+    [ADMIN_USERNAME, `Админ удалил заказ №${orderId}`]
+  );
+
+  await bot.answerCallbackQuery(q.id, { text: "🗑 Заказ удалён" });
+  await bot.sendMessage(ADMIN_ID, `🗑 Заказ №${orderId} удалён администратором`);
+
+  return;
+}
+
+
+
+
 
 // ================== Основная часть (заказы) ==================
 let orderId = null;
@@ -1206,6 +1306,58 @@ if (data.startsWith("delivered_")) {
 
     // ✅ Обновляем сообщение у всех участников
     await sendOrUpdateOrderAll(updatedOrder);
+
+   // ===== НАЧИСЛЕНИЕ РЕФЕРАЛЬНОЙ СКИДКИ (С ЗАЩИТОЙ) =====
+try {
+  // защита от повторного начисления
+  if (
+    updatedOrder.discount_type !== "first_order" ||
+    updatedOrder.referral_bonus_given === 1
+  ) {
+    return;
+  }
+
+  const buyerUsername = updatedOrder.tgNick?.replace(/^@/, "");
+  if (!buyerUsername) return;
+
+  const buyer = await getClient(buyerUsername);
+  if (!buyer?.referrer) return;
+
+  const referrerUsername = buyer.referrer;
+
+  // начисляем 1 бонус
+  await db.execute(
+    "UPDATE clients SET referral_bonus_available = referral_bonus_available + 1 WHERE username=?",
+    [referrerUsername]
+  );
+
+  // помечаем заказ, что бонус уже выдан
+  await db.execute(
+    "UPDATE orders SET referral_bonus_given = 1 WHERE id=?",
+    [updatedOrder.id]
+  );
+
+  console.log(
+    `[REFERRAL BONUS] +1 скидка для @${referrerUsername} за заказ @${buyerUsername}`
+  );
+
+  // уведомление пригласившему
+  const referrer = await getClient(referrerUsername);
+  if (referrer?.chat_id) {
+    await bot.sendMessage(
+      referrer.chat_id,
+      `🎉 Ваш друг сделал заказ!\n\n` +
+      `👤 Друг: @${buyerUsername}\n` +
+      `💸 Вам начислена скидка 3€\n` +
+      `ℹ️ Она автоматически применится к следующему заказу`
+    );
+  }
+
+} catch (e) {
+  console.error("[REFERRAL BONUS ERROR]", e?.message || e);
+}
+
+
 
     // ✅ Просим отзыв (1 раз) + лог
     try {
@@ -1403,17 +1555,21 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
     // ===== РЕФЕРАЛ =====
     if (isNew && ref && ref.startsWith("ref_")) {
-      const referrer = ref.replace("ref_", "");
+  const referrer = ref.replace("ref_", "");
 
-      // защита от самореферала
-      if (referrer !== username) {
-        await db.execute(
-          "UPDATE clients SET referrer=? WHERE username=?",
-          [referrer, username]
-        );
-        console.log(`Реферал установлен: @${username} ← @${referrer}`);
-      }
-    }
+  if (referrer === username) {
+    // лог самореферала
+    await db.execute(
+      "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+      ["self_referral", username, "Попытка самореферала"]
+    );
+  } else {
+    await db.execute(
+      "UPDATE clients SET referrer=? WHERE username=?",
+      [referrer, username]
+    );
+  }
+}
 
     // ===== КУРЬЕР =====
     if (await isCourier(username)) {
@@ -1428,20 +1584,29 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     }
 
     // ===== МЕНЮ =====
-    let welcomeText = "Добро пожаловать! Чтобы оформить заказ нажмите кнопку снизу открыть магазин.";
+   let welcomeText =
+"👋 *Добро пожаловать!*\n\n" +
+"🛒 *Заказы оформляются прямо в боте*\n" +
+"🚚 *Доставка в день заказа по вашему городу*\n\n" +
+"💸 *Есть скидки!*\n" +
+"🤝 *Приглашайте друзей — получайте скидки на заказы*\n\n" +
+"⭐ *Отзывы клиентов:*\n" +
+"👉 https://t.me/crazy_cloud_reviews\n\n" +
+"👇 *Чтобы оформить заказ, нажмите кнопку ниже*";
     let keyboard = [];
 
     if (username === ADMIN_USERNAME) {
       welcomeText += "\nПанель администратора и Панель курьера доступны через текстовые кнопки ниже.";
       keyboard = [
-        [{ text: "Статистика" }, { text: "Курьеры" }],
-        [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-        [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
-        [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-        [{ text: "Список курьеров" }, { text: "Все пользователи" }],
-        [{ text: "Рассылка" }],
-        [{ text: "Назад" }]
-      ];
+  [{ text: "Статистика" }, { text: "Курьеры" }],
+  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
+  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+  [{ text: "Рассылка" }],
+  [{ text: "Назад" }]
+];
       console.log(`Админ @${username} видит админ меню`);
 
     } else if (await isCourier(username)) {
@@ -1454,6 +1619,14 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
     } else {
   keyboard = [
+    [
+      {
+        text: "🛍 Открыть магазин",
+        web_app: {
+          url: "https://cn4tzwpqvg-ops.github.io/crazycloud/"
+        }
+      }
+    ],
     [{ text: "💸 Получить скидку" }],
     [{ text: "Личный кабинет" }, { text: "Поддержка" }],
     [{ text: "Мои заказы" }]
@@ -1461,10 +1634,32 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
       console.log(`Пользователь @${username} видит обычное меню`);
     }
 
-    // Отправляем сообщение пользователю
-    await bot.sendMessage(id, welcomeText, {
-      reply_markup: { keyboard, resize_keyboard: true }
-    });
+  const inlineKeyboard = {
+  inline_keyboard: [
+    [
+      {
+        text: "🛍 Открыть магазин",
+        web_app: {
+          url: "https://cn4tzwpqvg-ops.github.io/crazycloud/"
+        }
+      }
+    ]
+  ]
+};
+
+
+
+   // 1️⃣ Приветственное сообщение + кнопка Mini App ПОД ним
+await bot.sendMessage(id, welcomeText, {
+  parse_mode: "Markdown",
+  reply_markup: inlineKeyboard
+});
+
+// 2️⃣ Отдельно — нижнее меню (чтобы кнопки всегда были снизу)
+await bot.sendMessage(id, "⬆️ Используйте кнопки ниже", {
+  reply_markup: { keyboard, resize_keyboard: true }
+});
+
 
     // ===== Уведомление админу о новом пользователе =====
     if (isNew && ADMIN_ID) {
@@ -1731,9 +1926,10 @@ if (adminWaitingOrdersCourier.has(username)) {
     return bot.sendMessage(id, "Панель администратора", {
       reply_markup: {
        keyboard: [
-  [{ text: "Статистика" }, { text: "Курьеры" }],
+   [{ text: "Статистика" }, { text: "Курьеры" }],
   [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
   [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
   [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
   [{ text: "Список курьеров" }, { text: "Все пользователи" }],
   [{ text: "Рассылка" }],
@@ -1835,8 +2031,9 @@ if (text === "Назад") {
   return bot.sendMessage(id, "Главное меню", {
     reply_markup: {
       keyboard: [
-        [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-        [{ text: "Мои заказы" }]
+    [{ text: "💸 Получить скидку" }],
+    [{ text: "Личный кабинет" }, { text: "Поддержка" }],
+    [{ text: "Мои заказы" }]
       ],
       resize_keyboard: true
     }
@@ -1894,26 +2091,30 @@ if (text === "/banned" && id === ADMIN_ID) {
 }
 
 
-// ===== 💸 ПОЛУЧИТЬ СКИДКУ =====
+// ===== 💸 ПОЛУЧИТЬ СКИДКУ (ЭКРАН ОПИСАНИЯ) =====
 if (text === "💸 Получить скидку") {
   const uname = username.replace(/^@/, "");
   const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
 
   const msg =
-    `💸 Получить скидку\n\n` +
     `👥 Пригласите друга и получите скидку\n\n` +
-    `🎁 Другу:\n` +
+    `🎁 Что получает друг:\n` +
     `• скидка 2€ на первый заказ\n\n` +
-    `💸 Вам:\n` +
-    `• скидка 3€ на ОДИН следующий заказ\n\n` +
-    `📌 Важно:\n` +
+    `💸 Что получаете вы:\n` +
+    `• скидка 3€ на СЛЕДУЮЩИЙ заказ\n\n` +
+    `📌 Как это работает:\n` +
+    `1️⃣ Вы приглашаете друга\n` +
+    `2️⃣ Друг делает и оплачивает заказ\n` +
+    `3️⃣ Вам начисляется скидка 3€\n\n` +
+    `⚠️ Важно:\n` +
+    `• скидка начисляется ТОЛЬКО после заказа друга\n` +
     `• 1 друг = 1 скидка\n` +
     `• скидки не суммируются\n` +
-    `• применяется автоматически\n`;
+    `• применяется автоматически`;
 
   const kb = {
     keyboard: [
-      [{ text: "📊 Моя статистика" }],
+      [{ text: "📊 Мои приглашённые" }],
       [{ text: "Назад" }]
     ],
     resize_keyboard: true
@@ -1924,42 +2125,56 @@ if (text === "💸 Получить скидку") {
 }
 
 
-// ===== 📊 МОЯ СТАТИСТИКА СКИДОК =====
-if (text === "📊 Моя статистика") {
+
+// ===== 📊 МОИ ПРИГЛАШЁННЫЕ =====
+if (text === "📊 Мои приглашённые") {
   const uname = username.replace(/^@/, "");
 
-  const [[{ total }]] = await db.execute(
-    "SELECT COUNT(*) AS total FROM clients WHERE referrer=?",
+  // получаем всех приглашённых
+  const [refs] = await db.execute(
+    "SELECT username FROM clients WHERE referrer=?",
     [uname]
   );
 
-  const [[{ done }]] = await db.execute(
-    `SELECT COUNT(DISTINCT c.username) AS done
-     FROM clients c
-     JOIN orders o ON REPLACE(o.tgNick,'@','') = c.username
-     WHERE c.referrer=? AND o.status='delivered'`,
-    [uname]
-  );
+  let textMsg = "👥 Мои приглашённые\n\n";
 
-  const client = await getClient(uname);
-  const balance = Number(client?.bonus_balance || 0);
+  let completed = 0;
 
-  // 1 скидка = 3€
-  const discountsCount = Math.floor(balance / 3);
+  for (const r of refs) {
+    const [[order]] = await db.execute(
+      `SELECT id FROM orders 
+       WHERE REPLACE(tgNick,'@','')=? 
+       AND status='delivered' 
+       LIMIT 1`,
+      [r.username]
+    );
 
-  const msg =
-    `📊 Моя статистика\n\n` +
-    `👥 Приглашено друзей: ${total}\n` +
-    `⏳ Ещё не сделали заказ: ${total - done}\n` +
-    `✅ Получено скидок: ${done}\n\n` +
-    `💸 Доступно скидок:\n` +
-    `• ${discountsCount} заказа со скидкой 3€\n\n` +
-    `📌 Скидка применяется автоматически\n` +
-    `к следующему заказу`;
+    if (order) {
+      completed++;
+      textMsg += `@${r.username} — ✅ заказ выполнен (скидка получена)\n`;
+    } else {
+      textMsg += `@${r.username} — ⏳ ещё не заказал\n`;
+    }
+  }
 
-  await bot.sendMessage(id, msg);
+  if (refs.length === 0) {
+    textMsg +=
+      "Пока вы никого не пригласили.\n\n" +
+      "💡 Пригласите друга и получите скидку 3€\n" +
+      "после его первого заказа";
+  } else {
+    const discountsCount = completed; // 1 заказ = 1 скидка
+    textMsg +=
+      `\n💸 Доступно скидок:\n` +
+      `• ${discountsCount} заказа со скидкой 3€\n\n` +
+      `📌 Скидка применится автоматически\n` +
+      `к следующему заказу`;
+  }
+
+  await bot.sendMessage(id, textMsg);
   return;
 }
+
 
 
 
@@ -2128,9 +2343,10 @@ if (text === "Выполненные заказы") {
 if (text === "Панель администратора" && id === ADMIN_ID) {
   const kb = {
     keyboard: [
-  [{ text: "Статистика" }, { text: "Курьеры" }],
+   [{ text: "Статистика" }, { text: "Курьеры" }],
   [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
   [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
   [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
   [{ text: "Список курьеров" }, { text: "Все пользователи" }],
   [{ text: "Рассылка" }],
@@ -2265,6 +2481,73 @@ if (text === "Выполненные по курьеру" && id === ADMIN_ID) {
     reply_markup: { keyboard, resize_keyboard: true }
   });
 }
+
+
+if (text === "🤝 Рефералы" && id === ADMIN_ID) {
+  const [rows] = await db.execute(`
+    SELECT
+      c.username AS referrer,
+      r.username AS referral
+    FROM clients c
+    JOIN clients r ON r.referrer = c.username
+    ORDER BY c.username
+  `);
+
+  if (!rows.length) {
+    return bot.sendMessage(id, "🤝 Рефералов пока нет");
+  }
+
+  const grouped = {};
+  for (const r of rows) {
+    if (!grouped[r.referrer]) grouped[r.referrer] = [];
+    grouped[r.referrer].push(r.referral);
+  }
+
+  let msg = "🤝 Кто кого пригласил\n\n";
+
+  for (const referrer in grouped) {
+    msg += `👤 @${referrer}\n`;
+
+    for (const ref of grouped[referrer]) {
+      const [[{ cnt }]] = await db.execute(
+        "SELECT COUNT(*) AS cnt FROM orders WHERE tgNick=? AND status='delivered'",
+        [ref]
+      );
+
+      msg += cnt > 0
+        ? `  ✅ @${ref} — заказ выполнен\n`
+        : `  ⏳ @${ref} — без заказа\n`;
+    }
+
+    msg += "\n";
+  }
+
+  return bot.sendMessage(id, msg);
+}
+
+
+if (text === "🚨 Логи рефералов" && id === ADMIN_ID) {
+  const [logs] = await db.execute(
+    "SELECT * FROM referral_logs ORDER BY created_at DESC LIMIT 20"
+  );
+
+  if (!logs.length) {
+    return bot.sendMessage(id, "🚨 Логи пока пусты");
+  }
+
+  let msg = "🚨 Последние подозрительные действия\n\n";
+
+  for (const l of logs) {
+    msg +=
+      `⚠️ ${l.type}\n` +
+      `👤 @${l.username}\n` +
+      `📝 ${l.details}\n` +
+      `🕒 ${l.created_at}\n\n`;
+  }
+
+  return bot.sendMessage(id, msg);
+}
+
 
 if (text === "Статистика" && id === ADMIN_ID) {
   try {
@@ -2550,6 +2833,56 @@ console.log("[DEBUG api client_chat_id FIXED]", client_chat_id, "=>", clientChat
     console.log(`Новый заказ через API от ${cleanUsername}`);
     console.log(`Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`);
 
+    // ===== ЦЕНА И СКИДКИ =====
+let originalPrice = 15;
+let finalPrice = 15;
+let discountType = null;
+
+// получаем клиента
+const client = await getClient(cleanUsername);
+
+// считаем сколько заказов уже было
+const [[{ cnt: ordersCount }]] = await db.execute(
+  "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=?",
+  [cleanUsername]
+);
+
+// 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€
+if (ordersCount === 0 && client?.referrer) {
+  finalPrice = 13;
+  discountType = "first_order";
+}
+
+// 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ СКИДКА 3€
+else if (client?.referral_bonus_available > 0) {
+  finalPrice = 12;
+  discountType = "referral_bonus";
+
+  // списываем ОДНУ скидку
+  await db.execute(
+    "UPDATE clients SET referral_bonus_available = referral_bonus_available - 1 WHERE username=?",
+    [cleanUsername]
+  );
+
+  // 🚨 ЛОГ ИСПОЛЬЗОВАНИЯ СКИДКИ
+  await db.execute(
+    "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+    [
+      "use_bonus",
+      cleanUsername,
+      "Использована скидка 3€ (реферальный бонус)"
+    ]
+  );
+}
+
+console.log("[PRICE]", {
+  user: cleanUsername,
+  originalPrice,
+  finalPrice,
+  discountType
+});
+
+
     // ===== ГАРАНТИРОВАННО РЕГИСТРИРУЕМ ПОЛЬЗОВАТЕЛЯ =====
 await db.execute(`
   INSERT INTO clients (chat_id, username, banned)
@@ -2597,17 +2930,21 @@ console.log(`Присвоен новый ID заказа: ${id}`);
 
 
     const order = {
-      id,
-      tgNick: cleanUsername,
-      city,
-      delivery,
-      payment,
-      orderText,
-      date,
-      time,
-      status: "new",
-      client_chat_id: clientChatIdNum
-    };
+  id,
+  tgNick: cleanUsername,
+  city,
+  delivery,
+  payment,
+  orderText,
+  date,
+  time,
+  status: "new",
+  client_chat_id: clientChatIdNum,
+  original_price: originalPrice,
+  final_price: finalPrice,
+  discount_type: discountType
+};
+
 
     // ===== Добавляем заказ в базу, если его ещё нет =====
    await addOrder(order);
