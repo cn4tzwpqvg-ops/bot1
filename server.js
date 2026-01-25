@@ -1365,23 +1365,57 @@ if (oldCourierUsername) {
 
 
 // ================== /start ==================
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const id = msg.from.id;
-  const username = msg.from.username || `id${id}`;
+  const username = msg.from.username; // ❗ ТОЛЬКО реальный username
   const first_name = msg.from.first_name || "";
+  const ref = match?.[1]; // например ref_username
+
+  // 🚫 ЕСЛИ НЕТ USERNAME — СТОП
+  if (!username) {
+    await bot.sendMessage(
+      id,
+      "❗ Для работы с ботом нужен Telegram-ник (username)\n\n" +
+      "Он используется для:\n" +
+      "• оформления заказов\n" +
+      "• реферальной программы\n" +
+      "• связи с курьером\n\n" +
+      "👉 Как включить ник:\n" +
+      "Telegram → Настройки → Имя пользователя\n\n" +
+      "После установки ника нажмите /start"
+    );
+    return;
+  }
 
   console.log(` /start от @${username} (id: ${id}), имя: ${first_name}`);
 
   try {
     // Проверяем, новый ли пользователь
-    const [existing] = await db.execute("SELECT id FROM clients WHERE username=?", [username]);
+    const [existing] = await db.execute(
+      "SELECT id, referrer FROM clients WHERE username=?",
+      [username]
+    );
     const isNew = existing.length === 0;
 
     // Сохраняем или обновляем клиента
     await addOrUpdateClient(username, first_name, id);
     console.log(`Клиент @${username} добавлен/обновлён в базе`);
 
-    // Если курьер, сохраняем в таблицу couriers и обновляем COURIERS
+    // ===== РЕФЕРАЛ =====
+    if (isNew && ref && ref.startsWith("ref_")) {
+      const referrer = ref.replace("ref_", "");
+
+      // защита от самореферала
+      if (referrer !== username) {
+        await db.execute(
+          "UPDATE clients SET referrer=? WHERE username=?",
+          [referrer, username]
+        );
+        console.log(`Реферал установлен: @${username} ← @${referrer}`);
+      }
+    }
+
+    // ===== КУРЬЕР =====
     if (await isCourier(username)) {
       await db.execute(
         `INSERT INTO couriers (username, chat_id)
@@ -1393,66 +1427,66 @@ bot.onText(/\/start/, async (msg) => {
       console.log(`Курьер @${username} добавлен/обновлён, chat_id: ${id}`);
     }
 
-    // Формируем приветственное сообщение и клавиатуру
+    // ===== МЕНЮ =====
     let welcomeText = "Добро пожаловать! Чтобы оформить заказ нажмите кнопку снизу открыть магазин.";
     let keyboard = [];
 
     if (username === ADMIN_USERNAME) {
-  welcomeText += "\nПанель администратора и Панель курьера доступны через текстовые кнопки ниже.";
-  keyboard = [
-  [{ text: "Статистика" }, { text: "Курьеры" }],
-  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
-  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
-  [{ text: "Рассылка" }],
-  [{ text: "Назад" }]
-];
+      welcomeText += "\nПанель администратора и Панель курьера доступны через текстовые кнопки ниже.";
+      keyboard = [
+        [{ text: "Статистика" }, { text: "Курьеры" }],
+        [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+        [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+        [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+        [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+        [{ text: "Рассылка" }],
+        [{ text: "Назад" }]
+      ];
+      console.log(`Админ @${username} видит админ меню`);
 
-  console.log(`Админ @${username} видит админ меню`);
-} else if (await isCourier(username)) {
+    } else if (await isCourier(username)) {
       welcomeText += "\nПанель курьера доступна через текстовые кнопки ниже.";
       keyboard = [
         [{ text: "Личный кабинет" }, { text: "Поддержка" }],
         [{ text: "Панель курьера" }]
       ];
       console.log(`Курьер @${username} видит курьерское меню`);
+
     } else {
-      keyboard = [
-        [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-        [{ text: "Мои заказы" }]
-      ];
-      console.log(`Пользователь @${username} видит обычное меню с кнопкой "Мои заказы"`);
+  keyboard = [
+    [{ text: "🤝 Реферальная программа" }],
+    [{ text: "Личный кабинет" }, { text: "Поддержка" }],
+    [{ text: "Мои заказы" }]
+  ];
+      console.log(`Пользователь @${username} видит обычное меню`);
     }
 
- // Отправляем сообщение пользователю
-await bot.sendMessage(id, welcomeText, {
-  reply_markup: { keyboard, resize_keyboard: true }
-});
+    // Отправляем сообщение пользователю
+    await bot.sendMessage(id, welcomeText, {
+      reply_markup: { keyboard, resize_keyboard: true }
+    });
 
-// ===== Уведомление админу о новом пользователе =====
-if (isNew && ADMIN_ID) {
-  const login = msg.from.username ? `@${escapeMarkdown(msg.from.username)}` : "—";
+    // ===== Уведомление админу о новом пользователе =====
+    if (isNew && ADMIN_ID) {
+      try {
+        await bot.sendMessage(
+          ADMIN_ID,
+          `🆕 *Новый пользователь*\n\nИмя: *${escapeMarkdown(first_name) || "—"}*\nЛогин: @${escapeMarkdown(username)}\nChat ID: \`${id}\``,
+          { parse_mode: "Markdown" }
+        );
+        console.log(`Админу отправлено уведомление о новом пользователе @${username}`);
+      } catch (err) {
+        console.error("Не удалось отправить уведомление админу:", err.message);
+      }
+    }
 
-  try {
-    await bot.sendMessage(
-      ADMIN_ID,
-      `🆕 *Новый пользователь*\n\nИмя: *${escapeMarkdown(first_name) || "—"}*
-\nЛогин: ${login}\nChat ID: \`${id}\``,
-      { parse_mode: "Markdown" }
-    );
-    console.log(`Админу отправлено уведомление о новом пользователе @${username}`);
-  } catch (err) {
-    console.error("Не удалось отправить уведомление админу:", err.message);
-  }
-}
-
-console.log(`Приветственное сообщение отправлено @${username}`);
+    console.log(`Приветственное сообщение отправлено @${username}`);
 
   } catch (err) {
     console.error(`Ошибка обработки /start для @${username}:`, err.message);
   }
 });
+
 
 // ================== Панель курьера и админка ==================
 const adminWaitingCourier = new Map(); 
@@ -1860,6 +1894,62 @@ if (text === "/banned" && id === ADMIN_ID) {
 }
 
 
+// ===== 🤝 РЕФЕРАЛЬНАЯ ПРОГРАММА (ГЛАВНЫЙ ЭКРАН) =====
+if (text === "🤝 Реферальная программа") {
+  const uname = username.replace(/^@/, "");
+  const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
+
+  const msg =
+    `🤝 Реферальная программа\n\n` +
+    `🔗 Ваша ссылка:\n${refLink}\n\n` +
+    `🎁 Другу — скидка 2€ на первый заказ\n` +
+    `💸 Вам — 3€ после его заказа`;
+
+  const kb = {
+    keyboard: [
+      [{ text: "📊 Моя статистика" }],
+      [{ text: "Назад" }]
+    ],
+    resize_keyboard: true
+  };
+
+  await bot.sendMessage(id, msg, { reply_markup: kb });
+  return;
+}
+
+// ===== 📊 РЕФЕРАЛЬНАЯ СТАТИСТИКА =====
+if (text === "📊 Моя статистика") {
+  const uname = username.replace(/^@/, "");
+
+  const [[{ total }]] = await db.execute(
+    "SELECT COUNT(*) AS total FROM clients WHERE referrer=?",
+    [uname]
+  );
+
+  const [[{ done }]] = await db.execute(
+    `SELECT COUNT(DISTINCT c.username) AS done
+     FROM clients c
+     JOIN orders o ON REPLACE(o.tgNick,'@','') = c.username
+     WHERE c.referrer=? AND o.status='delivered'`,
+    [uname]
+  );
+
+  const client = await getClient(uname);
+  const balance = Number(client?.bonus_balance || 0).toFixed(2);
+
+  const msg =
+    `📊 Ваша реферальная статистика\n\n` +
+    `👥 Приглашено: ${total}\n` +
+    `⏳ Ожидают заказ: ${total - done}\n` +
+    `✅ Заказ выполнен: ${done}\n\n` +
+    `💰 Бонусы: ${balance} €`;
+
+  await bot.sendMessage(id, msg);
+  return;
+}
+
+
+
 // ===== Личный кабинет (красиво, без Markdown, без слешей) =====
 if (text === "Личный кабинет") {
   console.log("[DEBUG] Личный кабинет нажали:", { id, username });
@@ -1943,6 +2033,8 @@ if (text === "Личный кабинет") {
     return bot.sendMessage(id, "Ошибка при открытии личного кабинета.");
   }
 }
+
+
 
 
 
