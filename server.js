@@ -135,7 +135,7 @@ await db.execute(`
     await db.execute(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${column})`).catch(() => {});
   }
 
-    // ===== ДОБАВЛЯЕМ КОЛОНКИ ДЛЯ РЕФЕРАЛКИ =====
+     // ===== ДОБАВЛЯЕМ КОЛОНКИ ДЛЯ РЕФЕРАЛКИ =====
 
   // clients.referrer
   try {
@@ -154,21 +154,28 @@ await db.execute(`
   } catch (e) {}
 
   // clients.eligible_referrer (может ли человек приглашать других)
-try {
-  await db.execute(
-    "ALTER TABLE clients ADD COLUMN eligible_referrer TINYINT(1) DEFAULT 0"
-  );
-  console.log("clients.eligible_referrer добавлена");
-} catch (e) {}
+  try {
+    await db.execute(
+      "ALTER TABLE clients ADD COLUMN eligible_referrer TINYINT(1) DEFAULT 0"
+    );
+    console.log("clients.eligible_referrer добавлена");
+  } catch (e) {}
 
-// clients.referrals_locked (если сам пришёл по рефке и ещё не сделал заказ — блок на приглашения)
-try {
-  await db.execute(
-    "ALTER TABLE clients ADD COLUMN referrals_locked TINYINT(1) DEFAULT 0"
-  );
-  console.log("clients.referrals_locked добавлена");
-} catch (e) {}
+  // clients.referrals_locked (если сам пришёл по рефке и ещё не сделал заказ — блок на приглашения)
+  try {
+    await db.execute(
+      "ALTER TABLE clients ADD COLUMN referrals_locked TINYINT(1) DEFAULT 0"
+    );
+    console.log("clients.referrals_locked добавлена");
+  } catch (e) {}
 
+  // clients.referral_bonus_locked (резерв бонусов под активные заказы)
+  try {
+    await db.execute(
+      "ALTER TABLE clients ADD COLUMN referral_bonus_locked INT DEFAULT 0"
+    );
+    console.log("clients.referral_bonus_locked добавлена");
+  } catch (e) {}
 
   // orders.original_price
   try {
@@ -195,40 +202,31 @@ try {
   } catch (e) {}
 
   // orders.referral_bonus_given
-try {
-  await db.execute(
-    "ALTER TABLE orders ADD COLUMN referral_bonus_given TINYINT(1) DEFAULT 0"
-  );
-  console.log("orders.referral_bonus_given добавлена");
-} catch (e) {}
+  try {
+    await db.execute(
+      "ALTER TABLE orders ADD COLUMN referral_bonus_given TINYINT(1) DEFAULT 0"
+    );
+    console.log("orders.referral_bonus_given добавлена");
+  } catch (e) {}
 
+  // orders.referral_bonus_reserved_qty (сколько бонусов зарезервировано под этот заказ)
+  try {
+    await db.execute(
+      "ALTER TABLE orders ADD COLUMN referral_bonus_reserved_qty INT DEFAULT 0"
+    );
+    console.log("orders.referral_bonus_reserved_qty добавлена");
+  } catch (e) {}
+
+  // orders.referral_bonus_spent (чтобы не списать/не вернуть дважды)
+  try {
+    await db.execute(
+      "ALTER TABLE orders ADD COLUMN referral_bonus_spent TINYINT(1) DEFAULT 0"
+    );
+    console.log("orders.referral_bonus_spent добавлена");
+  } catch (e) {}
 
   console.log("База данных и таблицы готовы");
 }
-
-// clients.referral_bonus_locked (резерв бонусов под активные заказы)
-try {
-  await db.execute(
-    "ALTER TABLE clients ADD COLUMN referral_bonus_locked INT DEFAULT 0"
-  );
-  console.log("clients.referral_bonus_locked добавлена");
-} catch (e) {}
-
-// orders.referral_bonus_reserved_qty (сколько бонусов зарезервировано под этот заказ)
-try {
-  await db.execute(
-    "ALTER TABLE orders ADD COLUMN referral_bonus_reserved_qty INT DEFAULT 0"
-  );
-  console.log("orders.referral_bonus_reserved_qty добавлена");
-} catch (e) {}
-
-// orders.referral_bonus_spent (чтобы не списать/не вернуть дважды)
-try {
-  await db.execute(
-    "ALTER TABLE orders ADD COLUMN referral_bonus_spent TINYINT(1) DEFAULT 0"
-  );
-  console.log("orders.referral_bonus_spent добавлена");
-} catch (e) {}
 
 
 
