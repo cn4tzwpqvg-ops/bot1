@@ -952,6 +952,36 @@ bot.on("callback_query", async (q) => {
     });
   }
 
+  // ===== 📎 СКОПИРОВАТЬ РЕФЕРАЛЬНУЮ ССЫЛКУ =====
+if (data === "copy_ref_link") {
+  const uname = q.from.username;
+
+  if (!uname) {
+    await bot.answerCallbackQuery(q.id, {
+      text: "У вас не установлен username в Telegram",
+      show_alert: true
+    });
+    return;
+  }
+
+  const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
+
+  await bot.answerCallbackQuery(q.id, {
+    text: "Ссылка готова 👇",
+    show_alert: false
+  });
+
+  await bot.sendMessage(
+    id,
+    `🔗 *Ваша реферальная ссылка:*\n\n${refLink}\n\n` +
+    `📎 *Зажмите ссылку и выберите «Копировать»*`,
+    { parse_mode: "Markdown" }
+  );
+
+  return;
+}
+
+
   // ================== Рейтинг / отзыв ==================
   if (data.startsWith("rate_")) {
     const [, orderId, rating] = data.split("_");
@@ -1085,6 +1115,72 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 
   return bot.answerCallbackQuery(q.id, { text: "Отзывы загружены" });
 }
+
+// ================== ADMIN DELETE ORDER (confirm) ==================
+if (data.startsWith("admin_delete_") && fromId === ADMIN_ID) {
+  const orderId = data.split("_")[2];
+
+  const kb = {
+    inline_keyboard: [
+      [
+        { text: "🗑 Да, удалить", callback_data: `admin_delete_confirm_${orderId}` },
+        { text: "❌ Отмена", callback_data: `admin_delete_cancel_${orderId}` }
+      ]
+    ]
+  };
+
+  await bot.sendMessage(
+    fromId,
+    `⚠️ *Удаление заказа №${orderId}*\n\n` +
+    `Заказ будет *полностью удалён*:\n` +
+    `• у клиента\n` +
+    `• у курьеров\n` +
+    `• из базы данных\n\n` +
+    `Это действие *необратимо*.`,
+    { parse_mode: "Markdown", reply_markup: kb }
+  );
+
+  return bot.answerCallbackQuery(q.id);
+}
+
+// ================== ADMIN DELETE ORDER (confirmed) ==================
+if (data.startsWith("admin_delete_confirm_") && fromId === ADMIN_ID) {
+  const orderId = data.split("_")[3];
+
+  const order = await getOrderById(orderId);
+  if (!order) {
+    return bot.answerCallbackQuery(q.id, {
+      text: "Заказ уже удалён",
+      show_alert: true
+    });
+  }
+
+  // 1️⃣ удалить сообщения заказа у всех
+  const msgs = await getOrderMessages(orderId);
+  for (const m of msgs) {
+    try {
+      await bot.deleteMessage(m.chat_id, m.message_id);
+    } catch (e) {}
+  }
+
+  // 2️⃣ очистить таблицу сообщений
+  await db.execute("DELETE FROM order_messages WHERE order_id=?", [orderId]);
+
+  // 3️⃣ удалить сам заказ
+  await db.execute("DELETE FROM orders WHERE id=?", [orderId]);
+
+  await bot.sendMessage(
+    ADMIN_ID,
+    `🗑 Заказ №${orderId} полностью удалён администратором`
+  );
+
+  return bot.answerCallbackQuery(q.id, { text: "Удалено" });
+}
+
+if (data.startsWith("admin_delete_cancel_")) {
+  return bot.answerCallbackQuery(q.id, { text: "Удаление отменено" });
+}
+
 
 
 // ================== REASSIGN (админ) ==================
@@ -1634,32 +1730,10 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
       console.log(`Пользователь @${username} видит обычное меню`);
     }
 
-  const inlineKeyboard = {
-  inline_keyboard: [
-    [
-      {
-        text: "🛍 Открыть магазин",
-        web_app: {
-          url: "https://cn4tzwpqvg-ops.github.io/crazycloud/"
-        }
-      }
-    ]
-  ]
-};
-
-
-
-   // 1️⃣ Приветственное сообщение + кнопка Mini App ПОД ним
 await bot.sendMessage(id, welcomeText, {
   parse_mode: "Markdown",
-  reply_markup: inlineKeyboard
-});
-
-// 2️⃣ Отдельно — нижнее меню (чтобы кнопки всегда были снизу)
-await bot.sendMessage(id, "⬆️ Используйте кнопки ниже", {
   reply_markup: { keyboard, resize_keyboard: true }
 });
-
 
     // ===== Уведомление админу о новом пользователе =====
     if (isNew && ADMIN_ID) {
@@ -1739,14 +1813,19 @@ if (text === "Взятые сейчас" && id === ADMIN_ID) {
     return;
   }
 
-  await bot.sendMessage(id, `Взятые сейчас: ${orders.length}`);
-
+  // 🔥 ВАЖНО: сначала чистим ВСЕ старые сообщения заказов у админа
   for (const o of orders) {
-    await clearOrderMessage(o.id, id);              // ✅ чтобы прислало заново как новое
+    await clearOrderMessage(o.id, id);
+  }
+
+  // ✅ теперь шлём каждый заказ как НОВОЕ сообщение с кнопками
+  for (const o of orders) {
     await sendOrUpdateOrderToChat(o, id, "admin", ADMIN_USERNAME);
   }
+
   return;
 }
+
 
 
 // ===== Админ: Сводка курьеров =====
@@ -2096,32 +2175,55 @@ if (text === "💸 Получить скидку") {
   const uname = username.replace(/^@/, "");
   const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
 
-  const msg =
-    `👥 Пригласите друга и получите скидку\n\n` +
-    `🎁 Что получает друг:\n` +
-    `• скидка 2€ на первый заказ\n\n` +
-    `💸 Что получаете вы:\n` +
-    `• скидка 3€ на СЛЕДУЮЩИЙ заказ\n\n` +
-    `📌 Как это работает:\n` +
-    `1️⃣ Вы приглашаете друга\n` +
-    `2️⃣ Друг делает и оплачивает заказ\n` +
-    `3️⃣ Вам начисляется скидка 3€\n\n` +
-    `⚠️ Важно:\n` +
-    `• скидка начисляется ТОЛЬКО после заказа друга\n` +
-    `• 1 друг = 1 скидка\n` +
-    `• скидки не суммируются\n` +
-    `• применяется автоматически`;
+ const msg =
+  `👥 *Пригласите друга и получите скидку*\n\n` +
 
-  const kb = {
-    keyboard: [
-      [{ text: "📊 Мои приглашённые" }],
-      [{ text: "Назад" }]
-    ],
-    resize_keyboard: true
-  };
+  `🎁 *Что получает друг:*\n` +
+  `• *скидка 2€* на **ПЕРВЫЙ заказ**\n\n` +
 
-  await bot.sendMessage(id, msg, { reply_markup: kb });
-  return;
+  `💸 *Что получаете вы:*\n` +
+  `• *скидка 3€* на **СЛЕДУЮЩИЙ заказ**\n\n` +
+
+  `📌 *Как это работает:*\n` +
+  `1️⃣ Вы отправляете ссылку другу\n` +
+  `2️⃣ Друг делает заказ со скидкой 2€\n` +
+  `3️⃣ После выполненного заказа вам начисляется скидка 3€\n\n` +
+
+  `⚠️ *Важно:*\n` +
+  `• *Скидка начисляется только после заказа друга*\n` +
+  `• *1 друг = 1 скидка*\n` +
+  `• *Скидки не суммируются*`;
+
+
+
+// inline-кнопки (действия)
+const inlineKb = {
+  inline_keyboard: [
+    [{ text: "📎 Скопировать ссылку", callback_data: "copy_ref_link" }],
+    [{ text: "📊 Мои приглашённые", callback_data: "my_ref_stats" }]
+  ]
+};
+
+// нижнее меню (навигация)
+const bottomKb = {
+  keyboard: [
+    [{ text: "Назад" }]
+  ],
+  resize_keyboard: true
+};
+
+// сообщение с описанием + inline-кнопками
+await bot.sendMessage(id, msg, {
+  parse_mode: "Markdown",
+  reply_markup: inlineKb
+});
+
+// отдельное сообщение, чтобы появилась кнопка «Назад»
+await bot.sendMessage(id, "⬅️ Вернуться назад", {
+  reply_markup: bottomKb
+});
+
+return;
 }
 
 
