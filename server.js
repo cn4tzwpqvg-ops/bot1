@@ -153,6 +153,23 @@ await db.execute(`
     console.log("clients.referral_bonus_available добавлена");
   } catch (e) {}
 
+  // clients.eligible_referrer (может ли человек приглашать других)
+try {
+  await db.execute(
+    "ALTER TABLE clients ADD COLUMN eligible_referrer TINYINT(1) DEFAULT 0"
+  );
+  console.log("clients.eligible_referrer добавлена");
+} catch (e) {}
+
+// clients.referrals_locked (если сам пришёл по рефке и ещё не сделал заказ — блок на приглашения)
+try {
+  await db.execute(
+    "ALTER TABLE clients ADD COLUMN referrals_locked TINYINT(1) DEFAULT 0"
+  );
+  console.log("clients.referrals_locked добавлена");
+} catch (e) {}
+
+
   // orders.original_price
   try {
     await db.execute(
@@ -246,29 +263,40 @@ async function addOrUpdateClient(username, first_name, chat_id) {
   `, [username, first_name, now, now, chat_id]);
 }
 
-async function isEligibleReferrer(username) {
-  const uname = String(username || "").replace(/^@/, "").trim();
-  if (!uname) return false;
-
-  // админ — всегда можно (опционально)
-  if (uname === ADMIN_USERNAME) return true;
-
-  const [[row]] = await db.execute(
-    `SELECT COUNT(*) AS cnt
-     FROM orders
-     WHERE REPLACE(tgNick,'@','')=?
-       AND status='delivered'`,
-    [uname]
-  );
-
-  return Number(row?.cnt || 0) > 0;
-}
-
-
 async function getClient(username) {
   const [rows] = await db.execute("SELECT * FROM clients WHERE username=?", [username]);
   return rows[0];
 }
+
+async function isEligibleReferrer(username) {
+  const uname = String(username || "").replace(/^@/, "").trim();
+  if (!uname) return false;
+
+  // если уже помечен — ок
+  const c = await getClient(uname);
+  if (c && Number(c.eligible_referrer || 0) === 1) return true;
+
+  // иначе проверяем: есть ли хотя бы 1 delivered
+  const [[row]] = await db.execute(
+    `SELECT 1 AS ok FROM orders
+     WHERE REPLACE(tgNick,'@','')=? AND status='delivered'
+     LIMIT 1`,
+    [uname]
+  );
+
+  const ok = !!row?.ok;
+
+  // если есть delivered — фиксируем
+  if (ok) {
+    await db.execute(
+      "UPDATE clients SET eligible_referrer=1 WHERE username=?",
+      [uname]
+    );
+  }
+
+  return ok;
+}
+
 
 // ================= Заказы =================
 // ================= Вспомогательные функции =================
@@ -675,16 +703,21 @@ async function sendOrUpdateOrderAll(order) {
   }
 
   // Курьеры
-  const [couriers] = await db.execute(
-    "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
-  );
-  for (const c of couriers) {
-    recipientsMap.set(c.chat_id, {
-      chatId: c.chat_id,
-      role: "courier",
-      username: c.username
-    });
-  }
+const [couriers] = await db.execute(
+  "SELECT username, chat_id FROM couriers WHERE chat_id IS NOT NULL"
+);
+
+for (const c of couriers) {
+  // НЕ перетираем админа ролью courier
+  if (Number(c.chat_id) === Number(ADMIN_ID)) continue;
+
+  recipientsMap.set(c.chat_id, {
+    chatId: c.chat_id,
+    role: "courier",
+    username: c.username
+  });
+}
+
 
     // ✅ Если client_chat_id пустой — пытаемся найти по tgNick и сохранить в orders
   if (!order.client_chat_id && order.tgNick) {
@@ -1460,6 +1493,20 @@ if (data.startsWith("delivered_")) {
     await updateOrderStatus(orderId, "delivered", String(username || "").replace(/^@/, ""));
     const updatedOrder = await getOrderById(orderId);
 
+    // ✅ Разблокировать рефералку покупателю после 1 delivered
+try {
+  const buyerUsername = updatedOrder.tgNick?.replace(/^@/, "");
+  if (buyerUsername) {
+    await db.execute(
+      "UPDATE clients SET referrals_locked=0, eligible_referrer=1 WHERE username=?",
+      [buyerUsername]
+    );
+  }
+} catch (e) {
+  console.error("[UNLOCK REFERRALS ERROR]", e?.message || e);
+}
+
+
     // 2) Обновляем сообщение у всех участников
     await sendOrUpdateOrderAll(updatedOrder);
 
@@ -1712,31 +1759,27 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     await addOrUpdateClient(username, first_name, id);
     console.log(`Клиент @${username} добавлен/обновлён в базе`);
 
-  // ===== РЕФЕРАЛ + УВЕДОМЛЕНИЕ ПРИГЛАСИВШЕМУ (С ЗАЩИТОЙ) =====
+ // ===== РЕФЕРАЛ + УВЕДОМЛЕНИЕ ПРИГЛАСИВШЕМУ (С ЗАЩИТОЙ) =====
 if (isNew && ref && ref.startsWith("ref_")) {
   const referrer = ref.replace("ref_", "").replace(/^@/, "").trim();
   const me = String(username || "").replace(/^@/, "").trim();
 
-  // 0) защита от саморефа
+  // 0) самореф
   if (referrer === me) {
     await addReferralLog("self_referral", me, "Попытка самореферала");
   } else {
-    // 1) реферер должен существовать в clients
+    // 1) реферер должен существовать
     const refClient = await getClient(referrer);
 
-    // 2) и должен быть “допущен” (есть хотя бы 1 delivered)
+    // 2) и иметь хотя бы 1 delivered
     const eligible = refClient && await isEligibleReferrer(referrer);
 
     if (!eligible) {
-      // НЕ привязываем реферала → НИКАКИХ скидок/бонусов по этой цепочке
       await addReferralLog(
         "referrer_not_eligible",
         referrer || "unknown",
         `Попытка рефералки для @${me} (реферер без delivered)`
       );
-
-      // можно мягко сообщить новому юзеру (по желанию)
-      // await bot.sendMessage(id, "Реферальная ссылка пока не активна.");
     } else {
       // 3) привязываем реферера
       await db.execute(
@@ -1744,7 +1787,13 @@ if (isNew && ref && ref.startsWith("ref_")) {
         [referrer, me]
       );
 
-      // 4) уведомление пригласившему 1 раз (как у тебя)
+      // 4) новый юзер пришёл по рефке → блокируем ему приглашения пока не сделает delivered
+      await db.execute(
+        "UPDATE clients SET referrals_locked=1 WHERE username=?",
+        [me]
+      );
+
+      // 5) уведомление рефереру 1 раз
       try {
         const details = `friend_started:@${me}`;
         const already = await hasReferralLog("ref_start_notify", referrer, details);
@@ -1764,6 +1813,7 @@ if (isNew && ref && ref.startsWith("ref_")) {
     }
   }
 }
+
 
 
 
@@ -1872,6 +1922,9 @@ bot.on("message", async (msg) => {
 
   if (!msg.text) return;
   const text = msg.text.trim();
+  // ⛔️ чтобы /start обрабатывался только bot.onText(/\/start/)
+if (text.startsWith("/start")) return;
+
 
   // ✅ чтобы кнопки меню не перехватывались режимами "ожидания"
 if (id === ADMIN_ID) {
@@ -2266,7 +2319,19 @@ if (text === "/banned" && id === ADMIN_ID) {
 
 // ===== 💸 ПОЛУЧИТЬ СКИДКУ (ЭКРАН ОПИСАНИЯ) =====
 if (text === "💸 Получить скидку") {
-  const uname = username.replace(/^@/, "");
+  const uname = (username || "").replace(/^@/, "");
+
+  // ✅ ЗАЩИТА: если юзер пришёл по рефке и ещё не сделал 1 заказ — не даём пиарить рефку
+  const client = await getClient(uname);
+  if (client && Number(client.referrals_locked || 0) === 1) {
+    await bot.sendMessage(
+      id,
+      "⛔️ Реферальная ссылка станет доступна после вашего первого заказа.\n" +
+      "Сделайте заказ — и сможете приглашать друзей."
+    );
+    return;
+  }
+
   const refLink = `https://t.me/crazydecloud_bot?start=ref_${uname}`;
 
 
@@ -2299,14 +2364,19 @@ if (text === "💸 Получить скидку") {
 
   return;
 }
+
 // ===== 📊 МОИ ПРИГЛАШЁННЫЕ =====
 if (text === "📊 Мои приглашённые") {
-  const uname = username.replace(/^@/, "");
+  const uname = (username || "").replace(/^@/, "");
 
   const [refs] = await db.execute(
     "SELECT username FROM clients WHERE referrer=? ORDER BY username ASC",
     [uname]
   );
+
+  // ✅ берём реальное количество доступных скидок из БД
+  const me = await getClient(uname);
+  const availableBonuses = Number(me?.referral_bonus_available || 0);
 
   if (!refs.length) {
     const msg =
@@ -2324,7 +2394,7 @@ if (text === "📊 Мои приглашённые") {
   for (const r of refs) {
     const invited = r.username;
 
-    // 1) есть ли вообще заказ
+    // есть ли вообще заказ
     const [[anyOrder]] = await db.execute(
       `SELECT status FROM orders
        WHERE REPLACE(tgNick,'@','')=?
@@ -2333,7 +2403,7 @@ if (text === "📊 Мои приглашённые") {
       [invited]
     );
 
-    // 2) есть ли delivered
+    // есть ли delivered
     const [[delivered]] = await db.execute(
       `SELECT 1 AS ok FROM orders
        WHERE REPLACE(tgNick,'@','')=?
@@ -2344,11 +2414,11 @@ if (text === "📊 Мои приглашённые") {
 
     if (delivered?.ok) {
       deliveredCnt++;
-      orderedCnt++; // раз delivered есть, значит заказ точно был
+      orderedCnt++;
       msg += `@${invited} — ✅ заказ выполнен\n`;
     } else if (anyOrder?.status) {
       orderedCnt++;
-      msg += `@${invited} — 🛒 сделал заказ\n`;
+      msg += `@${invited} — 🛒 заказ есть (${anyOrder.status})\n`;
     } else {
       msg += `@${invited} — 👋 запустил бот, заказов нет\n`;
     }
@@ -2359,7 +2429,7 @@ if (text === "📊 Мои приглашённые") {
     `👋 Запустили бота: ${refs.length}\n` +
     `🛒 Сделали заказ: ${orderedCnt}\n` +
     `✅ Выполнено: ${deliveredCnt}\n\n` +
-    `💸 Скидок 3€ доступно: ${deliveredCnt}\n` +
+    `💸 Скидок 3€ доступно: ${availableBonuses}\n` +
     `Скидка применится автоматически к следующему заказу.`;
 
   await bot.sendMessage(id, msg);
@@ -3182,47 +3252,47 @@ console.log(`Присвоен новый ID заказа: ${id}`);
 };
 
 
-    // ===== Добавляем заказ в базу, если его ещё нет =====
-   await addOrder(order);
-console.log(`Заказ ${id} добавлен в базу`);
+ // ===== Проверка существующего заказа =====
+const exists = await getOrderById(id);
 
-if (clientChatIdNum) {
-  await db.execute(
-    "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-    [clientChatIdNum, id]
-  );
-      // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа
+if (!exists) {
+  // ===== Добавляем заказ в базу, если его ещё нет =====
+  await addOrder(order);
+  console.log(`Заказ ${id} добавлен в базу`);
+
+  // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа
   if (clientChatIdNum) {
-  await db.execute(
-    "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-    [clientChatIdNum, id]
-  );
+    await db.execute(
+      "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+      [clientChatIdNum, id]
+    );
+  }
+} else {
+  console.log(`Заказ ${id} уже в базе, пропускаем добавление`);
 }
-    } else {
-      console.log(`Заказ ${id} уже в базе, пропускаем добавление`);
-    }
 
-    // ===== Получаем заказ из базы =====
-    const updated = await getOrderById(id);
+// ===== Получаем заказ из базы =====
+const updated = await getOrderById(id);
 
-    // ✅ тест: принудительно слать новым сообщением всем (сброс message_id)
+// ✅ тест: принудительно слать новым сообщением всем (сброс message_id)
 await clearOrderMessage(updated.id, ADMIN_ID);
 
-    // ===== Отправляем уведомления в Telegram =====
-    await sendOrUpdateOrderAll(updated);
-    console.log(`Уведомления отправлены для заказа ${id}`);
+// ===== Отправляем уведомления в Telegram =====
+await sendOrUpdateOrderAll(updated);
+console.log(`Уведомления отправлены для заказа ${id}`);
 
-    // ===== WebSocket: обновление stock =====
-    broadcastStock();
-    console.log(`WebSocket: отправлено обновление stock`);
+// ===== WebSocket: обновление stock =====
+broadcastStock();
+console.log(`WebSocket: отправлено обновление stock`);
 
-    return res.json({ success: true, orderId: id });
+return res.json({ success: true, orderId: id });
 
-  } catch (err) {
-    console.error("Ошибка при обработке /api/send-order:", err);
-    return res.status(500).json({ success: false, error: "Внутренняя ошибка сервера" });
-  }
+} catch (err) {
+  console.error("Ошибка при обработке /api/send-order:", err);
+  return res.status(500).json({ success: false, error: "Внутренняя ошибка сервера" });
+}
 });
+
 
 
 
