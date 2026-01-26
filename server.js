@@ -568,23 +568,25 @@ async function sendOrUpdateOrderToChat(order, chatId, role, username) {
       await bot.editMessageText(msgText, {
         chat_id: chatId,
         message_id: existingMsgId,
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+        reply_markup: keyboard.length
+          ? { inline_keyboard: keyboard }
+          : undefined
       });
     } else {
       const sent = await bot.sendMessage(chatId, msgText, {
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+        reply_markup: keyboard.length
+          ? { inline_keyboard: keyboard }
+          : undefined
       });
       await saveOrderMessage(order.id, chatId, sent.message_id);
     }
   } catch (err) {
     const emsg = String(err?.message || "");
 
-    // Нормальная ситуация — Telegram ругается, что текст не изменился
+    // сообщение не изменилось — норм
     if (emsg.includes("message is not modified")) return;
 
-    // Если старое сообщение уже удалено/не найдено — чистим запись и шлём заново
+    // сообщение нельзя отредактировать — удаляем запись
     if (
       emsg.includes("message to edit not found") ||
       emsg.includes("message identifier is not specified") ||
@@ -594,18 +596,23 @@ async function sendOrUpdateOrderToChat(order, chatId, role, username) {
       await clearOrderMessage(order.id, chatId);
     }
 
-    // Пытаемся отправить заново и сохранить новый message_id
+    // пробуем отправить заново
     try {
       const sent = await bot.sendMessage(chatId, msgText, {
-        parse_mode: "MarkdownV2",
-        reply_markup: keyboard.length ? { inline_keyboard: keyboard } : undefined
+        reply_markup: keyboard.length
+          ? { inline_keyboard: keyboard }
+          : undefined
       });
       await saveOrderMessage(order.id, chatId, sent.message_id);
     } catch (e2) {
-      console.error(`[ERROR] sendOrUpdateOrderToChat ${order.id} -> ${chatId}:`, e2.message);
+      console.error(
+        `[ERROR] sendOrUpdateOrderToChat ${order.id} -> ${chatId}:`,
+        e2.message
+      );
     }
   }
 }
+
 
 // =================== ГЛАВНОЕ: разослать/обновить всем участникам ===================
 async function sendOrUpdateOrderAll(order) {
@@ -788,13 +795,18 @@ async function askForReview(order) {
 // =================== Восстановление заказов для клиентов ===================
 async function restoreOrdersForClients() {
   console.log("[INFO] Восстановление заказов для клиентов...");
-  const [clients] = await db.execute("SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL");
+  const [clients] = await db.execute(
+    "SELECT username, chat_id FROM clients WHERE chat_id IS NOT NULL"
+  );
 
   const limit = pLimit(5);
 
   for (const client of clients) {
     const [orders] = await db.execute(
-      `SELECT * FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status IN ('new','taken') ORDER BY created_at DESC`,
+      `SELECT * FROM orders
+       WHERE REPLACE(tgNick,'@','') = ?
+       AND status IN ('new','taken')
+       ORDER BY created_at DESC`,
       [client.username]
     );
 
@@ -803,16 +815,32 @@ async function restoreOrdersForClients() {
         try {
           // Проверяем, есть ли уже сообщение клиенту
           const messages = await getOrderMessages(order.id);
-          const alreadySent = messages.some(m => m.chat_id === client.chat_id);
+          const alreadySent = messages.some(
+            m => m.chat_id === client.chat_id
+          );
           if (alreadySent) return;
 
           const text = buildTextForOrder(order);
-          const sent = await bot.sendMessage(client.chat_id, text, { parse_mode: "MarkdownV2" });
 
-          await saveOrderMessage(order.id, client.chat_id, sent.message_id);
-          console.log(`[INFO] Отправлен заказ №${order.id} клиенту @${client.username}`);
+          const sent = await bot.sendMessage(
+            client.chat_id,
+            text
+          );
+
+          await saveOrderMessage(
+            order.id,
+            client.chat_id,
+            sent.message_id
+          );
+
+          console.log(
+            `[INFO] Отправлен заказ №${order.id} клиенту @${client.username}`
+          );
         } catch (err) {
-          console.error(`[ERROR] Ошибка отправки заказа №${order.id} клиенту @${client.username}:`, err.message);
+          console.error(
+            `[ERROR] Ошибка отправки заказа №${order.id} клиенту @${client.username}:`,
+            err.message
+          );
         }
       })
     );
@@ -822,6 +850,7 @@ async function restoreOrdersForClients() {
 
   console.log("[INFO] Восстановление заказов для клиентов завершено");
 }
+
 
 
 
@@ -1039,14 +1068,15 @@ if (data.startsWith("reviews_") && fromId === ADMIN_ID) {
 }
 
 
-   const msg = reviews.map(r =>
+const msg = reviews.map(r =>
   `*Заказ №${escapeMarkdownV2(r.order_id)}*\n` +
   `👤 Клиент: @${escapeMarkdownV2(r.client_username)}\n` +
   `🚚 Курьер: @${escapeMarkdownV2(r.courier_username)}\n` +
-  `⭐ Оценка: ${r.rating}/5\n` +
+  `⭐ Оценка: ${escapeMarkdownV2(String(r.rating))}\/5\n` +
   `📝 Отзыв: ${escapeMarkdownV2(r.review_text || "—")}\n` +
   `📅 Дата: ${escapeMarkdownV2(new Date(r.created_at).toLocaleString("ru-RU"))}`
-).join("\n\n\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\\n\n");
+).join("\n\n——————————————\n\n");
+
 
 
 
@@ -1910,13 +1940,11 @@ try {
 }
 
 // ===== сохраняем отзыв + рейтинг =====
-const now = new Date().toISOString().slice(0, 19).replace("T", " "); // MySQL DATETIME
+const now = new Date().toISOString().slice(0, 19).replace("T", "");
 
-// Убираем @ перед сохранением в БД
 const courierNick = review.courier.replace(/^@/, "");
 const clientNick = review.client.replace(/^@/, "");
 
-// Сохраняем в БД (не меняем Markdown, БД спокойно хранит спецсимволы)
 await db.execute(
   `INSERT INTO reviews (
      order_id,
@@ -1933,18 +1961,21 @@ console.log(
   `Отзыв сохранён: заказ ${review.orderId}, рейтинг ${review.rating}, клиент @${clientNick}, курьер @${courierNick}`
 );
 
-// отправляем админу
+const safeReviewText = reviewText
+  ? escapeMarkdownV2(reviewText)
+  : "—";
+
 await bot.sendMessage(
   ADMIN_ID,
   `Новый отзыв
 
-Заказ: №${review.orderId}
+Заказ: №${escapeMarkdownV2(String(review.orderId))}
 Клиент: @${escapeMarkdownV2(clientNick)}
 Курьер: @${escapeMarkdownV2(courierNick)}
-Оценка: ${review.rating}/5
+Оценка: ${escapeMarkdownV2(String(review.rating))}\/5
 
 Отзыв:
-${escapeMarkdownV2(reviewText)}`,
+${safeReviewText}`,
   { parse_mode: "MarkdownV2" }
 );
 
@@ -2621,58 +2652,62 @@ if (text === "Рассылка" && id === ADMIN_ID) {
   return bot.sendMessage(id, "Введите текст для рассылки всем подписанным клиентам:");
 }
 
-
 // ===== Рассылка с лимитом (без дублей + отчет по никам) =====
 if (adminWaitingBroadcast.has(username)) {
   const msgText = text;
 
   try {
-    // 1) Берем уникальные chat_id (если в базе дубли — они схлопнутся)
+    // 1) Берем уникальные chat_id
     const [rows] = await db.execute(`
       SELECT chat_id, MAX(username) AS username
       FROM clients
-      WHERE subscribed=1 AND chat_id IS NOT NULL
+      WHERE subscribed = 1 AND chat_id IS NOT NULL
       GROUP BY chat_id
     `);
 
-    console.log(`Начало рассылки от @${username}, текст: "${msgText}"`);
+    console.log(`Начало рассылки от @${username}`);
     console.log(`Уникальных получателей: ${rows.length}`);
-
-    const safeMsg = escapeMarkdownV2(msgText);
 
     const limit = pLimit(5);
 
     const okUsers = [];
     const failUsers = [];
 
-    // 2) На всякий случай еще защита от дублей в коде
+    // защита от дублей на всякий случай
     const sentSet = new Set();
 
-    const tasks = rows.map(r => limit(async () => {
-      const chatId = r.chat_id;
-      const uname = r.username ? String(r.username) : "";
+    const tasks = rows.map(r =>
+      limit(async () => {
+        const chatId = r.chat_id;
+        const uname = r.username ? String(r.username) : "";
 
-      if (!chatId) return;
+        if (!chatId) return;
+        if (sentSet.has(chatId)) return;
+        sentSet.add(chatId);
 
-      // если каким-то чудом chatId повторился — пропускаем
-      if (sentSet.has(chatId)) return;
-      sentSet.add(chatId);
+        try {
+          // ❗ РАССЫЛКА БЕЗ parse_mode
+          await bot.sendMessage(chatId, msgText);
 
-      try {
-        await bot.sendMessage(chatId, safeMsg, { parse_mode: "MarkdownV2" });
-        okUsers.push(uname ? `@${uname.replace(/^@/, "")}` : `chat_id:${chatId}`);
-        console.log(`✅ Отправлено: ${uname || chatId}`);
-      } catch (err) {
-        failUsers.push(uname ? `@${uname.replace(/^@/, "")}` : `chat_id:${chatId}`);
-        console.error(`❌ Ошибка отправки ${uname || chatId}:`, err.message);
-      }
-    }));
+          okUsers.push(
+            uname ? `@${uname.replace(/^@/, "")}` : `chat_id:${chatId}`
+          );
+          console.log(`✅ Отправлено: ${uname || chatId}`);
+        } catch (err) {
+          failUsers.push(
+            uname ? `@${uname.replace(/^@/, "")}` : `chat_id:${chatId}`
+          );
+          console.error(`❌ Ошибка отправки ${uname || chatId}:`, err.message);
+        }
+      })
+    );
 
     await Promise.all(tasks);
 
     adminWaitingBroadcast.delete(username);
 
-    // 3) Отчет админу (может быть длинный — шлем частями)
+    // ===== ОТЧЕТ АДМИНУ =====
+
     const makeChunks = (arr, maxLen = 3500) => {
       const out = [];
       let cur = "";
@@ -2692,16 +2727,23 @@ if (adminWaitingBroadcast.has(username)) {
     const header =
       `📣 Рассылка завершена\n` +
       `Успешно: ${okUsers.length} из ${rows.length}\n` +
-      `Ошибки: ${failUsers.length}\n`;
+      `Ошибки: ${failUsers.length}`;
 
-    await bot.sendMessage(ADMIN_ID, escapeMarkdownV2(header), { parse_mode: "MarkdownV2" });
+    // отчёт — можно MarkdownV2
+    await bot.sendMessage(
+      ADMIN_ID,
+      escapeMarkdownV2(header),
+      { parse_mode: "MarkdownV2" }
+    );
 
     if (okUsers.length) {
       const okChunks = makeChunks(okUsers);
       for (let i = 0; i < okChunks.length; i++) {
         await bot.sendMessage(
           ADMIN_ID,
-          escapeMarkdownV2(`✅ Доставлено (часть ${i + 1}/${okChunks.length}):\n${okChunks[i]}`),
+          escapeMarkdownV2(
+            `✅ Доставлено (часть ${i + 1}/${okChunks.length}):\n${okChunks[i]}`
+          ),
           { parse_mode: "MarkdownV2" }
         );
       }
@@ -2712,7 +2754,9 @@ if (adminWaitingBroadcast.has(username)) {
       for (let i = 0; i < failChunks.length; i++) {
         await bot.sendMessage(
           ADMIN_ID,
-          escapeMarkdownV2(`❌ Не доставлено (часть ${i + 1}/${failChunks.length}):\n${failChunks[i]}`),
+          escapeMarkdownV2(
+            `❌ Не доставлено (часть ${i + 1}/${failChunks.length}):\n${failChunks[i]}`
+          ),
           { parse_mode: "MarkdownV2" }
         );
       }
@@ -2722,13 +2766,14 @@ if (adminWaitingBroadcast.has(username)) {
     console.error(`Ошибка при рассылке от @${username}:`, err.message);
     await bot.sendMessage(
       ADMIN_ID,
-      `Ошибка при рассылке: ${escapeMarkdownV2(err.message)}`,
+      escapeMarkdownV2(`Ошибка при рассылке:\n${err.message}`),
       { parse_mode: "MarkdownV2" }
     );
   }
 
   return;
 }
+
 
 
 
