@@ -911,7 +911,8 @@ if (data === "copy_ref_link") {
     return;
   }
 
-  const refLink = `https://t.me/crazy_cloud_bot?start=ref_${uname}`;
+  const refLink = `https://t.me/crazydecloud_bot?start=ref_${uname}`;
+
 
   await bot.answerCallbackQuery(q.id, {
     text: "Ссылка готова 👇",
@@ -2131,7 +2132,8 @@ if (text === "/banned" && id === ADMIN_ID) {
 // ===== 💸 ПОЛУЧИТЬ СКИДКУ (ЭКРАН ОПИСАНИЯ) =====
 if (text === "💸 Получить скидку") {
   const uname = username.replace(/^@/, "");
-  const refLink = `https://t.me/crazy_cloud_bot?start=ref_${uname}`;
+  const refLink = `https://t.me/crazydecloud_bot?start=ref_${uname}`;
+
 
   const msg =
   "👥 Пригласите друга и получите скидку\n\n" +
