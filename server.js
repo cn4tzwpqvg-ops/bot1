@@ -177,9 +177,18 @@ await db.execute(`
     console.log("orders.discount_type добавлена");
   } catch (e) {}
 
+  // orders.referral_bonus_given
+try {
+  await db.execute(
+    "ALTER TABLE orders ADD COLUMN referral_bonus_given TINYINT(1) DEFAULT 0"
+  );
+  console.log("orders.referral_bonus_given добавлена");
+} catch (e) {}
+
 
   console.log("База данных и таблицы готовы");
 }
+
 
 function escapeMarkdown(text) {
   if (!text) return "";
@@ -237,6 +246,25 @@ async function addOrUpdateClient(username, first_name, chat_id) {
   `, [username, first_name, now, now, chat_id]);
 }
 
+async function isEligibleReferrer(username) {
+  const uname = String(username || "").replace(/^@/, "").trim();
+  if (!uname) return false;
+
+  // админ — всегда можно (опционально)
+  if (uname === ADMIN_USERNAME) return true;
+
+  const [[row]] = await db.execute(
+    `SELECT COUNT(*) AS cnt
+     FROM orders
+     WHERE REPLACE(tgNick,'@','')=?
+       AND status='delivered'`,
+    [uname]
+  );
+
+  return Number(row?.cnt || 0) > 0;
+}
+
+
 async function getClient(username) {
   const [rows] = await db.execute("SELECT * FROM clients WHERE username=?", [username]);
   return rows[0];
@@ -251,6 +279,36 @@ function formatMySQLDateTime(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
          `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
+async function hasReferralLog(type, username, details) {
+  const [rows] = await db.execute(
+    "SELECT 1 FROM referral_logs WHERE type=? AND username=? AND details=? LIMIT 1",
+    [type, username, details]
+  );
+  return rows.length > 0;
+}
+
+async function addReferralLog(type, username, details) {
+  await db.execute(
+    "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+    [type, username, details]
+  );
+}
+
+async function notifyReferrer(referrerUsername, text) {
+  const uname = String(referrerUsername || "").replace(/^@+/, "").trim();
+  if (!uname) return;
+
+  try {
+    const ref = await getClient(uname);
+    if (!ref || !ref.chat_id) return;
+
+    await bot.sendMessage(ref.chat_id, String(text || ""));
+  } catch (e) {
+    console.error("[notifyReferrer] failed:", e?.message || e);
+  }
+}
+
+
 
 // Преобразует дату в формат MySQL DATE: YYYY-MM-DD
 function formatMySQLDate(date = new Date()) {
@@ -442,13 +500,14 @@ function buildKeyboardForRecipient(order, { role, username }) {
   // По умолчанию кнопок нет
   let keyboard = [];
 
-  // Клиент — отмена в первые 20 минут, пока заказ NEW или TAKEN
+// Клиент — отмена в первые 20 минут, пока заказ NEW или TAKEN
 if (isClient) {
-  const createdMs = order.created_at ? new Date(order.created_at).getTime() : Date.now();
-const orderAge = Date.now() - createdMs;
-if (isClient) {
-  const createdMs = order.created_at ? new Date(order.created_at).getTime() : Date.now();
+  const createdMs = order.created_at
+    ? new Date(order.created_at).getTime()
+    : Date.now();
+
   const orderAge = Date.now() - createdMs;
+
   const canCancelByTime = orderAge <= 20 * 60 * 1000;
   const canCancelByStatus = (order.status === "new" || order.status === "taken");
 
@@ -462,19 +521,12 @@ if (isClient) {
   });
 
   if (canCancelByTime && canCancelByStatus) {
-    keyboard = [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
+    return [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
   }
-  return keyboard;
+
+  return [];
 }
 
-  const canCancelByTime = orderAge <= 20 * 60 * 1000;
-  const canCancelByStatus = (order.status === "new" || order.status === "taken");
-
-  if (canCancelByTime && canCancelByStatus) {
-    keyboard = [[{ text: "❌ Отменить заказ", callback_data: `confirm_cancel_${order.id}` }]];
-  }
-  return keyboard;
-}
 
   // Админ/курьеры
   if (order.status === "new") {
@@ -507,29 +559,25 @@ if (isClient) {
 
 function buildOrderMessage(order) {
   const lines = [
-    `🧾 Заказ №${escapeMarkdownV2(order.id)}`,
-    `👤 Клиент: ${escapeMarkdownV2(withAt(order.tgNick))}`,
-    `🏙 Город: ${escapeMarkdownV2(order.city || "—")}`,
-    `🚚 Доставка: ${escapeMarkdownV2(order.delivery || "—")}`,
-    `💰 Оплата: ${escapeMarkdownV2(order.payment || "—")}`,
-    `📝 Заказ: ${escapeMarkdownV2(order.orderText || "—")}`,
-    `📅 Дата: ${escapeMarkdownV2(order.date || "—")}`,
-    `⏰ Время: ${escapeMarkdownV2(order.time || "—")}`,
-    `🚚 Курьер: ${escapeMarkdownV2(withAt(order.courier_username || "—"))}`,
-    `📌 Статус: ${escapeMarkdownV2(order.status || "—")}`
+    `🧾 Заказ №${order.id}`,
+    `👤 Клиент: ${withAt(order.tgNick)}`,
+    `🏙 Город: ${order.city || "—"}`,
+    `🚚 Доставка: ${order.delivery || "—"}`,
+    `💰 Оплата: ${order.payment || "—"}`,
+    `📝 Заказ: ${order.orderText || "—"}`,
+    `📅 Дата: ${order.date || "—"}`,
+    `⏰ Время: ${order.time || "—"}`,
+    `🚚 Курьер: ${withAt(order.courier_username || "—")}`,
+    `📌 Статус: ${order.status || "—"}`
   ];
 
-  // ===== ЦЕНА И СКИДКА =====
   if (order.original_price && order.final_price) {
-    if (order.final_price < order.original_price) {
-      lines.push(
-        `💸 Цена: ${order.final_price}€ (вместо ${order.original_price}€)`
-      );
+    if (Number(order.final_price) < Number(order.original_price)) {
+      lines.push(`💸 Цена: ${order.final_price}€ (вместо ${order.original_price}€)`);
 
       if (order.discount_type === "first_order") {
         lines.push("🎁 Скидка применена: первый заказ по приглашению");
       }
-
       if (order.discount_type === "referral_bonus") {
         lines.push("🎁 Скидка применена: бонус за приглашённого друга");
       }
@@ -541,8 +589,6 @@ function buildOrderMessage(order) {
   return lines.join("\n");
 }
 
-
-
 function buildTextForOrder(order) {
   let msgText = buildOrderMessage({
     ...order,
@@ -550,7 +596,7 @@ function buildTextForOrder(order) {
   });
 
   if (order.status === "canceled") {
-    msgText += "\n\n" + escapeMarkdownV2("❌ Заказ был отменён покупателем");
+    msgText += "\n\n❌ Заказ был отменён покупателем";
   }
 
   return msgText;
@@ -773,13 +819,18 @@ async function askForReview(order) {
 
   try {
     await bot.sendMessage(
-      clientId,
-      `✅ Заказ №${orderId} доставлен.\n` +
-        `🚚 Курьер: ${courier}\n\n` +
-        `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
-        `Если не хотите — нажмите «Пропустить».`,
-      { reply_markup: kb }
-    );
+  clientId,
+  `✅ Заказ №${orderId} доставлен.\n` +
+    `🚚 Курьер: ${courier}\n\n` +
+    `Оцените работу курьера ⭐ (1–5)\n\n` +
+    `После оценки напишите пару слов:\n` +
+    `• опоздал/вовремя?\n` +
+    `• как общался?\n` +
+    `• всё ли было нормально?\n\n` +
+    `Если не хотите — нажмите «Пропустить».`,
+  { reply_markup: kb }
+);
+
 
     console.log("[DEBUG] review request sent to client:", clientId, "order:", orderId);
   } catch (e) {
@@ -989,14 +1040,14 @@ if (data.startsWith("skip_review_")) {
   const orderId = String(data.split("_")[2] || "").trim();
   const review = waitingReview.get(fromId);
 
-  if (!review || review.orderId !== orderId) {
+  if (!review || String(review.orderId) !== orderId) {
     return bot.answerCallbackQuery(q.id, {
       text: "Отзыв уже обработан или устарел",
       show_alert: true
     });
   }
 
-  // ✅ Если отзыв уже есть в БД — просто выходим (чтобы не было дублей)
+  // если отзыв уже есть в БД — просто выходим (чтобы не было дублей)
   const already = await hasReviewForOrder(orderId);
   if (already) {
     waitingReview.delete(fromId);
@@ -1004,43 +1055,64 @@ if (data.startsWith("skip_review_")) {
     return bot.answerCallbackQuery(q.id, { text: "Готово" });
   }
 
+  const courierNick = String(review.courier || "—").replace(/^@/, "");
+  const clientNick = String(review.client || "—").replace(/^@/, "");
+
+  // ✅ АНТИСПАМ админу: шлём лог 1 раз
+  const logType = "review_skip_notify";
+  const logUser = clientNick || "unknown";
+  const logDetails = `order:${orderId}:courier:@${courierNick}:rating:${review.rating ?? "none"}`;
+
+  let canNotifyAdmin = true;
+  try {
+    const exists = await hasReferralLog(logType, logUser, logDetails);
+    if (exists) canNotifyAdmin = false;
+    else await addReferralLog(logType, logUser, logDetails);
+  } catch (e) {
+    // если лог не записался — всё равно лучше уведомить админа
+    console.error("[review_skip_notify log error]", e?.message || e);
+  }
+
   // Если успел выбрать оценку — сохраняем только рейтинг (без текста)
   if (review.rating !== null) {
     try {
       const now = new Date().toISOString().slice(0, 19).replace("T", " ");
-      const courierNick = String(review.courier || "").replace(/^@/, "");
-      const clientNick = String(review.client || "").replace(/^@/, "");
-
       await db.execute(
         `INSERT INTO reviews (order_id, client_username, courier_username, rating, review_text, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [review.orderId, clientNick, courierNick, Number(review.rating), null, now]
+        [orderId, clientNick, courierNick, Number(review.rating), null, now]
       );
-
-      // админу — уведомление
-      if (ADMIN_ID) {
-        await bot.sendMessage(
-          ADMIN_ID,
-          `⚠️ Клиент @${escapeMarkdownV2(clientNick)} поставил оценку ${review.rating}/5 по заказу №${escapeMarkdownV2(review.orderId)}, но пропустил текст отзыва.`,
-          { parse_mode: "MarkdownV2" }
-        );
-      }
     } catch (e) {
-      console.error("[skip_review] save rating only error:", e.message);
+      console.error("[skip_review] save rating only error:", e?.message || e);
+    }
+  }
+
+  // ✅ Уведомление админу ВСЕГДА
+  if (ADMIN_ID && canNotifyAdmin) {
+    try {
+      const adminMsg =
+        review.rating === null
+          ? `⚠️ Клиент @${escapeMarkdownV2(clientNick)} отказался оставлять отзыв по заказу №${escapeMarkdownV2(orderId)} (без оценки).`
+          : `⚠️ Клиент @${escapeMarkdownV2(clientNick)} отказался писать отзыв по заказу №${escapeMarkdownV2(orderId)}, но поставил оценку ${escapeMarkdownV2(String(review.rating))}\/5.\nКурьер: @${escapeMarkdownV2(courierNick)}`;
+
+      await bot.sendMessage(ADMIN_ID, adminMsg, { parse_mode: "MarkdownV2" });
+    } catch (e) {
+      console.error("[skip_review] notify admin error:", e?.message || e);
     }
   }
 
   waitingReview.delete(fromId);
 
-  // Если оценки не было — просто закрываем
+  // ответ клиенту
   if (review.rating === null) {
-    await bot.sendMessage(fromId, "Ок, отзыв пропущен ✅ (оценка не выбрана)");
+    await bot.sendMessage(fromId, "Ок ✅ Отзыв пропущен.");
   } else {
-    await bot.sendMessage(fromId, "Ок, отзыв пропущен ✅");
+    await bot.sendMessage(fromId, "Ок ✅ Спасибо! Оценка сохранена, отзыв пропущен.");
   }
 
-  return bot.answerCallbackQuery(q.id, { text: "Пропущено" });
+  return bot.answerCallbackQuery(q.id, { text: "Готово" });
 }
+
 
 
 
@@ -1094,8 +1166,80 @@ const msg = reviews.map(r =>
   return bot.answerCallbackQuery(q.id, { text: "Отзывы загружены" });
 }
 
-// ================== ADMIN DELETE ORDER (confirm) ==================
+// ================== ADMIN DELETE ORDER (confirmed) ==================
+if (data.startsWith("admin_delete_confirm_") && fromId === ADMIN_ID) {
+  const orderId = data.split("_")[3];
+
+  const order = await getOrderById(orderId);
+  if (!order) {
+    await bot.answerCallbackQuery(q.id, {
+      text: "Заказ уже удалён",
+      show_alert: true
+    });
+    return;
+  }
+
+  // 1) удалить сообщения заказа у всех
+  const msgs = await getOrderMessages(orderId);
+  for (const m of msgs) {
+    try {
+      await bot.deleteMessage(m.chat_id, m.message_id);
+    } catch (e) {}
+  }
+
+  // 2) очистить таблицу сообщений
+  await db.execute("DELETE FROM order_messages WHERE order_id=?", [orderId]);
+
+  // 3) удалить сам заказ
+  await db.execute("DELETE FROM orders WHERE id=?", [orderId]);
+
+  // 4) лог (если нужно)
+  try {
+    await db.execute(
+      `INSERT INTO referral_logs (type, username, details, created_at)
+       VALUES ('admin_delete', ?, ?, NOW())`,
+      [ADMIN_USERNAME, `Админ удалил заказ №${orderId}`]
+    );
+  } catch (e) {}
+
+  // (не обязательно) заменить текст сообщения с подтверждением
+  try {
+    if (q.message?.chat?.id && q.message?.message_id) {
+      await bot.editMessageText(`✅ Заказ №${orderId} удалён`, {
+        chat_id: q.message.chat.id,
+        message_id: q.message.message_id
+      });
+    }
+  } catch (e) {}
+
+  await bot.answerCallbackQuery(q.id, { text: "Удалено" });
+
+  // (опционально) уведомление админу отдельным сообщением
+  // await bot.sendMessage(ADMIN_ID, `🗑 Заказ №${orderId} удалён администратором`);
+
+  return;
+}
+
+// ================== ADMIN DELETE ORDER (cancel) ==================
+if (data.startsWith("admin_delete_cancel_") && fromId === ADMIN_ID) {
+  await bot.answerCallbackQuery(q.id, { text: "Удаление отменено" });
+
+  try {
+    if (q.message?.chat?.id && q.message?.message_id) {
+      await bot.editMessageText("❌ Удаление отменено", {
+        chat_id: q.message.chat.id,
+        message_id: q.message.message_id
+      });
+    }
+  } catch (e) {}
+
+  return;
+}
+
+// ================== ADMIN DELETE ORDER (ask confirm) ==================
 if (data.startsWith("admin_delete_") && fromId === ADMIN_ID) {
+  if (data.startsWith("admin_delete_confirm_") || data.startsWith("admin_delete_cancel_")) return;
+
   const orderId = data.split("_")[2];
 
   const kb = {
@@ -1107,57 +1251,36 @@ if (data.startsWith("admin_delete_") && fromId === ADMIN_ID) {
     ]
   };
 
-  await bot.sendMessage(
-    fromId,
-    `⚠️ *Удаление заказа №${orderId}*\n\n` +
-    `Заказ будет *полностью удалён*:\n` +
+  const text =
+    `⚠️ Удаление заказа №${orderId}\n\n` +
+    `Заказ будет полностью удалён:\n` +
     `• у клиента\n` +
     `• у курьеров\n` +
     `• из базы данных\n\n` +
-    `Это действие *необратимо*.`,
-    { parse_mode: "Markdown", reply_markup: kb }
-  );
+    `Это действие необратимо.`;
 
-  return bot.answerCallbackQuery(q.id);
-}
-
-// ================== ADMIN DELETE ORDER (confirmed) ==================
-if (data.startsWith("admin_delete_confirm_") && fromId === ADMIN_ID) {
-  const orderId = data.split("_")[3];
-
-  const order = await getOrderById(orderId);
-  if (!order) {
-    return bot.answerCallbackQuery(q.id, {
-      text: "Заказ уже удалён",
-      show_alert: true
-    });
+  try {
+    // ✅ если кнопка нажата на сообщении — редактируем его
+    if (q.message?.chat?.id && q.message?.message_id) {
+      await bot.editMessageText(text, {
+        chat_id: q.message.chat.id,
+        message_id: q.message.message_id,
+        reply_markup: kb
+      });
+    } else {
+      // ✅ запасной вариант
+      await bot.sendMessage(fromId, text, { reply_markup: kb });
+    }
+  } catch (e) {
+    // если не смогли отредактировать — шлём новым
+    await bot.sendMessage(fromId, text, { reply_markup: kb });
   }
 
-  // 1️⃣ удалить сообщения заказа у всех
-  const msgs = await getOrderMessages(orderId);
-  for (const m of msgs) {
-    try {
-      await bot.deleteMessage(m.chat_id, m.message_id);
-    } catch (e) {}
-  }
-
-  // 2️⃣ очистить таблицу сообщений
-  await db.execute("DELETE FROM order_messages WHERE order_id=?", [orderId]);
-
-  // 3️⃣ удалить сам заказ
-  await db.execute("DELETE FROM orders WHERE id=?", [orderId]);
-
-  await bot.sendMessage(
-    ADMIN_ID,
-    `🗑 Заказ №${orderId} полностью удалён администратором`
-  );
-
-  return bot.answerCallbackQuery(q.id, { text: "Удалено" });
+  await bot.answerCallbackQuery(q.id);
+  return;
 }
 
-if (data.startsWith("admin_delete_cancel_")) {
-  return bot.answerCallbackQuery(q.id, { text: "Удаление отменено" });
-}
+
 
 
 
@@ -1204,47 +1327,6 @@ if (data.startsWith("reassign_cancel_") && fromId === ADMIN_ID) {
   await bot.answerCallbackQuery(q.id, { text: "Отменено" });
   return;
 }
-
-
-// ================== ADMIN DELETE ORDER ==================
-if (data.startsWith("admin_delete_") && fromId === ADMIN_ID) {
-  const orderId = data.split("_")[2];
-
-  const order = await getOrderById(orderId);
-  if (!order) {
-    return bot.answerCallbackQuery(q.id, {
-      text: "Заказ уже удалён",
-      show_alert: true
-    });
-  }
-
-  // 🔥 удаляем сообщения заказа у всех
-  const msgs = await getOrderMessages(orderId);
-  for (const m of msgs) {
-    try {
-      await bot.deleteMessage(m.chat_id, m.message_id);
-    } catch (e) {}
-  }
-
-  // 🔥 чистим таблицу order_messages
-  await db.execute("DELETE FROM order_messages WHERE order_id=?", [orderId]);
-
-  // 🔥 удаляем заказ из БД
-  await db.execute("DELETE FROM orders WHERE id=?", [orderId]);
-
-  // 🔥 лог (по желанию)
-  await db.execute(
-    `INSERT INTO referral_logs (type, username, details, created_at)
-     VALUES ('admin_delete', ?, ?, NOW())`,
-    [ADMIN_USERNAME, `Админ удалил заказ №${orderId}`]
-  );
-
-  await bot.answerCallbackQuery(q.id, { text: "🗑 Заказ удалён" });
-  await bot.sendMessage(ADMIN_ID, `🗑 Заказ №${orderId} удалён администратором`);
-
-  return;
-}
-
 
 
 
@@ -1366,7 +1448,7 @@ if (data.startsWith("delivered_")) {
 
   // Проверка: только курьер, который взял заказ, или админ
   const isOwnerOrAdmin =
-    order.courier_username?.replace(/^@/, "") === username.replace(/^@/, "") ||
+    String(order.courier_username || "").replace(/^@/, "") === String(username || "").replace(/^@/, "") ||
     fromId === ADMIN_ID;
 
   if (!isOwnerOrAdmin) {
@@ -1374,75 +1456,65 @@ if (data.startsWith("delivered_")) {
   }
 
   try {
-    // Обновляем статус на 'delivered'
-    await updateOrderStatus(orderId, "delivered", username.replace(/^@/, ""));
+    // 1) Обновляем статус на 'delivered'
+    await updateOrderStatus(orderId, "delivered", String(username || "").replace(/^@/, ""));
     const updatedOrder = await getOrderById(orderId);
 
-    // ✅ Обновляем сообщение у всех участников
+    // 2) Обновляем сообщение у всех участников
     await sendOrUpdateOrderAll(updatedOrder);
 
-   // ===== НАЧИСЛЕНИЕ РЕФЕРАЛЬНОЙ СКИДКИ (С ЗАЩИТОЙ) =====
-try {
-  // защита от повторного начисления
-  if (
-    updatedOrder.discount_type !== "first_order" ||
-    updatedOrder.referral_bonus_given === 1
-  ) {
-    return;
-  }
-
-  const buyerUsername = updatedOrder.tgNick?.replace(/^@/, "");
-  if (!buyerUsername) return;
-
-  const buyer = await getClient(buyerUsername);
-  if (!buyer?.referrer) return;
-
-  const referrerUsername = buyer.referrer;
-
-  // начисляем 1 бонус
-  await db.execute(
-    "UPDATE clients SET referral_bonus_available = referral_bonus_available + 1 WHERE username=?",
-    [referrerUsername]
-  );
-
-  // помечаем заказ, что бонус уже выдан
-  await db.execute(
-    "UPDATE orders SET referral_bonus_given = 1 WHERE id=?",
-    [updatedOrder.id]
-  );
-
-  console.log(
-    `[REFERRAL BONUS] +1 скидка для @${referrerUsername} за заказ @${buyerUsername}`
-  );
-
-  // уведомление пригласившему
-  const referrer = await getClient(referrerUsername);
-  if (referrer?.chat_id) {
-    await bot.sendMessage(
-      referrer.chat_id,
-      `🎉 Ваш друг сделал заказ!\n\n` +
-      `👤 Друг: @${buyerUsername}\n` +
-      `💸 Вам начислена скидка 3€\n` +
-      `ℹ️ Она автоматически применится к следующему заказу`
-    );
-  }
-
-} catch (e) {
-  console.error("[REFERRAL BONUS ERROR]", e?.message || e);
-}
-
-
-
-    // ✅ Просим отзыв (1 раз) + лог
+    // 3) Начисление бонуса пригласившему (ТОЛЬКО если это first_order и бонус ещё не выдавали)
     try {
-      console.log("[DEBUG] delivered -> askForReview", {
-        orderId: updatedOrder.id,
-        tgNick: updatedOrder.tgNick,
-        client_chat_id: updatedOrder.client_chat_id,
-        status: updatedOrder.status
-      });
+      const alreadyGiven = Number(updatedOrder.referral_bonus_given || 0) === 1;
+      const eligible = updatedOrder.discount_type === "first_order" && !alreadyGiven;
+
+      if (eligible) {
+        const buyerUsername = String(updatedOrder.tgNick || "").replace(/^@/, "").trim();
+        if (buyerUsername) {
+          const buyer = await getClient(buyerUsername);
+
+          const referrerUsername = String(buyer?.referrer || "").replace(/^@+/, "").trim();
+          if (referrerUsername) {
+            // ✅ антидубль через logs (на случай гонок/повторных delivered)
+            const details = `bonus_for_order:${updatedOrder.id}:buyer:@${buyerUsername}`;
+            const alreadyLogged = await hasReferralLog("ref_bonus_given", referrerUsername, details);
+
+            if (!alreadyLogged) {
+              // начисляем 1 бонус пригласившему
+              await db.execute(
+                "UPDATE clients SET referral_bonus_available = referral_bonus_available + 1 WHERE username=?",
+                [referrerUsername]
+              );
+
+              // помечаем заказ, что бонус уже выдан
+              await db.execute(
+                "UPDATE orders SET referral_bonus_given = 1 WHERE id=?",
+                [updatedOrder.id]
+              );
+
+              // пишем лог
+              await addReferralLog("ref_bonus_given", referrerUsername, details);
+
+              console.log(`[REFERRAL BONUS] +1 для @${referrerUsername} за заказ @${buyerUsername}`);
+
+              // уведомление пригласившему
+              await notifyReferrer(
+                referrerUsername,
+                `✅ Друг @${buyerUsername} сделал первый заказ.\nСкидка 3€ применится автоматически к вашему следующему заказу.`
+              );
+            } else {
+              console.log(`[REFERRAL BONUS] SKIP duplicate for @${referrerUsername} | ${details}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[REFERRAL BONUS ERROR]", e?.message || e);
+    }
+
+    // 4) Просим отзыв (1 раз)
+    try {
       await askForReview(updatedOrder);
-      console.log("[DEBUG] askForReview done for order", updatedOrder.id);
     } catch (e) {
       console.error("[ERROR] askForReview failed:", e?.message || e);
     }
@@ -1453,6 +1525,8 @@ try {
     return bot.answerCallbackQuery(q.id, { text: "Ошибка при доставке", show_alert: true });
   }
 }
+
+
 
 
 
@@ -1638,23 +1712,61 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     await addOrUpdateClient(username, first_name, id);
     console.log(`Клиент @${username} добавлен/обновлён в базе`);
 
-    // ===== РЕФЕРАЛ =====
-    if (isNew && ref && ref.startsWith("ref_")) {
-  const referrer = ref.replace("ref_", "");
+  // ===== РЕФЕРАЛ + УВЕДОМЛЕНИЕ ПРИГЛАСИВШЕМУ (С ЗАЩИТОЙ) =====
+if (isNew && ref && ref.startsWith("ref_")) {
+  const referrer = ref.replace("ref_", "").replace(/^@/, "").trim();
+  const me = String(username || "").replace(/^@/, "").trim();
 
-  if (referrer === username) {
-    // лог самореферала
-    await db.execute(
-      "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
-      ["self_referral", username, "Попытка самореферала"]
-    );
+  // 0) защита от саморефа
+  if (referrer === me) {
+    await addReferralLog("self_referral", me, "Попытка самореферала");
   } else {
-    await db.execute(
-      "UPDATE clients SET referrer=? WHERE username=?",
-      [referrer, username]
-    );
+    // 1) реферер должен существовать в clients
+    const refClient = await getClient(referrer);
+
+    // 2) и должен быть “допущен” (есть хотя бы 1 delivered)
+    const eligible = refClient && await isEligibleReferrer(referrer);
+
+    if (!eligible) {
+      // НЕ привязываем реферала → НИКАКИХ скидок/бонусов по этой цепочке
+      await addReferralLog(
+        "referrer_not_eligible",
+        referrer || "unknown",
+        `Попытка рефералки для @${me} (реферер без delivered)`
+      );
+
+      // можно мягко сообщить новому юзеру (по желанию)
+      // await bot.sendMessage(id, "Реферальная ссылка пока не активна.");
+    } else {
+      // 3) привязываем реферера
+      await db.execute(
+        "UPDATE clients SET referrer=? WHERE username=?",
+        [referrer, me]
+      );
+
+      // 4) уведомление пригласившему 1 раз (как у тебя)
+      try {
+        const details = `friend_started:@${me}`;
+        const already = await hasReferralLog("ref_start_notify", referrer, details);
+
+        if (!already) {
+          await addReferralLog("ref_start_notify", referrer, details);
+
+          await notifyReferrer(
+            referrer,
+            `👋 Ваш друг @${me} запустил бота по вашей ссылке.\n` +
+            `Если он сделает первый заказ, вам будет доступна скидка 3€ (автоматически).`
+          );
+        }
+      } catch (e) {
+        console.error("[REF START NOTIFY ERROR]", e?.message || e);
+      }
+    }
   }
 }
+
+
+
 
     // ===== КУРЬЕР =====
     if (await isCourier(username)) {
@@ -1669,15 +1781,13 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     }
 
     // ===== МЕНЮ =====
-   let welcomeText =
-"👋 *Добро пожаловать!*\n\n" +
-"🛒 *Заказы оформляются прямо в боте*\n" +
-"🚚 *Доставка в день заказа по вашему городу*\n\n" +
-"💸 *Есть скидки!*\n" +
-"🤝 *Приглашайте друзей — получайте скидки на заказы*\n\n" +
-"⭐ *Отзывы клиентов:*\n" +
-"👉 https://t.me/crazy_cloud_reviews\n\n" +
-"*Чтобы оформить заказ, нажмите кнопку Отркыть магазин*👇";
+let welcomeText =
+  "👋 Добро пожаловать!\n\n" +
+  "🛒 Оформляйте заказы прямо в боте\n" +
+  "🚚 Доставка по вашему городу в день заказа\n\n" +
+  "💸 Скидка до 5€ на заказ — забирайте в разделе «Получить скидку».\n\n" +
+  "⭐ Отзывы клиентов: https://t.me/crazy_cloud_reviews\n\n" +
+  "Чтобы оформить заказ, нажмите «Открыть магазин» 👇";
     let keyboard = [];
 
     if (username === ADMIN_USERNAME) {
@@ -1701,28 +1811,21 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
         [{ text: "Панель курьера" }]
       ];
       console.log(`Курьер @${username} видит курьерское меню`);
-
-    } else {
+} else {
   keyboard = [
-    [
-      {
-        text: "🛍 Открыть магазин",
-        web_app: {
-          url: "https://cn4tzwpqvg-ops.github.io/crazycloud/"
-        }
-      }
-    ],
     [{ text: "💸 Получить скидку" }],
-  [{ text: "📊 Мои приглашённые" }], // ✅ ВОТ СЮДА
-  [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-  [{ text: "Мои заказы" }]
-];
-      console.log(`Пользователь @${username} видит обычное меню`);
-    }
+    [{ text: "📊 Мои приглашённые" }],
+    [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+    [{ text: "🧾 Мои заказы" }]
+  ];
+
+  console.log(`Пользователь @${username} видит обычное меню`);
+}
 
 await bot.sendMessage(id, welcomeText, {
   reply_markup: { keyboard, resize_keyboard: true }
 });
+
 
 
     // ===== Уведомление админу о новом пользователе =====
@@ -1940,7 +2043,7 @@ try {
 }
 
 // ===== сохраняем отзыв + рейтинг =====
-const now = new Date().toISOString().slice(0, 19).replace("T", "");
+const now = new Date().toISOString().slice(0, 19).replace("T", " ");
 
 const courierNick = review.courier.replace(/^@/, "");
 const clientNick = review.client.replace(/^@/, "");
@@ -2101,9 +2204,10 @@ if (text === "Назад") {
   return bot.sendMessage(id, "Главное меню", {
     reply_markup: {
       keyboard: [
-    [{ text: "💸 Получить скидку" }],
-    [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-    [{ text: "Мои заказы" }]
+     [{ text: "💸 Получить скидку" }],
+    [{ text: "📊 Мои приглашённые" }],
+    [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+    [{ text: "🧾 Мои заказы" }]
       ],
       resize_keyboard: true
     }
@@ -2200,44 +2304,65 @@ if (text === "📊 Мои приглашённые") {
   const uname = username.replace(/^@/, "");
 
   const [refs] = await db.execute(
-    "SELECT username FROM clients WHERE referrer=?",
+    "SELECT username FROM clients WHERE referrer=? ORDER BY username ASC",
     [uname]
   );
 
-  let textMsg = "👥 Мои приглашённые\n\n";
-  let completed = 0;
+  if (!refs.length) {
+    const msg =
+      "👥 Мои приглашённые\n\n" +
+      "Пока список пуст.\n" +
+      "Отправьте другу ссылку из «Получить скидку» — и он появится здесь после /start.";
+    await bot.sendMessage(id, msg);
+    return;
+  }
+
+  let msg = "👥 Мои приглашённые\n\n";
+  let deliveredCnt = 0;
+  let orderedCnt = 0;
 
   for (const r of refs) {
-    const [[order]] = await db.execute(
-      `SELECT id FROM orders
+    const invited = r.username;
+
+    // 1) есть ли вообще заказ
+    const [[anyOrder]] = await db.execute(
+      `SELECT status FROM orders
+       WHERE REPLACE(tgNick,'@','')=?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [invited]
+    );
+
+    // 2) есть ли delivered
+    const [[delivered]] = await db.execute(
+      `SELECT 1 AS ok FROM orders
        WHERE REPLACE(tgNick,'@','')=?
        AND status='delivered'
        LIMIT 1`,
-      [r.username]
+      [invited]
     );
 
-    if (order) {
-      completed++;
-      textMsg += `@${r.username} — ✅ заказ выполнен\n`;
+    if (delivered?.ok) {
+      deliveredCnt++;
+      orderedCnt++; // раз delivered есть, значит заказ точно был
+      msg += `@${invited} — ✅ заказ выполнен\n`;
+    } else if (anyOrder?.status) {
+      orderedCnt++;
+      msg += `@${invited} — 🛒 сделал заказ\n`;
     } else {
-      textMsg += `@${r.username} — ⏳ ещё не заказал\n`;
+      msg += `@${invited} — 👋 запустил бот, заказов нет\n`;
     }
   }
 
-  if (refs.length === 0) {
-    textMsg +=
-      `\nПока вы никого не пригласили.\n\n` +
-      `💡 Пригласите друга и получите скидку *3€*\n` +
-      `после его первого заказа`;
-  } else {
-    textMsg +=
-      `\n💸 *Доступно скидок:*\n` +
-      `• ${completed} заказа со скидкой 3€\n\n` +
-      `📌 Скидка применяется автоматически\n` +
-      `к следующему заказу`;
-  }
+  msg +=
+    `\n📌 Итого:\n` +
+    `👋 Запустили бота: ${refs.length}\n` +
+    `🛒 Сделали заказ: ${orderedCnt}\n` +
+    `✅ Выполнено: ${deliveredCnt}\n\n` +
+    `💸 Скидок 3€ доступно: ${deliveredCnt}\n` +
+    `Скидка применится автоматически к следующему заказу.`;
 
-  await bot.sendMessage(id, textMsg);
+  await bot.sendMessage(id, msg);
   return;
 }
 
@@ -2245,8 +2370,9 @@ if (text === "📊 Мои приглашённые") {
 
 
 
+
 // ===== Личный кабинет (красиво, без Markdown, без слешей) =====
-if (text === "Личный кабинет") {
+if (text === "👤 Личный кабинет") {
   console.log("[DEBUG] Личный кабинет нажали:", { id, username });
 
   try {
@@ -2334,7 +2460,7 @@ if (text === "Личный кабинет") {
 
 
   // ===== Поддержка =====
-if (text === "Поддержка") {
+if (text === "🛟 Поддержка") {
   const kb = {
     inline_keyboard: [
       [{ text: "💬 Написать в поддержку", url: "https://t.me/crazycloud_manager" }],
@@ -2356,7 +2482,7 @@ if (text === "Поддержка") {
 }
 
 // ===== Менюшка =====
-if (text === "Мои заказы") {
+if (text === "🧾 Мои заказы") {
   return bot.sendMessage(id, "Что показать?", {
     reply_markup: {
       keyboard: [
@@ -2930,8 +3056,15 @@ const [[{ cnt: ordersCount }]] = await db.execute(
 
 // 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€
 if (ordersCount === 0 && client?.referrer) {
-  finalPrice = 13;
-  discountType = "first_order";
+  const okRef = await isEligibleReferrer(client.referrer);
+  if (okRef) {
+    finalPrice = 13;
+    discountType = "first_order";
+  } else {
+    // если вдруг кто-то проскочил старым кодом — не даём скидку
+    discountType = null;
+    finalPrice = 15;
+  }
 }
 
 // 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ СКИДКА 3€
@@ -2962,6 +3095,28 @@ console.log("[PRICE]", {
   finalPrice,
   discountType
 });
+
+// ✅ уведомление пригласившему: друг оформил первый заказ (1 раз)
+try {
+  if (discountType === "first_order" && client?.referrer) {
+    const referrerUsername = String(client.referrer).replace(/^@/, "").trim();
+    const details = `friend_order_created:@${cleanUsername}`;
+
+    const already = await hasReferralLog("ref_order_notify", referrerUsername, details);
+    if (!already) {
+      await addReferralLog("ref_order_notify", referrerUsername, details);
+
+      await notifyReferrer(
+        referrerUsername,
+        `🛒 Ваш друг @${cleanUsername} оформил первый заказ.\n` +
+        `Скидка 3€ станет доступна после доставки и применится автоматически.`
+      );
+    }
+  }
+} catch (e) {
+  console.error("[REF ORDER NOTIFY ERROR]", e?.message || e);
+}
+
 
 
     // ===== ГАРАНТИРОВАННО РЕГИСТРИРУЕМ ПОЛЬЗОВАТЕЛЯ =====
