@@ -911,7 +911,7 @@ if (data === "copy_ref_link") {
     return;
   }
 
-  const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
+  const refLink = `https://t.me/crazy_cloud_bot?start=ref_${uname}`;
 
   await bot.answerCallbackQuery(q.id, {
     text: "Ссылка готова 👇",
@@ -2131,7 +2131,7 @@ if (text === "/banned" && id === ADMIN_ID) {
 // ===== 💸 ПОЛУЧИТЬ СКИДКУ (ЭКРАН ОПИСАНИЯ) =====
 if (text === "💸 Получить скидку") {
   const uname = username.replace(/^@/, "");
-  const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
+  const refLink = `https://t.me/crazy_cloud_bot?start=ref_${uname}`;
 
   const msg =
   "👥 Пригласите друга и получите скидку\n\n" +
@@ -2157,26 +2157,8 @@ if (text === "💸 Получить скидку") {
   "📎 Зажмите ссылку и выберите «Копировать»";
 
 
-  // inline-кнопки (действия)
-  const inlineKb = {
-    inline_keyboard: [
-      [{ text: "📎 Показать ссылку", callback_data: "copy_ref_link" }],
-    ]
-  };
-
-  // отправляем основное сообщение
-  await bot.sendMessage(id, msg, {
-  reply_markup: inlineKb
-});
-
-
-  // нижнее меню (кнопка Назад)
-  await bot.sendMessage(id, "⬅️ Вернуться назад", {
-    reply_markup: {
-      keyboard: [[{ text: "Назад" }]],
-      resize_keyboard: true
-    }
-  });
+  // ✅ БЕЗ inline кнопок
+  await bot.sendMessage(id, msg);
 
   return;
 }
@@ -2189,7 +2171,7 @@ if (text === "📊 Мои приглашённые") {
     [uname]
   );
 
-  let textMsg = `👥 *Мои приглашённые*\n\n`;
+  let textMsg = "👥 Мои приглашённые\n\n";
   let completed = 0;
 
   for (const r of refs) {
@@ -2222,7 +2204,7 @@ if (text === "📊 Мои приглашённые") {
       `к следующему заказу`;
   }
 
-  await bot.sendMessage(id, textMsg, { parse_mode: "Markdown" });
+  await bot.sendMessage(id, textMsg);
   return;
 }
 
