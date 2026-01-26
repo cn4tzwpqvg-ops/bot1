@@ -206,6 +206,31 @@ try {
   console.log("База данных и таблицы готовы");
 }
 
+// clients.referral_bonus_locked (резерв бонусов под активные заказы)
+try {
+  await db.execute(
+    "ALTER TABLE clients ADD COLUMN referral_bonus_locked INT DEFAULT 0"
+  );
+  console.log("clients.referral_bonus_locked добавлена");
+} catch (e) {}
+
+// orders.referral_bonus_reserved_qty (сколько бонусов зарезервировано под этот заказ)
+try {
+  await db.execute(
+    "ALTER TABLE orders ADD COLUMN referral_bonus_reserved_qty INT DEFAULT 0"
+  );
+  console.log("orders.referral_bonus_reserved_qty добавлена");
+} catch (e) {}
+
+// orders.referral_bonus_spent (чтобы не списать/не вернуть дважды)
+try {
+  await db.execute(
+    "ALTER TABLE orders ADD COLUMN referral_bonus_spent TINYINT(1) DEFAULT 0"
+  );
+  console.log("orders.referral_bonus_spent добавлена");
+} catch (e) {}
+
+
 
 function escapeMarkdown(text) {
   if (!text) return "";
@@ -322,6 +347,47 @@ async function addReferralLog(type, username, details) {
   );
 }
 
+async function refundReservedBonusIfNeeded(order) {
+  try {
+    if (!order) return;
+
+    const discountType = String(order.discount_type || "");
+    const reservedQty = Number(order.referral_bonus_reserved_qty || 0);
+    const spent = Number(order.referral_bonus_spent || 0);
+
+    // Возвращаем только если это бонус 3€, он был зарезервирован, и ещё не "закреплён"
+    if (discountType !== "referral_bonus") return;
+    if (reservedQty <= 0) return;
+    if (spent === 1) return; // уже закрепили — не возвращаем
+
+    const buyer = String(order.tgNick || "").replace(/^@+/, "").trim();
+    if (!buyer) return;
+
+    // Возврат бонуса клиенту
+    await db.execute(
+      "UPDATE clients SET referral_bonus_available = referral_bonus_available + ? WHERE username=?",
+      [reservedQty, buyer]
+    );
+
+    // Обнуляем резерв на заказе (чтобы второй раз не вернуть)
+    await db.execute(
+      "UPDATE orders SET referral_bonus_reserved_qty=0 WHERE id=?",
+      [order.id]
+    );
+
+    // Лог
+    await db.execute(
+      "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+      ["bonus_refund", buyer, `Возврат ${reservedQty} бонус(ов) 3€ за заказ №${order.id}`]
+    );
+
+    console.log(`[BONUS REFUND] +${reservedQty} для @${buyer} за заказ ${order.id}`);
+  } catch (e) {
+    console.error("[refundReservedBonusIfNeeded] error:", e?.message || e);
+  }
+}
+
+
 async function notifyReferrer(referrerUsername, text) {
   const uname = String(referrerUsername || "").replace(/^@+/, "").trim();
   if (!uname) return;
@@ -385,9 +451,12 @@ async function addOrder(order) {
       client_chat_id,
       original_price,
       final_price,
-      discount_type
+      discount_type,
+      referral_bonus_reserved_qty,
+      referral_bonus_spent
+
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
       tgNick = VALUES(tgNick),
       city = VALUES(city),
@@ -400,7 +469,9 @@ async function addOrder(order) {
       client_chat_id = VALUES(client_chat_id),
       original_price = VALUES(original_price),
       final_price = VALUES(final_price),
-      discount_type = VALUES(discount_type)
+      discount_type = VALUES(discount_type),
+      referral_bonus_reserved_qty = VALUES(referral_bonus_reserved_qty),
+      referral_bonus_spent = VALUES(referral_bonus_spent)
     `,
     [
       order.id,
@@ -416,7 +487,9 @@ async function addOrder(order) {
       order.client_chat_id || null, // ← что пришло — то и пишем
       order.original_price ?? 15,
       order.final_price ?? 15,
-      order.discount_type || null
+      order.discount_type || null,
+      order.referral_bonus_reserved_qty ?? 0,
+      order.referral_bonus_spent ?? 0
     ]
   );
 }
@@ -1212,6 +1285,9 @@ if (data.startsWith("admin_delete_confirm_") && fromId === ADMIN_ID) {
     return;
   }
 
+  // ✅ ВОТ ЭТО ДОБАВЬ (до удаления order из БД)
+  await refundReservedBonusIfNeeded(order);
+
   // 1) удалить сообщения заказа у всех
   const msgs = await getOrderMessages(orderId);
   for (const m of msgs) {
@@ -1493,6 +1569,24 @@ if (data.startsWith("delivered_")) {
     await updateOrderStatus(orderId, "delivered", String(username || "").replace(/^@/, ""));
     const updatedOrder = await getOrderById(orderId);
 
+// ✅ ВОТ СЮДА: закрепляем списание бонуса 3€ при delivered
+try {
+  if (
+    String(updatedOrder.status || "") === "delivered" &&
+    String(updatedOrder.discount_type || "") === "referral_bonus" &&
+    Number(updatedOrder.referral_bonus_reserved_qty || 0) > 0 &&
+    Number(updatedOrder.referral_bonus_spent || 0) === 0
+  ) {
+    await db.execute(
+      "UPDATE orders SET referral_bonus_spent=1 WHERE id=?",
+      [updatedOrder.id]
+    );
+    updatedOrder.referral_bonus_spent = 1;
+  }
+} catch (e) {
+  console.error("[BONUS SPENT MARK ERROR]", e?.message || e);
+}
+
     // ✅ Разблокировать рефералку покупателю после 1 delivered
 try {
   const buyerUsername = updatedOrder.tgNick?.replace(/^@/, "");
@@ -1658,6 +1752,8 @@ if (data.startsWith("cancel_")) {
 );
 
     const updatedOrder = await getOrderById(orderId);
+
+    await refundReservedBonusIfNeeded(updatedOrder)
 
     await sendOrUpdateOrderAll(updatedOrder);
 
@@ -3084,252 +3180,270 @@ async function generateOrderId() {
 
 // ================= API: отправка заказа =================
 app.post("/api/send-order", async (req, res) => {
+  let reservedBonusQty = 0;       // сколько бонусов зарезервировали
+let reservedBonusUser = "";     // кому резервировали (username)
   try {
-    let { tgNick, city, delivery, payment, orderText, date, time, client_chat_id, tgUser } = req.body;
+    let {
+      tgNick,
+      city,
+      delivery,
+      payment,
+      orderText,
+      date,
+      time,
+      client_chat_id,
+      tgUser
+    } = req.body;
 
-// ✅ если сайт не прислал client_chat_id — берём из Telegram WebApp user.id
-if (!client_chat_id && tgUser?.id) {
-  client_chat_id = tgUser.id;
-}
+    // ✅ если сайт не прислал client_chat_id — берём из Telegram WebApp user.id
+    if (!client_chat_id && tgUser?.id) {
+      client_chat_id = tgUser.id;
+    }
 
-// ✅ приводим к числу (Telegram id — число)
-const clientChatIdNum = client_chat_id ? Number(client_chat_id) : null;
+    // ✅ приводим к числу (Telegram id — число)
+    const clientChatIdNum = client_chat_id ? Number(client_chat_id) : null;
 
-console.log("[DEBUG api body]", req.body);
-console.log("[DEBUG api client_chat_id FIXED]", client_chat_id, "=>", clientChatIdNum, "type:", typeof clientChatIdNum);
-
+    console.log("[DEBUG api body]", req.body);
+    console.log(
+      "[DEBUG api client_chat_id FIXED]",
+      client_chat_id,
+      "=>",
+      clientChatIdNum,
+      "type:",
+      typeof clientChatIdNum
+    );
 
     // ===== ПРОВЕРКА ВХОДНЫХ ДАННЫХ =====
-   if (!tgNick || !orderText) {
-  console.log("❌ Ошибка: неполные данные", req.body);
-  return res.status(400).json({ success: false, error: "INVALID_DATA" });
-}
+    if (!tgNick || !orderText) {
+      console.log("❌ Ошибка: неполные данные", req.body);
+      return res.status(400).json({ success: false, error: "INVALID_DATA" });
+    }
 
-    const cleanUsername = tgNick.replace(/^@/, "");
+    const cleanUsername = String(tgNick).replace(/^@+/, "").trim();
 
     console.log(`Новый заказ через API от ${cleanUsername}`);
-    console.log(`Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`);
+    console.log(
+      `Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`
+    );
 
     // ===== ЦЕНА И СКИДКИ =====
-let originalPrice = 15;
-let finalPrice = 15;
-let discountType = null;
+    let originalPrice = 15;
+    let finalPrice = 15;
+    let discountType = null;
 
-// получаем клиента
-const client = await getClient(cleanUsername);
+    // получаем клиента
+    const client = await getClient(cleanUsername);
 
-// считаем сколько заказов уже было
-const [[{ cnt: ordersCount }]] = await db.execute(
-  "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=?",
-  [cleanUsername]
+    // считаем сколько заказов уже было
+    const [[{ cnt: ordersCount }]] = await db.execute(
+      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=?",
+      [cleanUsername]
+    );
+
+    // 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€
+    if (ordersCount === 0 && client?.referrer) {
+      const okRef = await isEligibleReferrer(client.referrer);
+      if (okRef) {
+        finalPrice = 13;
+        discountType = "first_order";
+      } else {
+        discountType = null;
+        finalPrice = 15;
+      }
+    }
+    // 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ СКИДКА 3€ → РЕЗЕРВИРУЕМ (НЕ “СЖИГАЕМ” НАВСЕГДА)
+    else if (Number(client?.referral_bonus_available || 0) > 0) {
+      finalPrice = 12;
+      discountType = "referral_bonus";
+      reservedBonusQty = 1;
+
+const [resv] = await db.execute(
+  "UPDATE clients SET referral_bonus_available = referral_bonus_available - ? WHERE username=? AND referral_bonus_available >= ?",
+  [reservedBonusQty, cleanUsername, reservedBonusQty]
 );
 
-// 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€
-if (ordersCount === 0 && client?.referrer) {
-  const okRef = await isEligibleReferrer(client.referrer);
-  if (okRef) {
-    finalPrice = 13;
-    discountType = "first_order";
-  } else {
-    // если вдруг кто-то проскочил старым кодом — не даём скидку
-    discountType = null;
-    finalPrice = 15;
-  }
-}
+if (resv.affectedRows !== 1) {
+  finalPrice = 15;
+  discountType = null;
+  reservedBonusQty = 0;
+} else {
+  reservedBonusUser = cleanUsername; // ✅ теперь catch сможет вернуть
 
-// 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ СКИДКА 3€
-else if (client?.referral_bonus_available > 0) {
-  finalPrice = 12;
-  discountType = "referral_bonus";
-
-  // списываем ОДНУ скидку
-  await db.execute(
-    "UPDATE clients SET referral_bonus_available = referral_bonus_available - 1 WHERE username=?",
-    [cleanUsername]
-  );
-
-  // 🚨 ЛОГ ИСПОЛЬЗОВАНИЯ СКИДКИ
   await db.execute(
     "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
-    [
-      "use_bonus",
-      cleanUsername,
-      "Использована скидка 3€ (реферальный бонус)"
-    ]
+    ["reserve_bonus", cleanUsername, "Зарезервирована скидка 3€ (реферальный бонус)"]
   );
 }
-
-console.log("[PRICE]", {
-  user: cleanUsername,
-  originalPrice,
-  finalPrice,
-  discountType
-});
-
-// ✅ уведомление пригласившему: друг оформил первый заказ (1 раз)
-try {
-  if (discountType === "first_order" && client?.referrer) {
-    const referrerUsername = String(client.referrer).replace(/^@/, "").trim();
-    const details = `friend_order_created:@${cleanUsername}`;
-
-    const already = await hasReferralLog("ref_order_notify", referrerUsername, details);
-    if (!already) {
-      await addReferralLog("ref_order_notify", referrerUsername, details);
-
-      await notifyReferrer(
-        referrerUsername,
-        `🛒 Ваш друг @${cleanUsername} оформил первый заказ.\n` +
-        `Скидка 3€ станет доступна после доставки и применится автоматически.`
-      );
     }
-  }
-} catch (e) {
-  console.error("[REF ORDER NOTIFY ERROR]", e?.message || e);
-}
 
+    console.log("[PRICE]", {
+      user: cleanUsername,
+      originalPrice,
+      finalPrice,
+      discountType,
+      reservedBonusQty
+    });
 
+    // ✅ уведомление пригласившему: друг оформил первый заказ (1 раз)
+    try {
+      if (discountType === "first_order" && client?.referrer) {
+        const referrerUsername = String(client.referrer).replace(/^@+/, "").trim();
+        const details = `friend_order_created:@${cleanUsername}`;
+
+        const already = await hasReferralLog("ref_order_notify", referrerUsername, details);
+        if (!already) {
+          await addReferralLog("ref_order_notify", referrerUsername, details);
+
+          await notifyReferrer(
+            referrerUsername,
+            `🛒 Ваш друг @${cleanUsername} оформил первый заказ.\n` +
+              `Скидка 3€ станет доступна после доставки и применится автоматически.`
+          );
+        }
+      }
+    } catch (e) {
+      console.error("[REF ORDER NOTIFY ERROR]", e?.message || e);
+    }
 
     // ===== ГАРАНТИРОВАННО РЕГИСТРИРУЕМ ПОЛЬЗОВАТЕЛЯ =====
-await db.execute(`
-  INSERT INTO clients (chat_id, username, banned)
-  VALUES (?, ?, 0)
-  ON DUPLICATE KEY UPDATE
-    chat_id = VALUES(chat_id),
-    username = VALUES(username)
-`, [clientChatIdNum, cleanUsername]);
+    await db.execute(
+      `
+      INSERT INTO clients (chat_id, username, banned)
+      VALUES (?, ?, 0)
+      ON DUPLICATE KEY UPDATE
+        chat_id = VALUES(chat_id),
+        username = VALUES(username)
+      `,
+      [clientChatIdNum, cleanUsername]
+    );
 
- // ===== ПРОВЕРКА БАНА =====
-let banned = false;
+    // ===== ПРОВЕРКА БАНА =====
+    let banned = false;
 
-// Сначала проверяем по chat_id, если есть
-if (client_chat_id) {
-  const [rows] = await db.execute(
-    "SELECT banned FROM clients WHERE chat_id = ? LIMIT 1",
-    [client_chat_id]
-  );
-  if (rows.length && rows[0].banned === 1) banned = true;
-}
+    if (clientChatIdNum) {
+      const [rows] = await db.execute(
+        "SELECT banned FROM clients WHERE chat_id = ? LIMIT 1",
+        [clientChatIdNum]
+      );
+      if (rows.length && Number(rows[0].banned) === 1) banned = true;
+    }
 
-// Если chat_id нет или не найден — проверяем по username
-if (!banned) {
-  const [rows2] = await db.execute(
-    "SELECT banned FROM clients WHERE username = ? LIMIT 1",
-    [cleanUsername]
-  );
-  if (rows2.length && rows2[0].banned === 1) banned = true;
-}
+    if (!banned) {
+      const [rows2] = await db.execute(
+        "SELECT banned FROM clients WHERE username = ? LIMIT 1",
+        [cleanUsername]
+      );
+      if (rows2.length && Number(rows2[0].banned) === 1) banned = true;
+    }
 
-if (banned) {
-  console.log(`⛔ Заблокированный пользователь ${cleanUsername} (${client_chat_id || "no chat_id"})`);
-  return res.json({
-    success: false,
-    error: "USER_BANNED",
-    message: "Вы заблокированы и не можете создавать заказы"
-  });
-}
+    if (banned) {
+      console.log(
+        `⛔ Заблокированный пользователь ${cleanUsername} (${clientChatIdNum || "no chat_id"})`
+      );
 
+      // ✅ если был резерв бонуса — вернём сразу (на всякий)
+      if (reservedBonusQty > 0) {
+        await db.execute(
+          "UPDATE clients SET referral_bonus_available = referral_bonus_available + ? WHERE username=?",
+          [reservedBonusQty, cleanUsername]
+        );
+        await db.execute(
+          "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+          ["bonus_return_banned", cleanUsername, "Возврат зарезервированной скидки 3€ (пользователь забанен)"]
+        );
+      }
 
-    // ===== Проверка существующего заказа =====
-    // ✅ Всегда создаём новый заказ (иначе ловим старые delivered и “ничего не приходит”)
-const id = await generateOrderId();
-console.log(`Присвоен новый ID заказа: ${id}`);
+      return res.json({
+        success: false,
+        error: "USER_BANNED",
+        message: "Вы заблокированы и не можете создавать заказы"
+      });
+    }
 
+    // ===== Всегда создаём новый заказ =====
+    const id = await generateOrderId();
+    console.log(`Присвоен новый ID заказа: ${id}`);
 
     const order = {
-  id,
-  tgNick: cleanUsername,
-  city,
-  delivery,
-  payment,
-  orderText,
-  date,
-  time,
-  status: "new",
-  client_chat_id: clientChatIdNum,
-  original_price: originalPrice,
-  final_price: finalPrice,
-  discount_type: discountType
-};
+      id,
+      tgNick: cleanUsername,
+      city,
+      delivery,
+      payment,
+      orderText,
+      date,
+      time,
+      status: "new",
+      client_chat_id: clientChatIdNum,
+      original_price: originalPrice,
+      final_price: finalPrice,
+      discount_type: discountType,
 
+      // ✅ для возврата при отмене/удалении
+      referral_bonus_reserved_qty: reservedBonusQty,
+      referral_bonus_spent: 0
+    };
 
- // ===== Проверка существующего заказа =====
-const exists = await getOrderById(id);
+    // ===== Добавляем заказ в базу =====
+    await addOrder(order);
+    console.log(`Заказ ${id} добавлен в базу`);
 
-if (!exists) {
-  // ===== Добавляем заказ в базу, если его ещё нет =====
-  await addOrder(order);
-  console.log(`Заказ ${id} добавлен в базу`);
+    // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа (как у тебя)
+    if (clientChatIdNum) {
+      await db.execute(
+        "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+        [clientChatIdNum, id]
+      );
 
-  // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа
-  if (clientChatIdNum) {
-    await db.execute(
-      "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-      [clientChatIdNum, id]
-    );
-  }
-} else {
-  console.log(`Заказ ${id} уже в базе, пропускаем добавление`);
-}
+      if (clientChatIdNum) {
+        await db.execute(
+          "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+          [clientChatIdNum, id]
+        );
+      }
+    } else {
+      console.log(`Заказ ${id} без client_chat_id (сайт/вебапп не прислал)`);
+    }
 
-// ===== Получаем заказ из базы =====
-const updated = await getOrderById(id);
+    // ===== Получаем заказ из базы =====
+    const updated = await getOrderById(id);
 
-// ✅ тест: принудительно слать новым сообщением всем (сброс message_id)
-await clearOrderMessage(updated.id, ADMIN_ID);
+    // ✅ тест: принудительно слать новым сообщением всем (сброс message_id)
+    await clearOrderMessage(updated.id, ADMIN_ID);
 
-// ===== Отправляем уведомления в Telegram =====
-await sendOrUpdateOrderAll(updated);
-console.log(`Уведомления отправлены для заказа ${id}`);
+    // ===== Отправляем уведомления в Telegram =====
+    await sendOrUpdateOrderAll(updated);
+    console.log(`Уведомления отправлены для заказа ${id}`);
 
-// ===== WebSocket: обновление stock =====
-broadcastStock();
-console.log(`WebSocket: отправлено обновление stock`);
+    // ===== WebSocket: обновление stock =====
+    broadcastStock();
+    console.log(`WebSocket: отправлено обновление stock`);
 
-return res.json({ success: true, orderId: id });
-
-} catch (err) {
+    return res.json({ success: true, orderId: id });
+ } catch (err) {
   console.error("Ошибка при обработке /api/send-order:", err);
+
+  // ✅ ВОТ ЭТО ДОБАВЬ: возврат зарезервированного бонуса, если упали после резерва
+  try {
+    if (reservedBonusQty > 0 && reservedBonusUser) {
+      await db.execute(
+        "UPDATE clients SET referral_bonus_available = referral_bonus_available + ? WHERE username=?",
+        [reservedBonusQty, reservedBonusUser]
+      );
+
+      await db.execute(
+        "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+        ["bonus_return_error", reservedBonusUser, "Возврат зарезервированной скидки 3€ из-за ошибки API"]
+      );
+    }
+  } catch (e) {
+    console.error("[BONUS RETURN IN CATCH ERROR]", e?.message || e);
+  }
+
   return res.status(500).json({ success: false, error: "Внутренняя ошибка сервера" });
 }
 });
 
-
-
-
-// ================= Фикс зависших заказов =================
-app.post("/fix-all-new-orders", async (req, res) => {
-  try {
-    // Получаем все заказы со статусом "new"
-    const [orders] = await db.execute("SELECT * FROM orders WHERE status='new'");
-
-    if (orders.length === 0) {
-      console.log("Нет новых заказов для исправления.");
-      return res.send("Нет новых заказов для исправления.");
-    }
-
-    let successCount = 0;
-
-    for (const order of orders) {
-      try {
-        // Повторная отправка уведомлений в Telegram
-        await sendOrUpdateOrderAll(order);
-        console.log(`Заказ #${order.id} успешно обновлен`);
-        successCount++;
-      } catch (err) {
-        console.error(`Ошибка при обновлении заказа #${order.id}:`, err.message);
-      }
-    }
-
-    // Можно также отправить обновление stock после всех исправлений
-    broadcastStock();
-    console.log("WebSocket: обновлено состояние stock после фикса");
-
-    res.send(`Обновлено ${successCount} из ${orders.length} заказ(ов). Кнопки теперь должны появиться.`);
-  } catch (err) {
-    console.error("Ошибка сервера при исправлении заказов:", err);
-    res.status(500).send("Ошибка сервера при исправлении заказов");
-  }
-});
 
 
 
