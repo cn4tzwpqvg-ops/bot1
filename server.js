@@ -270,15 +270,7 @@ function parseDateForMySQL(dateStr) {
 }
 
 // ================= Заказы =================
-
 async function addOrder(order) {
-  // Получаем chat_id клиента по tgNick, если отсутствует
-  if (!order.client_chat_id) {
-    const cleanNick = order.tgNick.replace(/^@+/, "");
-    const client = await getClient(cleanNick);
-    if (client?.chat_id) order.client_chat_id = client.chat_id;
-  }
-
   const now = new Date();
   const mysqlDate = order.date ? parseDateForMySQL(order.date) : formatMySQLDate(now);
 
@@ -290,58 +282,59 @@ async function addOrder(order) {
 
   const createdAt = formatMySQLDateTime(now);
 
- // Вставляем или обновляем заказ
-await db.execute(
-  `
-  INSERT INTO orders (
-    id,
-    tgNick,
-    city,
-    delivery,
-    payment,
-    orderText,
-    date,
-    time,
-    status,
-    created_at,
-    client_chat_id,
-    original_price,
-    final_price,
-    discount_type
-  )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  ON DUPLICATE KEY UPDATE
-    tgNick = VALUES(tgNick),
-    city = VALUES(city),
-    delivery = VALUES(delivery),
-    payment = VALUES(payment),
-    orderText = VALUES(orderText),
-    date = VALUES(date),
-    time = VALUES(time),
-    status = VALUES(status),
-    client_chat_id = VALUES(client_chat_id),
-    original_price = VALUES(original_price),
-    final_price = VALUES(final_price),
-    discount_type = VALUES(discount_type)
-  `,
-  [
-    order.id,
-    order.tgNick,
-    order.city,
-    order.delivery,
-    order.payment,
-    order.orderText,
-    mysqlDate,
-    mysqlTime,
-    order.status || "new",
-    createdAt,
-    order.client_chat_id || null,
-    order.original_price ?? 15,
-    order.final_price ?? 15,
-    order.discount_type || null
-  ]
-);
+  // Вставляем или обновляем заказ
+  await db.execute(
+    `
+    INSERT INTO orders (
+      id,
+      tgNick,
+      city,
+      delivery,
+      payment,
+      orderText,
+      date,
+      time,
+      status,
+      created_at,
+      client_chat_id,
+      original_price,
+      final_price,
+      discount_type
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      tgNick = VALUES(tgNick),
+      city = VALUES(city),
+      delivery = VALUES(delivery),
+      payment = VALUES(payment),
+      orderText = VALUES(orderText),
+      date = VALUES(date),
+      time = VALUES(time),
+      status = VALUES(status),
+      client_chat_id = VALUES(client_chat_id),
+      original_price = VALUES(original_price),
+      final_price = VALUES(final_price),
+      discount_type = VALUES(discount_type)
+    `,
+    [
+      order.id,
+      order.tgNick,
+      order.city,
+      order.delivery,
+      order.payment,
+      order.orderText,
+      mysqlDate,
+      mysqlTime,
+      order.status || "new",
+      createdAt,
+      order.client_chat_id || null, // ← что пришло — то и пишем
+      order.original_price ?? 15,
+      order.final_price ?? 15,
+      order.discount_type || null
+    ]
+  );
 }
+
 
 
 
@@ -659,29 +652,6 @@ async function sendOrUpdateOrderAll(order) {
     }
   }
 
-  // ✅ Если client_chat_id пустой — пытаемся найти по tgNick и сохранить в orders
-if (!order.client_chat_id && order.tgNick) {
-  try {
-    const cleanNick = String(order.tgNick).replace(/^@+/, "").trim();
-    const client = await getClient(cleanNick);
-
-    if (client?.chat_id) {
-      order.client_chat_id = client.chat_id;
-
-      await db.execute(
-        "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-        [client.chat_id, order.id]
-      );
-
-      console.log("[DEBUG] resolved client_chat_id from clients:", client.chat_id, "for", cleanNick);
-    }
-  } catch (e) {
-    console.error("[sendOrUpdateOrderAll] resolve client_chat_id error:", e?.message || e);
-  }
-}
-
-
-
   // Клиент
   if (order.client_chat_id) {
     recipientsMap.set(order.client_chat_id, {
@@ -751,54 +721,31 @@ async function hasReviewForOrder(orderId) {
 
 async function askForReview(order) {
   if (!order) return;
-
-  // ✅ Если client_chat_id пустой — пробуем достать по tgNick из clients
-  if (!order.client_chat_id && order.tgNick) {
-    try {
-      const cleanNick = String(order.tgNick).replace(/^@+/, "").trim();
-      const client = await getClient(cleanNick);
-
-      if (client?.chat_id) {
-        order.client_chat_id = client.chat_id;
-
-        // ✅ сохраняем в заказ (чтобы потом всегда было)
-        await db.execute(
-          "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-          [client.chat_id, order.id]
-        );
-      }
-    } catch (e) {
-      console.error("[askForReview] lookup client_chat_id error:", e?.message || e);
-    }
-  }
-
-  // если так и не нашли chat_id — выходим
   if (!order.client_chat_id) return;
 
   const orderId = String(order.id);
   const clientId = order.client_chat_id;
 
-  // 1) не спрашиваем, если отзыв по заказу уже есть
   const already = await hasReviewForOrder(orderId);
   if (already) return;
 
-  // 2) не спрашиваем второй раз, если уже ждём отзыв от этого клиента
-// но если ждём по другому заказу — сбрасываем и спрашиваем заново
-if (waitingReview.has(clientId)) {
-  const cur = waitingReview.get(clientId);
-  if (cur && String(cur.orderId) !== String(orderId)) {
-    waitingReview.delete(clientId);
-  } else {
-    return;
+  if (waitingReview.has(clientId)) {
+    const cur = waitingReview.get(clientId);
+    if (cur && String(cur.orderId) !== orderId) {
+      waitingReview.delete(clientId);
+    } else {
+      return;
+    }
   }
-}
 
-
-  // сохраняем состояние ожидания
   waitingReview.set(clientId, {
     orderId,
-    courier: order.courier_username ? `@${String(order.courier_username).replace(/^@/, "")}` : "—",
-    client: order.tgNick ? `@${String(order.tgNick).replace(/^@/, "")}` : "—",
+    courier: order.courier_username
+      ? `@${String(order.courier_username).replace(/^@/, "")}`
+      : "—",
+    client: order.tgNick
+      ? `@${String(order.tgNick).replace(/^@/, "")}`
+      : "—",
     rating: null
   });
 
@@ -818,21 +765,19 @@ if (waitingReview.has(clientId)) {
   const courier = order.courier_username ? withAt(order.courier_username) : "—";
 
   try {
-  const courier = order.courier_username ? withAt(order.courier_username) : "—";
+    await bot.sendMessage(
+      clientId,
+      `✅ Заказ №${orderId} доставлен.\n` +
+        `🚚 Курьер: ${courier}\n\n` +
+        `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
+        `Если не хотите — нажмите «Пропустить».`,
+      { reply_markup: kb }
+    );
 
-  await bot.sendMessage(
-    clientId,
-    `✅ Заказ №${orderId} доставлен.\n` +
-      `🚚 Курьер: ${courier}\n\n` +
-      `Поставьте оценку (1–5) и (по желанию) напишите отзыв.\n` +
-      `Если не хотите — нажмите «Пропустить».`,
-    { reply_markup: kb }
-  );
-
-  console.log("[DEBUG] review request sent to client:", clientId, "order:", orderId);
-} catch (e) {
-  console.error("[ERROR] cannot send review request:", e?.message || e, { clientId, orderId });
-}
+    console.log("[DEBUG] review request sent to client:", clientId, "order:", orderId);
+  } catch (e) {
+    console.error("[ERROR] cannot send review request:", e?.message || e, { clientId, orderId });
+  }
 }
 
 
@@ -974,11 +919,11 @@ if (data === "copy_ref_link") {
   });
 
   await bot.sendMessage(
-    id,
-    `🔗 *Ваша реферальная ссылка:*\n\n${refLink}\n\n` +
-    `📎 *Зажмите ссылку и выберите «Копировать»*`,
-    { parse_mode: "Markdown" }
-  );
+  fromId,
+  `🔗 *Ваша реферальная ссылка:*\n\n${refLink}\n\n📎 *Зажмите ссылку и выберите «Копировать»*`,
+  { parse_mode: "Markdown" }
+);
+
 
   return;
 }
@@ -1737,9 +1682,10 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
       }
     ],
     [{ text: "💸 Получить скидку" }],
-    [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-    [{ text: "Мои заказы" }]
-  ];
+  [{ text: "📊 Мои приглашённые" }], // ✅ ВОТ СЮДА
+  [{ text: "Личный кабинет" }, { text: "Поддержка" }],
+  [{ text: "Мои заказы" }]
+];
       console.log(`Пользователь @${username} видит обычное меню`);
     }
 
@@ -2188,44 +2134,44 @@ if (text === "💸 Получить скидку") {
   const refLink = `https://t.me/${process.env.BOT_USERNAME}?start=ref_${uname}`;
 
   const msg =
-    `👥 *Пригласите друга и получите скидку*\n\n` +
+  "👥 Пригласите друга и получите скидку\n\n" +
 
-    `🎁 *Что получает друг:*\n` +
-    `• скидка *2€* на первый заказ\n\n` +
+  "🎁 Что получает друг:\n" +
+  "• скидка 2€ на первый заказ\n\n" +
 
-    `💸 *Что получаете вы:*\n` +
-    `• скидка *3€* на следующий заказ\n\n` +
+  "💸 Что получаете вы:\n" +
+  "• скидка 3€ на следующий заказ\n\n" +
 
-    `📌 *Как это работает:*\n` +
-    `1️⃣ Вы отправляете другу ссылку\n` +
-    `2️⃣ Друг делает заказ со скидкой 2€\n` +
-    `3️⃣ После выполненного заказа вам начисляется скидка 3€\n\n` +
+  "📌 Как это работает:\n" +
+  "1️⃣ Вы отправляете другу ссылку\n" +
+  "2️⃣ Друг делает заказ со скидкой 2€\n" +
+  "3️⃣ После выполненного заказа вам начисляется скидка 3€\n\n" +
 
-    `⚠️ *Важно:*\n` +
-    `• скидка начисляется *только после заказа друга*\n` +
-    `• 1 друг = 1 скидка\n` +
-    `• скидки не суммируются\n\n` +
+  "⚠️ Важно:\n" +
+  "• скидка начисляется только после заказа друга\n" +
+  "• 1 друг = 1 скидка\n" +
+  "• скидки не суммируются\n\n" +
 
-    `🔗 *Ваша реферальная ссылка:*\n` +
-    `${refLink}\n\n` +
-    `📎 Зажмите ссылку и выберите «Копировать»`;
+  "🔗 Ваша реферальная ссылка:\n" +
+  refLink + "\n\n" +
+  "📎 Зажмите ссылку и выберите «Копировать»";
+
 
   // inline-кнопки (действия)
   const inlineKb = {
     inline_keyboard: [
       [{ text: "📎 Показать ссылку", callback_data: "copy_ref_link" }],
-      [{ text: "📊 Мои приглашённые", callback_data: "my_ref_stats" }]
     ]
   };
 
   // отправляем основное сообщение
-  await bot.sendMessage(fromId, msg, {
-    parse_mode: "Markdown",
-    reply_markup: inlineKb
-  });
+  await bot.sendMessage(id, msg, {
+  reply_markup: inlineKb
+});
+
 
   // нижнее меню (кнопка Назад)
-  await bot.sendMessage(fromId, "⬅️ Вернуться назад", {
+  await bot.sendMessage(id, "⬅️ Вернуться назад", {
     reply_markup: {
       keyboard: [[{ text: "Назад" }]],
       resize_keyboard: true
@@ -2276,7 +2222,7 @@ if (text === "📊 Мои приглашённые") {
       `к следующему заказу`;
   }
 
-  await bot.sendMessage(fromId, textMsg, { parse_mode: "Markdown" });
+  await bot.sendMessage(id, textMsg, { parse_mode: "Markdown" });
   return;
 }
 
