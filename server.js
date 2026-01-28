@@ -10,6 +10,60 @@ const WebSocket = require("ws");
 // ================= Новая функция: рассылка и обновление с лимитом =================
 const pLimit = require("p-limit").default; // убедиться, что установлен npm install p-limit
 
+const MINI_APP_URL = "https://cn4tzwpqvg-ops.github.io/crazycloud/";
+
+const referralText =
+  "🎉 *Вас пригласил друг!*\n\n" +
+  "Как новому клиенту вам доступна скидка *2€* на первый заказ.\n\n" +
+  "Нажмите кнопку *«КУПИТЬ ЖИЖУ»* — скидка применится автоматически 👇";
+
+const discountMenuText =
+  "💸 *Скидки и приглашения*\n\n" +
+  "Приглашайте друзей и получайте *2€* скидки на заказы 👇";
+
+const discountMenuKeyboard = {
+  keyboard: [
+    [{ text: "👥 Мои приглашённые" }],
+    [{ text: "🔗 Моя реферальная ссылка" }],
+    [{ text: "⬅️ Назад в меню" }]
+  ],
+  resize_keyboard: true
+};
+
+const mainMenuKeyboard = {
+  keyboard: [
+    [{ text: "🛒 КУПИТЬ ЖИЖУ", web_app: { url: MINI_APP_URL } }],
+    [{ text: "💸 Получить скидку" }],
+    [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+    [{ text: "🧾 Мои заказы" }]
+  ],
+  resize_keyboard: true
+};
+
+const courierStartKeyboard = {
+  keyboard: [
+    [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+    [{ text: "Панель курьера" }],
+    [{ text: "⬅️ Назад" }]
+  ],
+  resize_keyboard: true
+};
+
+const adminStartKeyboard = {
+  keyboard: [
+    [{ text: "Статистика" }, { text: "Курьеры" }],
+    [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+    [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+    [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
+    [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+    [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+    [{ text: "Рассылка" }],
+    [{ text: "⬅️ Назад" }]
+  ],
+  resize_keyboard: true
+};
+
+
 
 
 // ================= Настройки1 =================
@@ -376,7 +430,7 @@ async function refundReservedBonusIfNeeded(order) {
     // Лог
     await db.execute(
       "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
-      ["bonus_refund", buyer, `Возврат ${reservedQty} бонус(ов) 3€ за заказ №${order.id}`]
+      ["bonus_refund", buyer, `Возврат ${reservedQty} бонус(ов) 2€ за заказ №${order.id}`]
     );
 
     console.log(`[BONUS REFUND] +${reservedQty} для @${buyer} за заказ ${order.id}`);
@@ -675,11 +729,11 @@ function buildOrderMessage(order) {
       lines.push(`💸 Цена: ${order.final_price}€ (вместо ${order.original_price}€)`);
 
       if (order.discount_type === "first_order") {
-        lines.push("🎁 Скидка применена: первый заказ по приглашению");
-      }
-      if (order.discount_type === "referral_bonus") {
-        lines.push("🎁 Скидка применена: бонус за приглашённого друга");
-      }
+  lines.push("🎁 Скидка применена: первый заказ по реферальной ссылке");
+}
+if (order.discount_type === "referral_bonus") {
+  lines.push("🎁 Скидка применена: скидка за приглашённого друга");
+}
     } else {
       lines.push(`💸 Цена: ${order.original_price}€`);
     }
@@ -1639,7 +1693,7 @@ try {
               // уведомление пригласившему
               await notifyReferrer(
                 referrerUsername,
-                `✅ Друг @${buyerUsername} сделал первый заказ.\nСкидка 3€ применится автоматически к вашему следующему заказу.`
+                `✅ Друг @${buyerUsername} сделал первый заказ.\nСкидка 2€ применится автоматически к вашему следующему заказу.`
               );
             } else {
               console.log(`[REFERRAL BONUS] SKIP duplicate for @${referrerUsername} | ${details}`);
@@ -1811,30 +1865,25 @@ if (oldCourierUsername) {
   }
 });
 
-
-// ================== /start и меню =================
-// ... остальной код меню, панель курьера, админка, рассылки и API без изменений
-
-
 // ================== /start ==================
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const id = msg.from.id;
-  const username = msg.from.username; // ❗ ТОЛЬКО реальный username
+  const username = msg.from.username; // ❗ только реальный username
   const first_name = msg.from.first_name || "";
-  const ref = match?.[1]; // например ref_username
+  const ref = match?.[1]; // например "ref_username"
 
   // 🚫 ЕСЛИ НЕТ USERNAME — СТОП
   if (!username) {
     await bot.sendMessage(
       id,
       "❗ Для работы с ботом нужен Telegram-ник (username)\n\n" +
-      "Он используется для:\n" +
-      "• оформления заказов\n" +
-      "• реферальной программы\n" +
-      "• связи с курьером\n\n" +
-      "👉 Как включить ник:\n" +
-      "Telegram → Настройки → Имя пользователя\n\n" +
-      "После установки ника нажмите /start"
+        "Он используется для:\n" +
+        "• оформления заказов\n" +
+        "• реферальной программы\n" +
+        "• связи с курьером\n\n" +
+        "👉 Как включить ник:\n" +
+        "Telegram → Настройки → Имя пользователя\n\n" +
+        "После установки ника нажмите /start"
     );
     return;
   }
@@ -1844,76 +1893,17 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   try {
     // Проверяем, новый ли пользователь
     const [existing] = await db.execute(
-      "SELECT id, referrer FROM clients WHERE username=?",
+      "SELECT id FROM clients WHERE username=?",
       [username]
     );
     const isNew = existing.length === 0;
 
-    // Сохраняем или обновляем клиента
+    // Сохраняем/обновляем клиента
     await addOrUpdateClient(username, first_name, id);
     console.log(`Клиент @${username} добавлен/обновлён в базе`);
 
- // ===== РЕФЕРАЛ + УВЕДОМЛЕНИЕ ПРИГЛАСИВШЕМУ (С ЗАЩИТОЙ) =====
-if (isNew && ref && ref.startsWith("ref_")) {
-  const referrer = ref.replace("ref_", "").replace(/^@/, "").trim();
-  const me = String(username || "").replace(/^@/, "").trim();
-
-  // 0) самореф
-  if (referrer === me) {
-    await addReferralLog("self_referral", me, "Попытка самореферала");
-  } else {
-    // 1) реферер должен существовать
-    const refClient = await getClient(referrer);
-
-    // 2) и иметь хотя бы 1 delivered
-    const eligible = refClient && await isEligibleReferrer(referrer);
-
-    if (!eligible) {
-      await addReferralLog(
-        "referrer_not_eligible",
-        referrer || "unknown",
-        `Попытка рефералки для @${me} (реферер без delivered)`
-      );
-    } else {
-      // 3) привязываем реферера
-      await db.execute(
-        "UPDATE clients SET referrer=? WHERE username=?",
-        [referrer, me]
-      );
-
-      // 4) новый юзер пришёл по рефке → блокируем ему приглашения пока не сделает delivered
-      await db.execute(
-        "UPDATE clients SET referrals_locked=1 WHERE username=?",
-        [me]
-      );
-
-      // 5) уведомление рефереру 1 раз
-      try {
-        const details = `friend_started:@${me}`;
-        const already = await hasReferralLog("ref_start_notify", referrer, details);
-
-        if (!already) {
-          await addReferralLog("ref_start_notify", referrer, details);
-
-          await notifyReferrer(
-            referrer,
-            `👋 Ваш друг @${me} запустил бота по вашей ссылке.\n` +
-            `Если он сделает первый заказ, вам будет доступна скидка 3€ (автоматически).`
-          );
-        }
-      } catch (e) {
-        console.error("[REF START NOTIFY ERROR]", e?.message || e);
-      }
-    }
-  }
-}
-
-
-
-
-
-    // ===== КУРЬЕР =====
-    if (await isCourier(username)) {
+    // ===== Если это курьер — обновим chat_id (как у тебя было) =====
+    if (isCourier(username)) {
       await db.execute(
         `INSERT INTO couriers (username, chat_id)
          VALUES (?, ?)
@@ -1924,53 +1914,120 @@ if (isNew && ref && ref.startsWith("ref_")) {
       console.log(`Курьер @${username} добавлен/обновлён, chat_id: ${id}`);
     }
 
-    // ===== МЕНЮ =====
-let welcomeText =
-  "👋 Добро пожаловать!\n\n" +
-  "🛒 Оформляйте заказы прямо в боте\n" +
-  "🚚 Доставка по вашему городу в день заказа\n\n" +
-  "💸 Скидка до 5€ на заказ — забирайте в разделе «Получить скидку».\n\n" +
-  "⭐ Отзывы клиентов: https://t.me/crazy_cloud_reviews\n\n" +
-  "Чтобы оформить заказ, нажмите «Открыть магазин» 👇";
-    let keyboard = [];
+    // ===== РЕФЕРАЛ (привязываем только если реально принят) =====
+    let referralAccepted = false;
 
+    if (isNew && ref && ref.startsWith("ref_")) {
+      const referrer = ref.replace("ref_", "").replace(/^@/, "").trim();
+      const me = String(username || "").replace(/^@/, "").trim();
+
+      // самореф
+      if (referrer === me) {
+        await addReferralLog("self_referral", me, "Попытка самореферала");
+      } else {
+        const refClient = await getClient(referrer);
+        const eligible = refClient && (await isEligibleReferrer(referrer));
+
+        if (!eligible) {
+          await addReferralLog(
+            "referrer_not_eligible",
+            referrer || "unknown",
+            `Попытка рефералки для @${me} (реферер без delivered)`
+          );
+        } else {
+          // привязываем реферера
+          await db.execute(
+            "UPDATE clients SET referrer=? WHERE username=?",
+            [referrer, me]
+          );
+
+          // новый пришёл по рефке -> блокируем ему приглашения, пока не будет delivered
+          await db.execute(
+            "UPDATE clients SET referrals_locked=1 WHERE username=?",
+            [me]
+          );
+
+          referralAccepted = true;
+
+          // уведомление рефереру 1 раз
+          try {
+            const details = `friend_started:@${me}`;
+            const already = await hasReferralLog("ref_start_notify", referrer, details);
+
+            if (!already) {
+              await addReferralLog("ref_start_notify", referrer, details);
+              await notifyReferrer(
+                referrer,
+                `👋 Ваш друг @${me} запустил бота по вашей ссылке.\n` +
+                  `Если он сделает первый заказ, вам будет доступна скидка 2€ (автоматически).`
+              );
+            }
+          } catch (e) {
+            console.error("[REF START NOTIFY ERROR]", e?.message || e);
+          }
+        }
+      }
+    }
+
+    // ===== ТЕКСТ ПРИВЕТСТВИЯ (1 основное сообщение) =====
+    let welcomeText =
+      "👋 Добро пожаловать в *CRAZY CLOUD!*\n\n" +
+      "🛒 Заказывайте жидкости прямо в боте\n" +
+      "🚚 Доставка по вашему городу в день заказа\n\n" +
+      "⭐ Отзывы клиентов:\nhttps://t.me/crazy_cloud_reviews\n\n" +
+      "Чтобы оформить заказ, нажмите кнопку ниже 👇";
+
+    // ===== ВЫБОР КЛАВИАТУРЫ =====
+    let replyMarkup = {
+      keyboard: [
+        [{ text: "🛒 КУПИТЬ ЖИЖУ", web_app: { url: MINI_APP_URL } }],
+        [{ text: "💸 Получить скидку" }],
+        [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+        [{ text: "🧾 Мои заказы" }]
+      ],
+      resize_keyboard: true
+    };
+
+    // Админ
     if (username === ADMIN_USERNAME) {
-      welcomeText += "\nПанель администратора и Панель курьера доступны через текстовые кнопки ниже.";
-      keyboard = [
-  [{ text: "Статистика" }, { text: "Курьеры" }],
-  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
-  [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
-  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
-  [{ text: "Рассылка" }],
-  [{ text: "Назад" }]
-];
-      console.log(`Админ @${username} видит админ меню`);
+      welcomeText += "\n\nПанель администратора и Панель курьера доступны через кнопки ниже.";
+      replyMarkup = {
+        keyboard: [
+          [{ text: "Статистика" }, { text: "Курьеры" }],
+          [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
+          [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+          [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
+          [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
+          [{ text: "Список курьеров" }, { text: "Все пользователи" }],
+          [{ text: "Рассылка" }],
+          [{ text: "⬅️ Назад" }]
+        ],
+        resize_keyboard: true
+      };
+    }
+    // Курьер (если не админ)
+    else if (isCourier(username)) {
+      welcomeText += "\n\nПанель курьера доступна через кнопки ниже.";
+      replyMarkup = {
+        keyboard: [
+          [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+          [{ text: "Панель курьера" }],
+          [{ text: "⬅️ Назад" }]
+        ],
+        resize_keyboard: true
+      };
+    }
 
-    } else if (await isCourier(username)) {
-      welcomeText += "\nПанель курьера доступна через текстовые кнопки ниже.";
-      keyboard = [
-        [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-        [{ text: "Панель курьера" }]
-      ];
-      console.log(`Курьер @${username} видит курьерское меню`);
-} else {
-  keyboard = [
-    [{ text: "💸 Получить скидку" }],
-    [{ text: "📊 Мои приглашённые" }],
-    [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
-    [{ text: "🧾 Мои заказы" }]
-  ];
+    // ✅ 1️⃣ Отправляем ОДНО стартовое сообщение
+    await bot.sendMessage(id, welcomeText, {
+      parse_mode: "Markdown",
+      reply_markup: replyMarkup
+    });
 
-  console.log(`Пользователь @${username} видит обычное меню`);
-}
-
-await bot.sendMessage(id, welcomeText, {
-  reply_markup: { keyboard, resize_keyboard: true }
-});
-
-
+    // ✅ 2️⃣ Реф-сообщение только если реферал реально принят
+    if (referralAccepted) {
+      await bot.sendMessage(id, referralText, { parse_mode: "Markdown" });
+    }
 
     // ===== Уведомление админу о новом пользователе =====
     if (isNew && ADMIN_ID) {
@@ -1987,7 +2044,6 @@ await bot.sendMessage(id, welcomeText, {
     }
 
     console.log(`Приветственное сообщение отправлено @${username}`);
-
   } catch (err) {
     console.error(`Ошибка обработки /start для @${username}:`, err.message);
   }
@@ -2315,6 +2371,50 @@ for (const o of orders) {
   return;
 }
 
+// ===== НАЗАД (универсально) =====
+// ВАЖНО: ставим ПОСЛЕ waitingReview и ПОСЛЕ adminWaitingOrdersCourier,
+// чтобы не ломать админ-режимы выбора и сбор отзывов.
+if (text === "Назад" || text === "⬅️ Назад" || text === "⬅️ Назад в меню") {
+  // Админ
+  if (id === ADMIN_ID) {
+    return bot.sendMessage(id, "Главное меню админа", {
+      reply_markup: {
+        keyboard: [
+          [{ text: "Панель администратора" }, { text: "Панель курьера" }]
+        ],
+        resize_keyboard: true
+      }
+    });
+  }
+
+  // Курьер
+  if (isCourier(username)) {
+    return bot.sendMessage(id, "Главное меню курьера", {
+      reply_markup: {
+        keyboard: [
+          [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+          [{ text: "Панель курьера" }]
+        ],
+        resize_keyboard: true
+      }
+    });
+  }
+
+  // Клиент — возвращаем главное меню С КНОПКОЙ web_app
+  return bot.sendMessage(id, "Главное меню", {
+    reply_markup: {
+      keyboard: [
+        [{ text: "🛒 КУПИТЬ ЖИЖУ", web_app: { url: MINI_APP_URL } }],
+        [{ text: "💸 Получить скидку" }],
+        [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+        [{ text: "🧾 Мои заказы" }]
+      ],
+      resize_keyboard: true
+    }
+  });
+}
+
+
 
 // Если админ в состоянии ожидания ввода ника, но нажал кнопку меню
 const menuCommands = ["Список курьеров", "Назад", "Панель администратора"];
@@ -2324,7 +2424,7 @@ if (adminWaitingCourier.has(username) && menuCommands.includes(text)) {
 }
 
 // ✅ ✅ ✅ ВОТ СЮДА ВСТАВЛЯЕШЬ ОБРАБОТЧИК "НАЗАД"
-if (text === "Назад") {
+if (text === "Назад" || text === "⬅️ Назад") {
   if (id === ADMIN_ID) {
     return bot.sendMessage(id, "Главное меню админа", {
       reply_markup: {
@@ -2360,6 +2460,22 @@ if (text === "Назад") {
     }
   });
 }
+
+// ===== 💸 ПОЛУЧИТЬ СКИДКУ (ПОДМЕНЮ) =====
+if (text === "💸 Получить скидку") {
+  await bot.sendMessage(id, "💸 Реферальная программа\n\nВыберите действие 👇", {
+    reply_markup: {
+      keyboard: [
+        [{ text: "🤝 Мои приглашённые" }],
+        [{ text: "🔗 Моя реферальная ссылка" }],
+        [{ text: "⬅️ Назад" }]
+      ],
+      resize_keyboard: true
+    }
+  });
+  return;
+}
+
 
 // ===== Просмотр всех курьеров (кнопка 📈 Курьеры) =====
 if (text === "Курьеры" && id === ADMIN_ID) {
@@ -2412,7 +2528,7 @@ if (text === "/banned" && id === ADMIN_ID) {
 }
 
 // ===== 💸 ПОЛУЧИТЬ СКИДКУ (ЭКРАН ОПИСАНИЯ) =====
-if (text === "💸 Получить скидку") {
+if (text === "🔗 Моя реферальная ссылка") {
   const uname = (username || "").replace(/^@/, "");
 
   // ✅ ЗАЩИТА: если юзер пришёл по рефке и ещё не сделал 1 заказ — не даём пиарить рефку
@@ -2436,12 +2552,12 @@ if (text === "💸 Получить скидку") {
   "• скидка 2€ на первый заказ\n\n" +
 
   "💸 Что получаете вы:\n" +
-  "• скидка 3€ на следующий заказ\n\n" +
+  "• скидка 2€ на следующий заказ\n\n" +
 
   "📌 Как это работает:\n" +
   "1️⃣ Вы отправляете другу ссылку\n" +
   "2️⃣ Друг делает заказ со скидкой 2€\n" +
-  "3️⃣ После выполненного заказа вам начисляется скидка 3€\n\n" +
+  "3️⃣ После выполненного заказа вам начисляется скидка 2€\n\n" +
 
   "⚠️ Важно:\n" +
   "• скидка начисляется только после заказа друга\n" +
@@ -2460,7 +2576,7 @@ if (text === "💸 Получить скидку") {
 }
 
 // ===== 📊 МОИ ПРИГЛАШЁННЫЕ =====
-if (text === "📊 Мои приглашённые") {
+if (text === "🤝 Мои приглашённые"){
   const uname = (username || "").replace(/^@/, "");
 
   const [refs] = await db.execute(
@@ -2523,7 +2639,7 @@ if (text === "📊 Мои приглашённые") {
     `👋 Запустили бота: ${refs.length}\n` +
     `🛒 Сделали заказ: ${orderedCnt}\n` +
     `✅ Выполнено: ${deliveredCnt}\n\n` +
-    `💸 Скидок 3€ доступно: ${availableBonuses}\n` +
+    `💸 Скидок 2€ доступно: ${availableBonuses}\n` +
     `Скидка применится автоматически к следующему заказу.`;
 
   await bot.sendMessage(id, msg);
@@ -3224,84 +3340,109 @@ let reservedBonusUser = "";     // кому резервировали (username
       `Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`
     );
 
-    // ===== ЦЕНА И СКИДКИ =====
-    let originalPrice = 15;
-    let finalPrice = 15;
-    let discountType = null;
+// ===== ЦЕНА И СКИДКИ =====
+let originalPrice = 15;
+let finalPrice = 15;
+let discountType = null;
 
-    // получаем клиента
-    const client = await getClient(cleanUsername);
+// получаем клиента
+const client = await getClient(cleanUsername);
 
-    // считаем сколько заказов уже было
-    const [[{ cnt: ordersCount }]] = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=?",
-      [cleanUsername]
-    );
+// ✅ если есть активный заказ (new/taken) — скидки НЕ применяем, второй заказ только по 15€
+const [[activeOrder]] = await db.execute(
+  `SELECT id FROM orders
+   WHERE REPLACE(tgNick,'@','')=?
+     AND status IN ('new','taken')
+   LIMIT 1`,
+  [cleanUsername]
+);
+const hasActive = !!activeOrder?.id;
 
-    // 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€
-    if (ordersCount === 0 && client?.referrer) {
-      const okRef = await isEligibleReferrer(client.referrer);
-      if (okRef) {
-        finalPrice = 13;
-        discountType = "first_order";
-      } else {
-        discountType = null;
-        finalPrice = 15;
-      }
-    }
-    // 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ СКИДКА 3€ → РЕЗЕРВИРУЕМ (НЕ “СЖИГАЕМ” НАВСЕГДА)
-    else if (Number(client?.referral_bonus_available || 0) > 0) {
-      finalPrice = 12;
-      discountType = "referral_bonus";
-      reservedBonusQty = 1;
-
-const [resv] = await db.execute(
-  "UPDATE clients SET referral_bonus_available = referral_bonus_available - ? WHERE username=? AND referral_bonus_available >= ?",
-  [reservedBonusQty, cleanUsername, reservedBonusQty]
+// считаем сколько заказов уже было (без canceled)
+const [[{ cnt: ordersCount }]] = await db.execute(
+  `SELECT COUNT(*) AS cnt
+   FROM orders
+   WHERE REPLACE(tgNick,'@','')=?
+     AND status <> 'canceled'`,
+  [cleanUsername]
 );
 
-if (resv.affectedRows !== 1) {
+// 🔒 Если уже есть активный заказ — никаких скидок, без резерва бонусов
+if (hasActive) {
   finalPrice = 15;
   discountType = null;
   reservedBonusQty = 0;
 } else {
-  reservedBonusUser = cleanUsername; // ✅ теперь catch сможет вернуть
+  // 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€ (15 -> 13)
+  if (ordersCount === 0 && client?.referrer) {
+    const okRef = await isEligibleReferrer(client.referrer);
+    if (okRef) {
+      finalPrice = 13;
+      discountType = "first_order";
+    } else {
+      discountType = null;
+      finalPrice = 15;
+    }
+  }
 
-  await db.execute(
-    "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
-    ["reserve_bonus", cleanUsername, "Зарезервирована скидка 3€ (реферальный бонус)"]
-  );
+  // 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ РЕФ-БОНУС → -2€ (15 -> 13) + резервируем 1 бонус
+ else if (Number(client?.referral_bonus_available || 0) > 0) {
+  finalPrice = 13;
+  discountType = "referral_bonus";
+  reservedBonusQty = 1;
+
+    const [resv] = await db.execute(
+      "UPDATE clients SET referral_bonus_available = referral_bonus_available - ? WHERE username=? AND referral_bonus_available >= ?",
+      [reservedBonusQty, cleanUsername, reservedBonusQty]
+    );
+
+    if (resv.affectedRows !== 1) {
+      finalPrice = 15;
+      discountType = null;
+      reservedBonusQty = 0;
+    } else {
+      reservedBonusUser = cleanUsername; // ✅ чтобы catch смог вернуть
+
+      await db.execute(
+        "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+        ["reserve_bonus", cleanUsername, "Зарезервирована скидка 2€ (реферальный бонус)"]
+      );
+    }
+  }
 }
+
+console.log("[PRICE]", {
+  user: cleanUsername,
+  originalPrice,
+  finalPrice,
+  discountType,
+  reservedBonusQty,
+  hasActive,
+  ordersCount
+});
+
+// ✅ уведомление пригласившему: друг оформил первый заказ (1 раз)
+try {
+  if (discountType === "first_order" && client?.referrer) {
+    const referrerUsername = String(client.referrer).replace(/^@+/, "").trim();
+    const details = `friend_order_created:@${cleanUsername}`;
+
+    const already = await hasReferralLog("ref_order_notify", referrerUsername, details);
+    if (!already) {
+      await addReferralLog("ref_order_notify", referrerUsername, details);
+
+      await notifyReferrer(
+        referrerUsername,
+        `🛒 Ваш друг @${cleanUsername} оформил первый заказ.\n` +
+          `Скидка 2€ применена.`
+      );
     }
+  }
+} catch (e) {
+  console.error("[REF ORDER NOTIFY ERROR]", e?.message || e);
+}
 
-    console.log("[PRICE]", {
-      user: cleanUsername,
-      originalPrice,
-      finalPrice,
-      discountType,
-      reservedBonusQty
-    });
 
-    // ✅ уведомление пригласившему: друг оформил первый заказ (1 раз)
-    try {
-      if (discountType === "first_order" && client?.referrer) {
-        const referrerUsername = String(client.referrer).replace(/^@+/, "").trim();
-        const details = `friend_order_created:@${cleanUsername}`;
-
-        const already = await hasReferralLog("ref_order_notify", referrerUsername, details);
-        if (!already) {
-          await addReferralLog("ref_order_notify", referrerUsername, details);
-
-          await notifyReferrer(
-            referrerUsername,
-            `🛒 Ваш друг @${cleanUsername} оформил первый заказ.\n` +
-              `Скидка 3€ станет доступна после доставки и применится автоматически.`
-          );
-        }
-      }
-    } catch (e) {
-      console.error("[REF ORDER NOTIFY ERROR]", e?.message || e);
-    }
 
     // ===== ГАРАНТИРОВАННО РЕГИСТРИРУЕМ ПОЛЬЗОВАТЕЛЯ =====
     await db.execute(
@@ -3347,7 +3488,7 @@ if (resv.affectedRows !== 1) {
         );
         await db.execute(
           "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
-          ["bonus_return_banned", cleanUsername, "Возврат зарезервированной скидки 3€ (пользователь забанен)"]
+          ["bonus_return_banned", cleanUsername, "Возврат зарезервированной скидки 2€ (пользователь забанен)"]
         );
       }
 
@@ -3431,7 +3572,7 @@ if (resv.affectedRows !== 1) {
 
       await db.execute(
         "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
-        ["bonus_return_error", reservedBonusUser, "Возврат зарезервированной скидки 3€ из-за ошибки API"]
+        ["bonus_return_error", reservedBonusUser, "Возврат зарезервированной скидки 2€ из-за ошибки API"]
       );
     }
   } catch (e) {
@@ -3441,6 +3582,72 @@ if (resv.affectedRows !== 1) {
   return res.status(500).json({ success: false, error: "Внутренняя ошибка сервера" });
 }
 });
+
+
+
+// ================= API: узнать цену/скидку (без резерва бонусов) =================
+app.post("/api/price-info", async (req, res) => {
+  try {
+    const { tgNick } = req.body;
+
+    if (!tgNick) return res.status(400).json({ ok: false, error: "NO_TGNICK" });
+
+    const cleanUsername = String(tgNick).replace(/^@+/, "").trim();
+    const client = await getClient(cleanUsername);
+
+    // активный заказ? тогда скидки не показываем
+    const [[activeOrder]] = await db.execute(
+      `SELECT id FROM orders
+       WHERE REPLACE(tgNick,'@','')=?
+         AND status IN ('new','taken')
+       LIMIT 1`,
+      [cleanUsername]
+    );
+    const hasActive = !!activeOrder?.id;
+
+    // сколько заказов было (без canceled)
+    const [[{ cnt: ordersCount }]] = await db.execute(
+      `SELECT COUNT(*) AS cnt
+       FROM orders
+       WHERE REPLACE(tgNick,'@','')=?
+         AND status <> 'canceled'`,
+      [cleanUsername]
+    );
+
+    let originalPrice = 15;
+    let finalPrice = 15;
+    let discountType = null;
+
+    if (!hasActive) {
+      // первый заказ по рефке -> 13
+      if (ordersCount === 0 && client?.referrer) {
+        const okRef = await isEligibleReferrer(client.referrer);
+        if (okRef) {
+          finalPrice = 13;
+          discountType = "first_order";
+        }
+      }
+      // бонус пригласившему -> 13 (если есть бонусы)
+      else if (Number(client?.referral_bonus_available || 0) > 0) {
+        finalPrice = 13;
+        discountType = "referral_bonus";
+      }
+    }
+
+    return res.json({
+      ok: true,
+      originalPrice,
+      finalPrice,
+      discountType,
+      hasActive,
+      ordersCount
+    });
+  } catch (e) {
+    console.error("[/api/price-info] error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
 
 
 
