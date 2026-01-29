@@ -100,17 +100,19 @@ async function initDB() {
 
   // ===== Создание таблиц =====
   await db.execute(`
-    CREATE TABLE IF NOT EXISTS clients (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      username VARCHAR(255) UNIQUE,
-      first_name VARCHAR(255),
-      chat_id BIGINT,
-      subscribed TINYINT DEFAULT 1,
-      city VARCHAR(255),
-      created_at DATETIME,
-      last_active DATETIME
-    )
-  `);
+  CREATE TABLE IF NOT EXISTS clients (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(255) UNIQUE,
+    first_name VARCHAR(255),
+    chat_id BIGINT,
+    banned TINYINT(1) DEFAULT 0,
+    subscribed TINYINT DEFAULT 1,
+    city VARCHAR(255),
+    created_at DATETIME,
+    last_active DATETIME
+  )
+`);
+
 
   await db.execute(`
     CREATE TABLE IF NOT EXISTS orders (
@@ -2054,16 +2056,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 const adminWaitingCourier = new Map(); 
 const adminWaitingBroadcast = new Map(); 
 
-(async () => {
-  try {
-    await db.execute("ALTER TABLE clients ADD COLUMN banned TINYINT(1) DEFAULT 0");
-    console.log("Колонка banned добавлена в clients");
-  } catch (e) {
-    console.log("Колонка banned уже существует");
-  }
-})();
-
-
 // ===== Основной обработчик сообщений =====
 bot.on("message", async (msg) => {
   const id = msg.from.id;
@@ -2983,9 +2975,10 @@ if (text === "🤝 Рефералы" && id === ADMIN_ID) {
 
     for (const ref of grouped[referrer]) {
       const [[{ cnt }]] = await db.execute(
-        "SELECT COUNT(*) AS cnt FROM orders WHERE tgNick=? AND status='delivered'",
-        [ref]
-      );
+  "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=? AND status='delivered'",
+  [ref]
+);
+
 
       msg += cnt > 0
         ? `  ✅ @${ref} — заказ выполнен\n`
@@ -3268,7 +3261,17 @@ return;
 
 // ================= Express / WebSocket =================
 const app = express();
-app.use(cors());
+
+// ✅ CORS для GitHub Pages (mini app)
+app.use(cors({
+  origin: [
+    "https://cn4tzwpqvg-ops.github.io",
+    "https://cn4tzwpqvg-ops.github.io/crazycloud"
+  ],
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+
 app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -3298,55 +3301,86 @@ app.post("/api/send-order", async (req, res) => {
 let reservedBonusUser = "";     // кому резервировали (username)
   try {
     let {
-      tgNick,
-      city,
-      delivery,
-      payment,
-      orderText,
-      date,
-      time,
-      client_chat_id,
-      tgUser
-    } = req.body;
+  tgNick,
+  city,
+  delivery,
+  payment,
+  orderText,
+  date,
+  time,
+  client_chat_id,
+  tgUser
+} = req.body;
 
-    // ✅ если сайт не прислал client_chat_id — берём из Telegram WebApp user.id
-    if (!client_chat_id && tgUser?.id) {
-      client_chat_id = tgUser.id;
-    }
+// ✅ username берём либо из tgNick (если фронт прислал), либо из Telegram WebApp user.username
+const rawUsername = tgNick || tgUser?.username;
 
-    // ✅ приводим к числу (Telegram id — число)
-    const clientChatIdNum = client_chat_id ? Number(client_chat_id) : null;
+// ✅ если сайт не прислал client_chat_id — берём из Telegram WebApp user.id
+if (!client_chat_id && tgUser?.id) {
+  client_chat_id = tgUser.id;
+}
 
-    console.log("[DEBUG api body]", req.body);
-    console.log(
-      "[DEBUG api client_chat_id FIXED]",
-      client_chat_id,
-      "=>",
-      clientChatIdNum,
-      "type:",
-      typeof clientChatIdNum
-    );
+// ✅ приводим к числу (Telegram id — число)
+const clientChatIdNum = client_chat_id ? Number(client_chat_id) : null;
 
-    // ===== ПРОВЕРКА ВХОДНЫХ ДАННЫХ =====
-    if (!tgNick || !orderText) {
-      console.log("❌ Ошибка: неполные данные", req.body);
-      return res.status(400).json({ success: false, error: "INVALID_DATA" });
-    }
+console.log("[DEBUG api body]", req.body);
+console.log(
+  "[DEBUG api client_chat_id FIXED]",
+  client_chat_id,
+  "=>",
+  clientChatIdNum,
+  "type:",
+  typeof clientChatIdNum
+);
 
-    const cleanUsername = String(tgNick).replace(/^@+/, "").trim();
+// ===== ПРОВЕРКА ВХОДНЫХ ДАННЫХ =====
+if (!rawUsername || !orderText) {
+  return res.status(400).json({
+    success: false,
+    error: "USERNAME_REQUIRED"
+  });
+}
 
-    console.log(`Новый заказ через API от ${cleanUsername}`);
-    console.log(
-      `Детали: город=${city}, доставка=${delivery}, оплата=${payment}, текст заказа="${orderText}"`
-    );
+const cleanUsername = String(rawUsername).replace(/^@+/, "").trim();
+
+// 1) username обязателен
+if (!cleanUsername) {
+  return res.status(400).json({
+    success: false,
+    error: "USERNAME_REQUIRED"
+  });
+}
+
+// 2) Telegram username: 3..32, латиница/цифры/_
+if (!/^[a-zA-Z0-9_]{3,32}$/.test(cleanUsername)) {
+  return res.status(400).json({
+    success: false,
+    error: "INVALID_USERNAME"
+  });
+}
+
+console.log(`[API] Новый заказ от @${cleanUsername}`);
+
+// ✅ 3) гарантируем что клиент есть в БД ДО расчёта скидок
+await db.execute(
+  `INSERT INTO clients (username, chat_id, banned, created_at, last_active, subscribed)
+   VALUES (?, ?, 0, NOW(), NOW(), 1)
+   ON DUPLICATE KEY UPDATE
+     chat_id = VALUES(chat_id),
+     last_active = NOW(),
+     subscribed = 1`,
+  [cleanUsername, clientChatIdNum || null]
+);
+
+// 4) получаем клиента уже гарантированно
+const client = await getClient(cleanUsername);
+
 
 // ===== ЦЕНА И СКИДКИ =====
 let originalPrice = 15;
 let finalPrice = 15;
 let discountType = null;
 
-// получаем клиента
-const client = await getClient(cleanUsername);
 
 // ✅ если есть активный заказ (new/taken) — скидки НЕ применяем, второй заказ только по 15€
 const [[activeOrder]] = await db.execute(
@@ -3442,20 +3476,6 @@ try {
   console.error("[REF ORDER NOTIFY ERROR]", e?.message || e);
 }
 
-
-
-    // ===== ГАРАНТИРОВАННО РЕГИСТРИРУЕМ ПОЛЬЗОВАТЕЛЯ =====
-    await db.execute(
-      `
-      INSERT INTO clients (chat_id, username, banned)
-      VALUES (?, ?, 0)
-      ON DUPLICATE KEY UPDATE
-        chat_id = VALUES(chat_id),
-        username = VALUES(username)
-      `,
-      [clientChatIdNum, cleanUsername]
-    );
-
     // ===== ПРОВЕРКА БАНА =====
     let banned = false;
 
@@ -3528,21 +3548,15 @@ try {
     console.log(`Заказ ${id} добавлен в базу`);
 
     // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа (как у тебя)
-    if (clientChatIdNum) {
-      await db.execute(
-        "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-        [clientChatIdNum, id]
-      );
+   if (clientChatIdNum) {
+  await db.execute(
+    "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
+    [clientChatIdNum, id]
+  );
+} else {
+  console.log(`Заказ ${id} без client_chat_id (сайт/вебапп не прислал)`);
+}
 
-      if (clientChatIdNum) {
-        await db.execute(
-          "UPDATE orders SET client_chat_id=? WHERE id=? AND (client_chat_id IS NULL OR client_chat_id=0)",
-          [clientChatIdNum, id]
-        );
-      }
-    } else {
-      console.log(`Заказ ${id} без client_chat_id (сайт/вебапп не прислал)`);
-    }
 
     // ===== Получаем заказ из базы =====
     const updated = await getOrderById(id);
@@ -3588,47 +3602,69 @@ try {
 // ================= API: узнать цену/скидку (без резерва бонусов) =================
 app.post("/api/price-info", async (req, res) => {
   try {
-    const { tgNick } = req.body;
+    const body = req.body || {};
+const tgNick = body.tgNick || body.tgUser?.username;  // ✅ добавили fallback
 
-    if (!tgNick) return res.status(400).json({ ok: false, error: "NO_TGNICK" });
 
+    // 1) Без tgNick — значит Mini App открыт вне Telegram / нет username
+    if (!tgNick) {
+      return res.json({
+        ok: false,
+        finalPrice: 15,
+        discountType: null,
+        error: "USERNAME_REQUIRED"
+      });
+    }
+
+    // 2) Нормализуем и валидируем username
     const cleanUsername = String(tgNick).replace(/^@+/, "").trim();
+
+    // Telegram username: 3..32, латиница/цифры/подчеркивание
+    if (!/^[a-zA-Z0-9_]{3,32}$/.test(cleanUsername)) {
+      return res.json({
+        ok: false,
+        finalPrice: 15,
+        discountType: null,
+        error: "INVALID_USERNAME"
+      });
+    }
+
+    // 3) Достаём клиента (может быть null)
     const client = await getClient(cleanUsername);
 
-    // активный заказ? тогда скидки не показываем
-    const [[activeOrder]] = await db.execute(
-      `SELECT id FROM orders
-       WHERE REPLACE(tgNick,'@','')=?
-         AND status IN ('new','taken')
-       LIMIT 1`,
+    // 4) Активный заказ (new/taken)? тогда скидки не показываем
+    const activeRows = await db.execute(
+      "SELECT id FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('new','taken') LIMIT 1",
       [cleanUsername]
     );
-    const hasActive = !!activeOrder?.id;
+    const activeOrder = (activeRows && activeRows[0] && activeRows[0][0]) ? activeRows[0][0] : null;
+    const hasActive = !!(activeOrder && activeOrder.id);
 
-    // сколько заказов было (без canceled)
-    const [[{ cnt: ordersCount }]] = await db.execute(
-      `SELECT COUNT(*) AS cnt
-       FROM orders
-       WHERE REPLACE(tgNick,'@','')=?
-         AND status <> 'canceled'`,
+    // 5) Сколько заказов было (без canceled)
+    const cntRows = await db.execute(
+      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=? AND status <> 'canceled'",
       [cleanUsername]
     );
+    const ordersCount =
+      (cntRows && cntRows[0] && cntRows[0][0] && typeof cntRows[0][0].cnt !== "undefined")
+        ? Number(cntRows[0][0].cnt)
+        : 0;
 
-    let originalPrice = 15;
-    let finalPrice = 15;
-    let discountType = null;
+    var originalPrice = 15;
+    var finalPrice = 15;
+    var discountType = null;
 
     if (!hasActive) {
-      // первый заказ по рефке -> 13
-      if (ordersCount === 0 && client?.referrer) {
+      // 6) Первый заказ по рефке → 13 (только если реферер eligible)
+      if (ordersCount === 0 && client && client.referrer) {
         const okRef = await isEligibleReferrer(client.referrer);
         if (okRef) {
           finalPrice = 13;
           discountType = "first_order";
         }
       }
-      // бонус пригласившему -> 13 (если есть бонусы)
-      else if (Number(client?.referral_bonus_available || 0) > 0) {
+      // 7) Реф-бонусы → 13 (если есть доступные бонусы)
+      else if (client && Number(client.referral_bonus_available || 0) > 0) {
         finalPrice = 13;
         discountType = "referral_bonus";
       }
@@ -3636,17 +3672,23 @@ app.post("/api/price-info", async (req, res) => {
 
     return res.json({
       ok: true,
-      originalPrice,
-      finalPrice,
-      discountType,
-      hasActive,
-      ordersCount
+      originalPrice: originalPrice,
+      finalPrice: finalPrice,
+      discountType: discountType,
+      hasActive: hasActive,
+      ordersCount: ordersCount
     });
   } catch (e) {
-    console.error("[/api/price-info] error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    console.error("[/api/price-info] error:", e && e.message ? e.message : e);
+    return res.status(500).json({
+      ok: false,
+      finalPrice: 15,
+      discountType: null,
+      error: "SERVER_ERROR"
+    });
   }
 });
+
 
 
 
