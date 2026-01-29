@@ -6,6 +6,7 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
+const crypto = require("crypto");
 
 
 
@@ -134,7 +135,7 @@ let db;
 let COURIERS = {};
 const bot = new TelegramBot(TOKEN);
 
-bot.deleteWebHook().catch(() => {});
+bot.deleteWebhook().catch(() => {});
 bot.on("polling_error", (err) => console.error("Polling error:", err));
 
 async function ensureClientsChatIdUnique() {
@@ -266,6 +267,36 @@ await db.execute(`
 `);
 
 
+  // ===== ПРОМОКОДЫ (одноразовые) =====
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS promo_codes (
+      code VARCHAR(32) PRIMARY KEY,
+      created_at DATETIME NOT NULL,
+      created_by BIGINT NULL,
+
+      intended_username VARCHAR(255) NULL,     -- кому предназначен (чтоб не "сливали")
+      reserved_by_chat_id BIGINT NULL,
+      reserved_by_username VARCHAR(255) NULL,
+      reserved_at DATETIME NULL,
+
+      used TINYINT(1) DEFAULT 0,
+      used_at DATETIME NULL,
+      used_order_id VARCHAR(255) NULL,
+      used_by_chat_id BIGINT NULL,
+      used_by_username VARCHAR(255) NULL
+    )
+  `);
+
+  await db.execute(`CREATE INDEX idx_promo_intended ON promo_codes(intended_username)`).catch(()=>{});
+  await db.execute(`CREATE INDEX idx_promo_reserved ON promo_codes(reserved_by_chat_id)`).catch(()=>{});
+  await db.execute(`CREATE INDEX idx_promo_used ON promo_codes(used)`).catch(()=>{});
+  await db.execute(`CREATE INDEX idx_promo_cleanup ON promo_codes(used, intended_username, created_at)`).catch(()=>{});
+
+
+
+
+
+
 
 
 
@@ -374,10 +405,17 @@ await db.execute(`
     console.log("orders.referral_bonus_spent добавлена");
   } catch (e) {}
 
+    // clients.promo_code (какой купон привязан к клиенту)
+  try {
+    await db.execute("ALTER TABLE clients ADD COLUMN promo_code VARCHAR(32) DEFAULT NULL");
+    console.log("clients.promo_code добавлена");
+  } catch (e) {}
+
   await ensureClientsChatIdUnique();
 
   console.log("База данных и таблицы готовы");
 }
+
 
 
 
@@ -493,6 +531,186 @@ async function getClient(username) {
   return rows[0];
 }
 
+function normU(u) {
+  return String(u || "").replace(/^@+/, "").trim();
+}
+
+function makePromoCode(len = 10) {
+  // Без спецсимволов, удобно для start-параметра
+  return crypto.randomBytes(16).toString("hex").slice(0, len).toUpperCase();
+}
+
+// создать купон под конкретного юзера (чтобы не мог "сливать")
+async function createPromo(createdByChatId, intendedUsername = null) {
+  const uname = intendedUsername ? normU(intendedUsername) : null;
+
+  if (uname && !/^[a-zA-Z0-9_]{3,32}$/.test(uname)) throw new Error("BAD_USERNAME");
+
+  for (let i = 0; i < 10; i++) {
+    const code = makePromoCode(10);
+    try {
+      await db.execute(
+        "INSERT INTO promo_codes (code, created_at, created_by, intended_username) VALUES (?, NOW(), ?, ?)",
+        [code, Number(createdByChatId) || null, uname]
+      );
+      return code;
+    } catch (e) {
+      if (String(e?.message || "").toLowerCase().includes("duplicate")) continue;
+      throw e;
+    }
+  }
+  throw new Error("CANNOT_CREATE_CODE");
+}
+
+// привязать купон к пользователю при /start?start=c_CODE
+async function claimPromoCode(codeRaw, username, chatId) {
+  const code = String(codeRaw || "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  const uname = normU(username);
+  const cid = Number(chatId);
+
+  if (!code) return { ok: false, error: "bad_code" };
+
+  // только если "нет заказов" (без учета canceled)
+  const [[row]] = await db.execute(
+  `SELECT COUNT(*) AS cnt
+   FROM orders
+   WHERE status <> 'canceled'
+     AND (client_chat_id=? OR REPLACE(tgNick,'@','')=?)`,
+  [cid, uname]
+);
+  if (Number(row?.cnt || 0) > 0) return { ok: false, error: "already_has_orders" };
+
+  const [rows] = await db.execute("SELECT * FROM promo_codes WHERE code=? LIMIT 1", [code]);
+  const p = rows[0];
+  if (!p) return { ok: false, error: "not_found" };
+  if (Number(p.used || 0) === 1) return { ok: false, error: "used" };
+
+  // анти-слив: intended_username
+  if (p.intended_username && normU(p.intended_username).toLowerCase() !== uname.toLowerCase()) {
+    return { ok: false, error: "not_for_you" };
+  }
+
+  // если зарезервирован другим — стоп
+  if (p.reserved_by_chat_id && Number(p.reserved_by_chat_id) !== cid) {
+    return { ok: false, error: "reserved_by_other" };
+  }
+
+  // нельзя иметь другой промокод (проверяем по chat_id)
+  const [cRows] = await db.execute(
+    "SELECT promo_code FROM clients WHERE chat_id=? LIMIT 1",
+    [cid]
+  );
+  const existingPromo = cRows[0]?.promo_code;
+  if (existingPromo && String(existingPromo) !== code) {
+    return { ok: false, error: "already_has_promo" };
+  }
+
+  // резервируем атомарно
+  const [upd] = await db.execute(
+    `UPDATE promo_codes
+     SET reserved_by_chat_id = COALESCE(reserved_by_chat_id, ?),
+         reserved_by_username = COALESCE(reserved_by_username, ?),
+         reserved_at = COALESCE(reserved_at, NOW())
+     WHERE code=? AND used=0 AND (reserved_by_chat_id IS NULL OR reserved_by_chat_id=?)`,
+    [cid, uname, code, cid]
+  );
+  if (upd.affectedRows !== 1) return { ok: false, error: "reserved_by_other" };
+
+  // сохраняем в clients по chat_id
+  await db.execute("UPDATE clients SET promo_code=? WHERE chat_id=?", [code, cid]);
+
+  return { ok: true, code };
+}
+
+// проверка: есть ли у клиента рабочий промокод
+async function canUsePromoDiscount(username, chatId) {
+  const uname = normU(username);
+  const cid = Number(chatId);
+
+  const [rows] = await db.execute(
+  `SELECT p.code
+   FROM clients c
+   JOIN promo_codes p ON p.code = c.promo_code
+   WHERE c.chat_id=?
+     AND p.used=0
+     AND (p.reserved_by_chat_id=? OR p.reserved_by_username=?)
+     AND (p.intended_username IS NULL OR LOWER(p.intended_username)=LOWER(?))
+   LIMIT 1`,
+  [cid, cid, uname, uname]
+);
+  return rows.length ? rows[0].code : null;
+}
+
+
+// “съесть” промокод при первом создании заказа
+async function consumePromo(username, chatId, orderId) {
+  const uname = normU(username);
+  const cid = Number(chatId);
+
+  const [cRows] = await db.execute(
+    "SELECT promo_code FROM clients WHERE chat_id=? LIMIT 1",
+    [cid]
+  );
+  const code = cRows[0]?.promo_code;
+  if (!code) return false;
+
+  const [upd] = await db.execute(
+    `UPDATE promo_codes
+     SET used=1, used_at=NOW(), used_order_id=?, used_by_chat_id=?, used_by_username=?
+     WHERE code=? AND used=0 AND (reserved_by_chat_id=? OR reserved_by_username=?)`,
+    [String(orderId), cid, uname, String(code), cid, uname]
+  );
+
+  return upd.affectedRows === 1;
+}
+
+// ✅ Удаляем универсальные промо (intended_username IS NULL), если им > 30 дней и они не использованы
+async function cleanupUniversalPromos(days = 30) {
+  try {
+    if (!db) return;
+
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const cutoffStr = formatMySQLDateTime(cutoff); // функция у тебя уже есть ниже
+
+    // 1) отвязываем промо у клиентов (чтобы не оставалось "мертвых" купонов)
+    const [r1] = await db.execute(
+      `
+      UPDATE clients c
+      JOIN promo_codes p ON p.code = c.promo_code
+      SET c.promo_code = NULL
+      WHERE p.used = 0
+        AND p.intended_username IS NULL
+        AND p.created_at < ?
+      `,
+      [cutoffStr]
+    );
+
+    // 2) удаляем сами промо
+    const [r2] = await db.execute(
+      `
+      DELETE FROM promo_codes
+      WHERE used = 0
+        AND intended_username IS NULL
+        AND created_at < ?
+      `,
+      [cutoffStr]
+    );
+
+    // (опционально) лог в referral_logs, чтобы видеть что чистка работает
+    await db.execute(
+      "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+      ["promo_cleanup", "system", `cleared_clients:${r1.affectedRows} deleted_promos:${r2.affectedRows} cutoff:${cutoffStr}`]
+    ).catch(() => {});
+
+    console.log(`[PROMO CLEANUP] cleared clients: ${r1.affectedRows}, deleted promos: ${r2.affectedRows}, cutoff: ${cutoffStr}`);
+  } catch (e) {
+    console.error("[PROMO CLEANUP ERROR]", e?.message || e);
+  }
+}
+
+
+
+
 async function isEligibleReferrer(username) {
   const uname = String(username || "").replace(/^@/, "").trim();
   if (!uname) return false;
@@ -586,6 +804,51 @@ async function refundReservedBonusIfNeeded(order) {
     console.error("[refundReservedBonusIfNeeded] error:", e?.message || e);
   }
 }
+
+async function refundPromoIfNeeded(order) {
+  try {
+    if (!order) return;
+
+    const discountType = String(order.discount_type || "");
+    if (discountType !== "promo") return;
+
+    // если уже доставлен — промо НЕ возвращаем
+    if (String(order.status || "") === "delivered") return;
+
+    const buyerUsername = String(order.tgNick || "").replace(/^@+/, "").trim();
+    const buyerChatId = order.client_chat_id ? Number(order.client_chat_id) : null;
+
+    // Возвращаем промо ТОЛЬКО если оно реально "сгорело" именно на этот заказ
+    const [upd] = await db.execute(
+  `UPDATE promo_codes
+   SET used=0,
+       used_at=NULL,
+       used_order_id=NULL,
+       used_by_chat_id=NULL,
+       used_by_username=NULL
+   WHERE used=1
+     AND used_order_id=?
+     AND (
+       (? IS NOT NULL AND used_by_chat_id = ?)
+       OR (? IS NULL AND used_by_username = ?)
+     )`,
+  [String(order.id), buyerChatId, buyerChatId, buyerChatId, buyerUsername]
+);
+
+
+    if (upd.affectedRows === 1) {
+      await db.execute(
+        "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+        ["promo_refund", buyerUsername || "unknown", `Возврат промо 2€ за заказ №${order.id}`]
+      );
+
+      console.log(`[PROMO REFUND] restored for @${buyerUsername} order ${order.id}`);
+    }
+  } catch (e) {
+    console.error("[refundPromoIfNeeded] error:", e?.message || e);
+  }
+}
+
 
 
 async function notifyReferrer(referrerUsername, text) {
@@ -882,6 +1145,12 @@ function buildOrderMessage(order) {
 if (order.discount_type === "referral_bonus") {
   lines.push("🎁 Скидка применена: скидка за приглашённого друга");
 }
+
+if (order.discount_type === "promo") {
+  lines.push("🎟 Скидка применена: промокод 2€ (первый заказ)");
+}
+
+
     } else {
       lines.push(`💸 Цена: ${order.original_price}€`);
     }
@@ -1245,6 +1514,11 @@ async function restoreOrdersForCouriers() {
   await initDB();
   COURIERS = await getCouriers();
   await addCourier(ADMIN_USERNAME, ADMIN_ID);
+
+  // ✅ Чистка универсальных промо: 1 раз при старте + раз в 24 часа
+  await cleanupUniversalPromos(30);
+  setInterval(() => cleanupUniversalPromos(30), 24 * 60 * 60 * 1000);
+
 
   await restoreOrdersForClients();   // безопасно
   await restoreOrdersForCouriers();  // безопасно
@@ -1917,6 +2191,8 @@ if (data.startsWith("admin_delete_confirm_") && fromId === ADMIN_ID) {
 
   // ✅ ВОТ ЭТО ДОБАВЬ (до удаления order из БД)
   await refundReservedBonusIfNeeded(order);
+  await refundPromoIfNeeded(order); // ✅ ДОБАВИТЬ
+
 
   // 1) удалить сообщения заказа у всех
   const msgs = await getOrderMessages(orderId);
@@ -2381,11 +2657,13 @@ if (data.startsWith("cancel_")) {
   [orderId]
 );
 
-    const updatedOrder = await getOrderById(orderId);
+const updatedOrder = await getOrderById(orderId);
 
-    await refundReservedBonusIfNeeded(updatedOrder)
+await refundReservedBonusIfNeeded(updatedOrder);
+await refundPromoIfNeeded(updatedOrder);   // ✅ ДОБАВИТЬ
 
-    await sendOrUpdateOrderAll(updatedOrder);
+await sendOrUpdateOrderAll(updatedOrder);
+
 
     // ✅ Уведомление админа всегда
 try {
@@ -2448,7 +2726,8 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const id = msg.from.id;
   const username = msg.from.username; // ❗ только реальный username
   const first_name = msg.from.first_name || "";
-  const ref = match?.[1]; // например "ref_username"
+  const payload = (match?.[1] || "").trim(); // может быть "ref_x" или "c_CODE"
+
 
   // 🚫 ЕСЛИ НЕТ USERNAME — СТОП
   if (!username) {
@@ -2478,75 +2757,118 @@ const isNew = existing.length === 0;
 
 
     // Сохраняем/обновляем клиента
-    await addOrUpdateClient(username, first_name, id);
-    console.log(`Клиент @${username} добавлен/обновлён в базе`);
+   // Сохраняем/обновляем клиента
+await addOrUpdateClient(username, first_name, id);
+console.log(`Клиент @${username} добавлен/обновлён в базе`);
 
-    // ===== Если это курьер — обновим chat_id (как у тебя было) =====
-    if (isCourier(username)) {
-      await db.execute(
-        `INSERT INTO couriers (username, chat_id)
-         VALUES (?, ?)
-         ON DUPLICATE KEY UPDATE chat_id = VALUES(chat_id)`,
-        [username, id]
+
+
+// ===== PROMO / РЕФЕРАЛ (привязываем только если реально принято) =====
+let promoAccepted = false;
+let referralAccepted = false;
+
+// ===== Если это курьер — обновим chat_id (как у тебя было) =====
+if (isCourier(username)) {
+  await db.execute(
+    `INSERT INTO couriers (username, chat_id)
+     VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE chat_id = VALUES(chat_id)`,
+    [username, id]
+  );
+  COURIERS = await getCouriers();
+  console.log(`Курьер @${username} добавлен/обновлён, chat_id: ${id}`);
+}
+
+// ===== PROMO: /start c_CODE =====
+if (payload && payload.startsWith("c_")) {
+  const codeRaw = payload.slice(2);
+
+  try {
+    const r = await claimPromoCode(codeRaw, username, id);
+
+    if (r.ok) {
+  promoAccepted = true;
+} else {
+      const map = {
+        not_found: "❌ Купон не найден.",
+        used: "❌ Купон уже использован.",
+        reserved_by_other: "❌ Купон уже привязан к другому.",
+        already_has_orders: "❌ Купон только для клиентов без заказов.",
+        not_for_you: "❌ Этот купон предназначен другому пользователю.",
+        already_has_promo: "❌ У вас уже есть привязанный купон."
+      };
+
+      await bot.sendMessage(id, map[r.error] || "❌ Купон недействителен.");
+
+      // лог в БД (чтобы видеть попытки)
+      await addReferralLog(
+        "promo_rejected",
+        String(username || "").replace(/^@+/, "").trim() || "unknown",
+        `code:${String(codeRaw || "").toUpperCase()} reason:${r.error || "unknown"}`
       );
-      COURIERS = await getCouriers();
-      console.log(`Курьер @${username} добавлен/обновлён, chat_id: ${id}`);
     }
+  } catch (e) {
+    console.error("[PROMO claim] error:", e?.message || e);
+  }
+}
 
-    // ===== РЕФЕРАЛ (привязываем только если реально принят) =====
-    let referralAccepted = false;
+// ===== РЕФЕРАЛ: /start ref_username =====
+// рефералку привязываем только новому пользователю, и только если PROMO НЕ принято
+if (!promoAccepted && isNew && payload && payload.startsWith("ref_")) {
+  const referrer = payload.replace("ref_", "").replace(/^@/, "").trim();
+  const me = String(username || "").replace(/^@/, "").trim();
 
-    if (isNew && ref && ref.startsWith("ref_")) {
-      const referrer = ref.replace("ref_", "").replace(/^@/, "").trim();
-      const me = String(username || "").replace(/^@/, "").trim();
+  // самореф
+  if (referrer && me && referrer.toLowerCase() === me.toLowerCase()) {
+    await addReferralLog("self_referral", me, "Попытка самореферала");
+  } else {
+    const refClient = await getClient(referrer);
+    const eligible = refClient && (await isEligibleReferrer(referrer));
 
-      // самореф
-      if (referrer === me) {
-        await addReferralLog("self_referral", me, "Попытка самореферала");
-      } else {
-        const refClient = await getClient(referrer);
-        const eligible = refClient && (await isEligibleReferrer(referrer));
+    if (!eligible) {
+      await addReferralLog(
+        "referrer_not_eligible",
+        referrer || "unknown",
+        `Попытка рефералки для @${me} (реферер без delivered)`
+      );
+    } else {
+      // ✅ страховка: не перетираем, если вдруг уже стоит
+      const myRow = await getClient(me);
+      if (!myRow?.referrer) {
+        await db.execute(
+          "UPDATE clients SET referrer=? WHERE username=?",
+          [referrer, me]
+        );
+      }
 
-        if (!eligible) {
-          await addReferralLog(
-            "referrer_not_eligible",
-            referrer || "unknown",
-            `Попытка рефералки для @${me} (реферер без delivered)`
+      // новый пришёл по рефке -> блокируем ему приглашения, пока не будет delivered
+      await db.execute(
+        "UPDATE clients SET referrals_locked=1 WHERE username=?",
+        [me]
+      );
+
+      referralAccepted = true;
+
+      // уведомление рефереру 1 раз
+      try {
+        const details = `friend_started:@${me}`;
+        const already = await hasReferralLog("ref_start_notify", referrer, details);
+
+        if (!already) {
+          await addReferralLog("ref_start_notify", referrer, details);
+          await notifyReferrer(
+            referrer,
+            `👋 Ваш друг @${me} запустил бота по вашей ссылке.\n` +
+              `Если он сделает первый заказ, вам будет доступна скидка 2€ (автоматически).`
           );
-        } else {
-          // привязываем реферера
-          await db.execute(
-            "UPDATE clients SET referrer=? WHERE username=?",
-            [referrer, me]
-          );
-
-          // новый пришёл по рефке -> блокируем ему приглашения, пока не будет delivered
-          await db.execute(
-            "UPDATE clients SET referrals_locked=1 WHERE username=?",
-            [me]
-          );
-
-          referralAccepted = true;
-
-          // уведомление рефереру 1 раз
-          try {
-            const details = `friend_started:@${me}`;
-            const already = await hasReferralLog("ref_start_notify", referrer, details);
-
-            if (!already) {
-              await addReferralLog("ref_start_notify", referrer, details);
-              await notifyReferrer(
-                referrer,
-                `👋 Ваш друг @${me} запустил бота по вашей ссылке.\n` +
-                  `Если он сделает первый заказ, вам будет доступна скидка 2€ (автоматически).`
-              );
-            }
-          } catch (e) {
-            console.error("[REF START NOTIFY ERROR]", e?.message || e);
-          }
         }
+      } catch (e) {
+        console.error("[REF START NOTIFY ERROR]", e?.message || e);
       }
     }
+  }
+}
+
 
    // ===== ТЕКСТ ПРИВЕТСТВИЯ (1 основное сообщение) =====
 let welcomeText = [
@@ -2560,6 +2882,7 @@ let welcomeText = [
   "Чтобы оформить заказ, нажмите",
   "КУПИТЬ ЖИЖУ 👇"
 ].join("\n");
+
 
 
 
@@ -2588,6 +2911,15 @@ if (isAdmin) {
       parse_mode: "Markdown",
       reply_markup: replyMarkup
     });
+
+    // ✅ 1️⃣.1 — ВОТ СЮДА промо-уведомление
+if (promoAccepted) {
+  await bot.sendMessage(
+    id,
+    "🎟 Промо активировано ✅\nСкидка 2€ применится автоматически к *первому* заказу.",
+    { parse_mode: "Markdown" }
+  );
+}
 
     // ✅ 2️⃣ Реф-сообщение только если реферал реально принят
     if (referralAccepted) {
@@ -2630,6 +2962,55 @@ bot.on("message", async (msg) => {
   const text = msg.text.trim();
   // ⛔️ чтобы /start обрабатывался только bot.onText(/\/start/)
 if (text.startsWith("/start")) return;
+
+  // ===== ADMIN: создать промокод под юзера =====
+ if (Number(id) === Number(ADMIN_ID) && text.startsWith("/promo")) {
+  const parts = text.split(" ").filter(Boolean);
+  const target = parts[1] || null; // /promo OR /promo @username
+
+  try {
+    const uname = target ? normU(target) : null;
+    const code = await createPromo(id, uname);
+    const link = `https://t.me/crazydecloud_bot?start=c_${code}`;
+
+    return bot.sendMessage(
+      id,
+      uname
+        ? `🎟 Промокод создан для @${uname}\n\nСсылка:\n${link}\n\n(Купон одноразовый и работает только для этого @${uname})`
+        : `🎟 Универсальный промокод создан\n\nСсылка:\n${link}\n\n(Купон одноразовый: 1 ссылка = 1 клиент)`
+    );
+  } catch (e) {
+    return bot.sendMessage(id, "Ошибка создания промокода. Проверь username или попробуй ещё раз.");
+  }
+}
+
+
+  // ===== ADMIN: посмотреть последние промокоды =====
+  if (Number(id) === Number(ADMIN_ID) && text === "/promos") {
+    const [rows] = await db.execute(
+      `SELECT code, intended_username, reserved_by_username, used, created_at, reserved_at, used_at, used_order_id
+       FROM promo_codes
+       ORDER BY created_at DESC
+       LIMIT 20`
+    );
+
+    if (!rows.length) return bot.sendMessage(id, "Промокодов пока нет.");
+
+    const lines = rows.map(r => {
+      const st = Number(r.used) === 1 ? "✅ USED" : (r.reserved_by_username ? "🟡 RESERVED" : "🟢 NEW");
+      return `${st}  ${r.code}  for:@${r.intended_username || "-"}  reserved:@${r.reserved_by_username || "-"}  order:${r.used_order_id || "-"}`;
+    });
+
+    return bot.sendMessage(id, "🎟 Последние промокоды:\n\n" + lines.join("\n"));
+  }
+
+  // ===== ADMIN: ручная чистка универсальных промо =====
+if (Number(id) === Number(ADMIN_ID) && text === "/promo_cleanup") {
+  await cleanupUniversalPromos(30);
+  return bot.sendMessage(id, "✅ Чистка универсальных промо выполнена (старше 30 дней).");
+}
+
+
 
 
   // ✅ чтобы кнопки меню не перехватывались режимами "ожидания"
@@ -3926,29 +4307,50 @@ const client = await getClient(cleanUsername);
 
 
 // ===== ЦЕНА И СКИДКИ =====
-let originalPrice = 15;
+const originalPrice = 15;
 let finalPrice = 15;
 let discountType = null;
 
+// ✅ активный заказ проверяем лучше по chat_id (если есть), иначе по username
+let hasActive = false;
+if (clientChatIdNum) {
+  const [[r]] = await db.execute(
+    `SELECT id FROM orders
+     WHERE client_chat_id=? AND status IN ('new','taken')
+     LIMIT 1`,
+    [clientChatIdNum]
+  );
+  hasActive = !!r?.id;
+} else {
+  const [[r]] = await db.execute(
+    `SELECT id FROM orders
+     WHERE REPLACE(tgNick,'@','')=? AND status IN ('new','taken')
+     LIMIT 1`,
+    [cleanUsername]
+  );
+  hasActive = !!r?.id;
+}
 
-// ✅ если есть активный заказ (new/taken) — скидки НЕ применяем, второй заказ только по 15€
-const [[activeOrder]] = await db.execute(
-  `SELECT id FROM orders
-   WHERE REPLACE(tgNick,'@','')=?
-     AND status IN ('new','taken')
-   LIMIT 1`,
-  [cleanUsername]
-);
-const hasActive = !!activeOrder?.id;
-
-// считаем сколько заказов уже было (без canceled)
-const [[{ cnt: ordersCount }]] = await db.execute(
-  `SELECT COUNT(*) AS cnt
-   FROM orders
-   WHERE REPLACE(tgNick,'@','')=?
-     AND status <> 'canceled'`,
-  [cleanUsername]
-);
+// ✅ сколько заказов было (без canceled) — тоже лучше по chat_id, но с подстраховкой по username
+let ordersCount = 0;
+if (clientChatIdNum) {
+  const [[r]] = await db.execute(
+    `SELECT COUNT(*) AS cnt
+     FROM orders
+     WHERE status <> 'canceled'
+       AND (client_chat_id=? OR REPLACE(tgNick,'@','')=?)`,
+    [clientChatIdNum, cleanUsername]
+  );
+  ordersCount = Number(r?.cnt || 0);
+} else {
+  const [[r]] = await db.execute(
+    `SELECT COUNT(*) AS cnt
+     FROM orders
+     WHERE REPLACE(tgNick,'@','')=? AND status <> 'canceled'`,
+    [cleanUsername]
+  );
+  ordersCount = Number(r?.cnt || 0);
+}
 
 // 🔒 Если уже есть активный заказ — никаких скидок, без резерва бонусов
 if (hasActive) {
@@ -3956,23 +4358,37 @@ if (hasActive) {
   discountType = null;
   reservedBonusQty = 0;
 } else {
-  // 🟢 ПЕРВЫЙ ЗАКАЗ ПО РЕФЕРАЛКЕ → -2€ (15 -> 13)
-  if (ordersCount === 0 && client?.referrer) {
+
+  // ✅ 1) PROMO (самый приоритет) — только если 0 заказов
+  if (ordersCount === 0 && clientChatIdNum) {
+    try {
+      const promo = await canUsePromoDiscount(cleanUsername, clientChatIdNum);
+      if (promo) {
+        finalPrice = 13;
+        discountType = "promo";
+      }
+    } catch (e) {
+      console.error("[PROMO send-order] error:", e?.message || e);
+    }
+  }
+
+  // ✅ 2) Первый заказ по рефке — только если промо не применилось
+  if (!discountType && ordersCount === 0 && client?.referrer) {
     const okRef = await isEligibleReferrer(client.referrer);
     if (okRef) {
       finalPrice = 13;
       discountType = "first_order";
     } else {
-      discountType = null;
       finalPrice = 15;
+      discountType = null;
     }
   }
 
-  // 🟢 НЕ ПЕРВЫЙ, НО ЕСТЬ РЕФ-БОНУС → -2€ (15 -> 13) + резервируем 1 бонус
- else if (Number(client?.referral_bonus_available || 0) > 0) {
-  finalPrice = 13;
-  discountType = "referral_bonus";
-  reservedBonusQty = 1;
+  // ✅ 3) Реф-бонус — только если промо/первый заказ не применились
+  else if (!discountType && Number(client?.referral_bonus_available || 0) > 0) {
+    finalPrice = 13;
+    discountType = "referral_bonus";
+    reservedBonusQty = 1;
 
     const [resv] = await db.execute(
       "UPDATE clients SET referral_bonus_available = referral_bonus_available - ? WHERE username=? AND referral_bonus_available >= ?",
@@ -3994,6 +4410,8 @@ if (hasActive) {
   }
 }
 
+
+// Лог
 console.log("[PRICE]", {
   user: cleanUsername,
   originalPrice,
@@ -4003,6 +4421,7 @@ console.log("[PRICE]", {
   hasActive,
   ordersCount
 });
+
 
 // ===== ИТОГОВОЕ КОЛИЧЕСТВО И ИТОГОВАЯ СУММА (если в заказе 2+ шт) =====
 const qtyMatches = String(orderText || "").match(/×\s*(\d+)\s*шт/gi) || [];
@@ -4089,6 +4508,7 @@ try {
     const id = await generateOrderId();
     console.log(`Присвоен новый ID заказа: ${id}`);
 
+
     const order = {
       id,
       tgNick: cleanUsername,
@@ -4112,6 +4532,20 @@ try {
     // ===== Добавляем заказ в базу =====
     await addOrder(order);
     console.log(`Заказ ${id} добавлен в базу`);
+    
+    // ✅ промо "сгорает" только после успешного создания заказа
+if (discountType === "promo") {
+  const ok = await consumePromo(cleanUsername, clientChatIdNum, id);
+
+  // если вдруг гонка/ошибка — откатываем скидку на заказе
+  if (!ok) {
+    await db.execute(
+      "UPDATE orders SET final_price=?, discount_type=NULL WHERE id=?",
+      [originalTotal, id]
+    );
+  }
+}
+
 
     // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа (как у тебя)
    if (clientChatIdNum) {
@@ -4170,6 +4604,7 @@ app.post("/api/price-info", async (req, res) => {
   try {
     const body = req.body || {};
 const tgNick = body.tgNick || body.tgUser?.username;  // ✅ добавили fallback
+const cid = Number(body.client_chat_id || body.tgUser?.id || 0);
 
 
     // 1) Без tgNick — значит Mini App открыт вне Telegram / нет username
@@ -4216,34 +4651,54 @@ const tgNick = body.tgNick || body.tgUser?.username;  // ✅ добавили fa
         ? Number(cntRows[0][0].cnt)
         : 0;
 
-    var originalPrice = 15;
-    var finalPrice = 15;
-    var discountType = null;
+const originalPrice = 15;
+let finalPrice = 15;
+let discountType = null;
 
-    if (!hasActive) {
-      // 6) Первый заказ по рефке → 13 (только если реферер eligible)
-      if (ordersCount === 0 && client && client.referrer) {
-        const okRef = await isEligibleReferrer(client.referrer);
-        if (okRef) {
-          finalPrice = 13;
-          discountType = "first_order";
-        }
-      }
-      // 7) Реф-бонусы → 13 (если есть доступные бонусы)
-      else if (client && Number(client.referral_bonus_available || 0) > 0) {
-        finalPrice = 13;
-        discountType = "referral_bonus";
-      }
+// Если уже есть активный заказ — никаких скидок
+if (!hasActive) {
+  // ✅ 1) ПРОМО (приоритет) — только если 0 заказов
+  let promoCode = null;
+  try {
+    const chatId = Number(cid);
+    if (ordersCount === 0 && Number.isFinite(chatId) && chatId > 0) {
+      promoCode = await canUsePromoDiscount(cleanUsername, chatId);
     }
+  } catch (e) {
+    console.error("[PROMO price-info] error:", e?.message || e);
+  }
 
-    return res.json({
-      ok: true,
-      originalPrice: originalPrice,
-      finalPrice: finalPrice,
-      discountType: discountType,
-      hasActive: hasActive,
-      ordersCount: ordersCount
-    });
+  if (ordersCount === 0 && promoCode) {
+    finalPrice = 13;
+    discountType = "promo";
+  }
+
+  // ✅ 2) Первый заказ по рефералке — только если промо не применилось
+  else if (ordersCount === 0 && client?.referrer) {
+    const okRef = await isEligibleReferrer(client.referrer);
+    if (okRef) {
+      finalPrice = 13;
+      discountType = "first_order";
+    }
+  }
+
+  // ✅ 3) Реф-бонус — только если промо/первый заказ не применились
+  else if (Number(client?.referral_bonus_available || 0) > 0) {
+    finalPrice = 13;
+    discountType = "referral_bonus";
+  }
+}
+
+return res.json({
+  ok: true,
+  originalPrice,
+  finalPrice,
+  discountType,
+  hasActive,
+  ordersCount
+});
+
+
   } catch (e) {
     console.error("[/api/price-info] error:", e && e.message ? e.message : e);
     return res.status(500).json({
