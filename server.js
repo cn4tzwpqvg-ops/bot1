@@ -32,14 +32,13 @@ const discountMenuKeyboard = {
 
 const mainMenuKeyboard = {
   keyboard: [
-    [{ text: "🛒 КУПИТЬ ЖИЖУ", web_app: { url: MINI_APP_URL } }],
+    [{ text: "🛒 КУПИТЬ ЖИЖУ" }],  // <-- без web_app
     [{ text: "💸 Получить скидку" }],
     [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
     [{ text: "🧾 Мои заказы" }]
   ],
   resize_keyboard: true
 };
-
 const courierStartKeyboard = {
   keyboard: [
     [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
@@ -85,6 +84,21 @@ const waitingReview = new Map();
 let db;
 let COURIERS = {};
 const bot = new TelegramBot(TOKEN);
+// ✅ ШАГ 3 — вставь СРАЗУ ПОСЛЕ const bot = ...
+bot.onText(/^🛒 КУПИТЬ ЖИЖУ$/, (msg) => {
+  const u = msg.from?.username ? msg.from.username.replace(/^@/, "") : "";
+  const url = u ? `${MINI_APP_URL}?u=${encodeURIComponent(u)}` : MINI_APP_URL;
+
+  return bot.sendMessage(msg.chat.id, "Открыть магазин:", {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "🛒 ОТКРЫТЬ MINI APP", web_app: { url } }
+      ]]
+    }
+  });
+});
+
+
 bot.deleteWebHook().catch(() => {});
 bot.on("polling_error", (err) => console.error("Polling error:", err));
 
@@ -2518,6 +2532,16 @@ const adminWaitingBroadcast = new Map();
 
 // ===== Основной обработчик сообщений =====
 bot.on("message", async (msg) => {
+  if (msg.text === "🛒 КУПИТЬ ЖИЖУ") {
+  return bot.sendMessage(msg.chat.id, "Открыть магазин:", {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "🛒 ОТКРЫТЬ MINI APP", web_app: { url: MINI_APP_URL } }
+      ]]
+    }
+  });
+}
+
   try {
   const id = msg.from.id;
   const username = msg.from.username; // username должен быть для курьеров
