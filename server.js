@@ -2788,6 +2788,36 @@ if (payload && payload.startsWith("c_")) {
 
     if (r.ok) {
   promoAccepted = true;
+ // ✅ уведомляем админа, если промо создано админом
+  try {
+    const codeNorm = String(r.code || codeRaw).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+    const u = String(username || "").replace(/^@+/, "").trim();
+
+    const [rowsP] = await db.execute(
+      "SELECT created_by FROM promo_codes WHERE code=? LIMIT 1",
+      [codeNorm]
+    );
+    const createdBy = rowsP[0]?.created_by;
+
+    if (Number(createdBy) === Number(ADMIN_ID)) {
+      const details = `user:@${u} code:${codeNorm}`;
+
+      // антидубль
+      const exists = await hasReferralLog("admin_promo_join", "admin", details);
+      if (!exists) {
+        await addReferralLog("admin_promo_join", "admin", details);
+
+        await bot.sendMessage(
+          ADMIN_ID,
+          `🆕 \\@${escapeMarkdownV2(u)} присоединился по *промо-ссылке админа*\nКод: \`${codeNorm}\``,
+          { parse_mode: "MarkdownV2" }
+        );
+      }
+    }
+  } catch (e) {
+    console.error("[ADMIN PROMO JOIN notify] error:", e?.message || e);
+  }
+
 } else {
       const map = {
         not_found: "❌ Купон не найден.",
@@ -2848,6 +2878,33 @@ if (!promoAccepted && isNew && payload && payload.startsWith("ref_")) {
       );
 
       referralAccepted = true;
+
+      // ✅ если реферер = админ — сообщаем админу
+try {
+  const meU = String(username || "").replace(/^@+/, "").trim();
+  const refU = String(referrer || "").replace(/^@+/, "").trim();
+
+  const adminU = String(ADMIN_USERNAME || "").replace(/^@+/, "").trim();
+
+  // считаем "ссылка админа" если referrer == ADMIN_USERNAME
+  if (refU && adminU && refU.toLowerCase() === adminU.toLowerCase()) {
+    const details = `user:@${meU} ref:@${refU}`;
+
+    const exists = await hasReferralLog("admin_ref_join", "admin", details);
+    if (!exists) {
+      await addReferralLog("admin_ref_join", "admin", details);
+
+      await bot.sendMessage(
+        ADMIN_ID,
+        `🆕 @${escapeMarkdownV2(meU)} присоединился по *реферальной ссылке админа*`,
+        { parse_mode: "MarkdownV2" }
+      );
+    }
+  }
+} catch (e) {
+  console.error("[ADMIN REF JOIN notify] error:", e?.message || e);
+}
+
 
       // уведомление рефереру 1 раз
       try {
@@ -3009,6 +3066,32 @@ if (Number(id) === Number(ADMIN_ID) && text === "/promo_cleanup") {
   await cleanupUniversalPromos(30);
   return bot.sendMessage(id, "✅ Чистка универсальных промо выполнена (старше 30 дней).");
 }
+
+// ===== ADMIN: удалить промокод по коду =====
+if (Number(id) === Number(ADMIN_ID) && text.startsWith("/promo_del")) {
+  const parts = text.split(" ").filter(Boolean);
+  const code = String(parts[1] || "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+
+  if (!code) return bot.sendMessage(id, "Формат: /promo_del CODE");
+
+  // 1) отвязать у клиентов
+  await db.execute("UPDATE clients SET promo_code=NULL WHERE promo_code=?", [code]);
+
+  // 2) удалить сам промо-код
+  const [r] = await db.execute("DELETE FROM promo_codes WHERE code=?", [code]);
+
+  // 3) лог
+  await db.execute(
+    "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
+    ["promo_deleted", ADMIN_USERNAME, `deleted:${code} affected:${r.affectedRows}`]
+  ).catch(() => {});
+
+  return bot.sendMessage(
+    id,
+    r.affectedRows ? `✅ Промокод ${code} удалён` : `❌ Промокод ${code} не найден`
+  );
+}
+
 
 
 
