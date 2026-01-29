@@ -3012,6 +3012,15 @@ if (text === "/banned" && id === ADMIN_ID) {
   return bot.sendMessage(ADMIN_ID, "Забаненные пользователи:\n" + list);
 }
 
+
+// ===== 💸 ПОЛУЧИТЬ СКИДКУ (вход в меню) =====
+if (text === "💸 Получить скидку") {
+  return bot.sendMessage(id, discountMenuText, {
+    parse_mode: "Markdown",
+    reply_markup: discountMenuKeyboard
+  });
+}
+
 // ===== 💸 ПОЛУЧИТЬ СКИДКУ (ЭКРАН ОПИСАНИЯ) =====
 if (text === "🔗 Моя реферальная ссылка") {
   const uname = (username || "").replace(/^@/, "");
