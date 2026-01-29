@@ -135,7 +135,7 @@ let db;
 let COURIERS = {};
 const bot = new TelegramBot(TOKEN);
 
-bot.deleteWebhook().catch(() => {});
+bot.deleteWebHook().catch(() => {});
 bot.on("polling_error", (err) => console.error("Polling error:", err));
 
 async function ensureClientsChatIdUnique() {
