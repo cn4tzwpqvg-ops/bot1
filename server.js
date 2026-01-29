@@ -1402,10 +1402,9 @@ function shortOrderLine(o) {
 // грузим 1 страницу + общее количество
 async function fetchPanelOrdersPage(mode, courierUsername, page) {
   const p = Math.max(1, Number(page || 1));
-  const offset = (p - 1) * PAGE_SIZE;
 
   let where = "";
-  let params = [];
+  const params = [];
 
   if (mode === "new") {
     where = "WHERE status='new' AND courier_username IS NULL";
@@ -1419,7 +1418,8 @@ async function fetchPanelOrdersPage(mode, courierUsername, page) {
     where = "WHERE status IN ('new','taken','delivered')";
   }
 
-  const [[cntRow]] = await db.execute(
+  // COUNT
+  const [[cntRow]] = await db.query(
     `SELECT COUNT(*) AS cnt FROM orders ${where}`,
     params
   );
@@ -1429,18 +1429,17 @@ async function fetchPanelOrdersPage(mode, courierUsername, page) {
   const pageFixed = Math.min(p, totalPages);
   const offsetFixed = (pageFixed - 1) * PAGE_SIZE;
 
-  const [rows] = await db.execute(
-    `
-    SELECT * FROM orders
-    ${where}
-    ORDER BY created_at DESC
-    LIMIT ? OFFSET ?
-    `,
-    [...params, PAGE_SIZE, offsetFixed]
-  );
+  // LIST (LIMIT/OFFSET без placeholders)
+  const sql =
+    `SELECT * FROM orders ${where} ` +
+    `ORDER BY created_at DESC ` +
+    `LIMIT ${Number(PAGE_SIZE)} OFFSET ${Number(offsetFixed)}`;
+
+  const [rows] = await db.query(sql, params);
 
   return { rows, total, totalPages, page: pageFixed };
 }
+
 
 async function showOrdersList(chatId, role, username, mode, page, editMessageId) {
   const courierUsername = (role === "courier" || role === "admin") ? username : null;
@@ -2519,6 +2518,7 @@ const adminWaitingBroadcast = new Map();
 
 // ===== Основной обработчик сообщений =====
 bot.on("message", async (msg) => {
+  try {
   const id = msg.from.id;
   const username = msg.from.username; // username должен быть для курьеров
   const first_name = msg.from.first_name || "";
@@ -3758,6 +3758,15 @@ await showOrdersList(id, role, username, mode, 1, existingMsgId);
 return;
 } // закрыли IF
 
+  } catch (e) {
+    console.error("[MESSAGE HANDLER ERROR]", e?.message || e, e);
+
+    // Мягко ответим пользователю (чтобы не было тишины)
+    try {
+      await bot.sendMessage(msg.from.id, "⚠️ Ошибка. Попробуйте ещё раз.");
+    } catch {}
+  }
+
 }); // ✅ закрыли bot.on("message", async (msg) => { ... })
 
 // ================= Express / WebSocket =================
@@ -4207,6 +4216,13 @@ const tgNick = body.tgNick || body.tgUser?.username;  // ✅ добавили fa
 });
 
 
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
 
 
 
