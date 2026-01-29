@@ -7,6 +7,8 @@ const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
 
+
+
 // ================= Новая функция: рассылка и обновление с лимитом =================
 const pLimit = require("p-limit").default; // убедиться, что установлен npm install p-limit
 
@@ -23,36 +25,40 @@ const discountMenuText =
 
 const discountMenuKeyboard = {
   keyboard: [
-    [{ text: "👥 Мои приглашённые" }],
+    [{ text: "🤝 Мои приглашённые" }],
     [{ text: "🔗 Моя реферальная ссылка" }],
-    [{ text: "⬅️ Назад в меню" }]
+    [{ text: "⬅️ Назад" }]
   ],
   resize_keyboard: true
 };
 
+
 const mainMenuKeyboard = {
   keyboard: [
-    [{ text: "🛒 КУПИТЬ ЖИЖУ" }],  // <-- без web_app
     [{ text: "💸 Получить скидку" }],
     [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
     [{ text: "🧾 Мои заказы" }]
   ],
   resize_keyboard: true
 };
+
 const courierStartKeyboard = {
   keyboard: [
+    [{ text: "💸 Получить скидку" }],
     [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
+    [{ text: "🧾 Мои заказы" }],
     [{ text: "Панель курьера" }],
     [{ text: "⬅️ Назад" }]
   ],
   resize_keyboard: true
 };
 
+
 const adminStartKeyboard = {
   keyboard: [
     [{ text: "Статистика" }, { text: "Курьеры" }],
     [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-    [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+    [{ text: "Взятые сейчас" }, { text: "✅ Доставлено сегодня" }], // ✅ было "Сводка курьеров"
     [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
     [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
     [{ text: "Список курьеров" }, { text: "Все пользователи" }],
@@ -61,6 +67,26 @@ const adminStartKeyboard = {
   ],
   resize_keyboard: true
 };
+
+
+const myOrdersKeyboard = {
+  keyboard: [
+    [{ text: "Активные заказы" }],
+    [{ text: "Выполненные заказы" }],
+    [{ text: "⬅️ Назад" }]
+  ],
+  resize_keyboard: true
+};
+
+const courierPanelKeyboard = {
+  keyboard: [
+    [{ text: "Новые заказы" }, { text: "Взятые заказы" }],
+    [{ text: "Выполненные заказы" }],
+    [{ text: "⬅️ Назад" }]
+  ],
+  resize_keyboard: true
+};
+
 
 
 
@@ -84,20 +110,6 @@ const waitingReview = new Map();
 let db;
 let COURIERS = {};
 const bot = new TelegramBot(TOKEN);
-// ✅ ШАГ 3 — вставь СРАЗУ ПОСЛЕ const bot = ...
-bot.onText(/^🛒 КУПИТЬ ЖИЖУ$/, (msg) => {
-  const u = msg.from?.username ? msg.from.username.replace(/^@/, "") : "";
-  const url = u ? `${MINI_APP_URL}?u=${encodeURIComponent(u)}` : MINI_APP_URL;
-
-  return bot.sendMessage(msg.chat.id, "Открыть магазин:", {
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "🛒 ОТКРЫТЬ MINI APP", web_app: { url } }
-      ]]
-    }
-  });
-});
-
 
 bot.deleteWebHook().catch(() => {});
 bot.on("polling_error", (err) => console.error("Polling error:", err));
@@ -362,30 +374,54 @@ function withAt(username) {
 async function getCouriers() {
   const [rows] = await db.execute("SELECT username, chat_id FROM couriers");
   const map = {};
-  rows.forEach(r => { if (r.username && r.chat_id) map[r.username] = r.chat_id; });
+  for (const r of rows) {
+    const u = String(r.username || "").replace(/^@+/, "").trim();
+    if (!u) continue;
+    map[u] = (r.chat_id == null ? null : Number(r.chat_id));
+  }
   return map;
 }
 
+
 async function addCourier(username, chatId = null) {
-  if (!username) return false;
-  await db.execute(`
+  const u = String(username || "").replace(/^@+/, "").trim();
+  if (!u) return false;
+
+  const cid = (chatId === null || chatId === undefined || chatId === "")
+    ? null
+    : Number(chatId);
+
+  await db.execute(
+    `
     INSERT INTO couriers (username, chat_id)
     VALUES (?, ?)
     ON DUPLICATE KEY UPDATE chat_id=VALUES(chat_id)
-  `, [username, chatId]);
+    `,
+    [u, cid]
+  );
+
   COURIERS = await getCouriers();
-  console.log(`Курьер добавлен/обновлён: @${username}, chat_id: ${chatId}`);
+  console.log(`Курьер добавлен/обновлён: @${u}, chat_id: ${cid}`);
   return true;
 }
 
-
 async function removeCourier(username) {
-  await db.execute("DELETE FROM couriers WHERE username=?", [username]);
+  const u = String(username || "").replace(/^@+/, "").trim();
+  if (!u) return;
+
+  await db.execute("DELETE FROM couriers WHERE username=?", [u]);
   COURIERS = await getCouriers();
-  console.log(`Курьер удалён: @${username}`);
+  console.log(`Курьер удалён: @${u}`);
 }
 
-function isCourier(username) { return !!COURIERS[username]; }
+function isCourier(username) {
+  const u = String(username || "").replace(/^@+/, "").trim();
+  if (!u) return false;
+
+  // true если курьер есть в таблице couriers (даже если chat_id ещё NULL)
+  return Object.prototype.hasOwnProperty.call(COURIERS, u);
+}
+
 
 // ================= Клиенты =================
 async function addOrUpdateClient(username, first_name, chat_id) {
@@ -2450,50 +2486,28 @@ const isNew = existing.length === 0;
   "👋 Добро пожаловать в *CRAZY CLOUD!*\n\n" +
   "🛒 Заказывайте жидкости прямо в боте\n" +
   "🚚 Доставка по вашему городу в день заказа\n\n" +
-  "⭐ Отзывы клиентов: [t.me/crazy_cloud_reviews](https://t.me/crazy_cloud_reviews)\n\n" +
-  "Чтобы оформить заказ, нажмите кнопку ниже 👇";
+  "⭐ Отзывы клиентов:\n" +
+  "[crazy_cloud_reviews](https://t.me/crazy_cloud_reviews)\n\n" +
+  "Чтобы оформить заказ, нажмите 🛒 КУПИТЬ ЖИЖУ 👇";
 
 
-    // ===== ВЫБОР КЛАВИАТУРЫ =====
-    let replyMarkup = {
-      keyboard: [
-        [{ text: "🛒 КУПИТЬ ЖИЖУ", web_app: { url: MINI_APP_URL } }],
-        [{ text: "💸 Получить скидку" }],
-        [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
-        [{ text: "🧾 Мои заказы" }]
-      ],
-      resize_keyboard: true
-    };
+// ===== ВЫБОР КЛАВИАТУРЫ (ОДИН РАЗ, БЕЗ ДУБЛЕЙ) =====
+const u = String(username || "").replace(/^@+/, "").trim();
+const adminU = String(ADMIN_USERNAME || "").replace(/^@+/, "").trim();
 
-    // Админ
-    if (username === ADMIN_USERNAME) {
-      welcomeText += "\n\nПанель администратора и Панель курьера доступны через кнопки ниже.";
-      replyMarkup = {
-        keyboard: [
-          [{ text: "Статистика" }, { text: "Курьеры" }],
-          [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-          [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
-          [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
-          [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-          [{ text: "Список курьеров" }, { text: "Все пользователи" }],
-          [{ text: "Рассылка" }],
-          [{ text: "⬅️ Назад" }]
-        ],
-        resize_keyboard: true
-      };
-    }
-    // Курьер (если не админ)
-    else if (isCourier(username)) {
-      welcomeText += "\n\nПанель курьера доступна через кнопки ниже.";
-      replyMarkup = {
-        keyboard: [
-          [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
-          [{ text: "Панель курьера" }],
-          [{ text: "⬅️ Назад" }]
-        ],
-        resize_keyboard: true
-      };
-    }
+const isAdmin = Number(id) === Number(ADMIN_ID) || (u && adminU && u === adminU);
+const isC = isCourier(u);
+
+// клиент по умолчанию
+let replyMarkup = mainMenuKeyboard;
+
+if (isAdmin) {
+  welcomeText += "\n\nПанель администратора и Панель курьера доступны через кнопки ниже.";
+  replyMarkup = adminStartKeyboard;
+} else if (isC) {
+  welcomeText += "\n\nПанель курьера доступна через кнопки ниже.";
+  replyMarkup = courierStartKeyboard;
+}
 
     // ✅ 1️⃣ Отправляем ОДНО стартовое сообщение
     await bot.sendMessage(id, welcomeText, {
@@ -2533,16 +2547,6 @@ const adminWaitingBroadcast = new Map();
 
 // ===== Основной обработчик сообщений =====
 bot.on("message", async (msg) => {
-  if (msg.text === "🛒 КУПИТЬ ЖИЖУ") {
-  return bot.sendMessage(msg.chat.id, "Открыть магазин:", {
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "🛒 ОТКРЫТЬ MINI APP", web_app: { url: MINI_APP_URL } }
-      ]]
-    }
-  });
-}
-
   try {
   const id = msg.from.id;
   const username = msg.from.username; // username должен быть для курьеров
@@ -2555,7 +2559,7 @@ if (text.startsWith("/start")) return;
 
 
   // ✅ чтобы кнопки меню не перехватывались режимами "ожидания"
-if (id === ADMIN_ID) {
+if (Number(id) === Number(ADMIN_ID)) {
   const adminMenuClicks = [
     "Панель курьера",
     "Панель администратора",
@@ -2564,9 +2568,12 @@ if (id === ADMIN_ID) {
     "Выполненные заказы",
     "Взятые сейчас",
     "Сводка курьеров",
+    "✅ Доставлено сегодня",     // ✅ если ты переименовал кнопку
     "Активные по курьеру",
     "Выполненные по курьеру",
-    "Назад"
+    "⬅️ Назад",
+    "Назад",
+    "⬅️ Назад в меню"
   ];
 
   if (adminMenuClicks.includes(text)) {
@@ -2575,6 +2582,7 @@ if (id === ADMIN_ID) {
     adminWaitingCourier.delete(username);
   }
 }
+
 
 // ===== Админ: Взятые сейчас (все заказы status='taken') =====
 if (text === "Взятые сейчас" && id === ADMIN_ID) {
@@ -2893,110 +2901,48 @@ for (const o of orders) {
   return;
 }
 
-// ===== НАЗАД (универсально) =====
-// ВАЖНО: ставим ПОСЛЕ waitingReview и ПОСЛЕ adminWaitingOrdersCourier,
-// чтобы не ломать админ-режимы выбора и сбор отзывов.
-if (text === "Назад" || text === "⬅️ Назад" || text === "⬅️ Назад в меню") {
-  // Админ
-  if (id === ADMIN_ID) {
+/// ===== НАЗАД + СБРОС РЕЖИМОВ (универсально, ОДИН раз) =====
+// ставь ПОСЛЕ waitingReview и ПОСЛЕ adminWaitingOrdersCourier
+const backClicks = new Set(["Назад", "⬅️ Назад", "⬅️ Назад в меню"]);
+
+if (backClicks.has(text)) {
+  // сбрасываем все "режимы ожидания", чтобы меню не ломалось
+  adminWaitingOrdersCourier.delete(username);
+  adminWaitingBroadcast.delete(username);
+  adminWaitingCourier.delete(username);
+
+  // админ
+  if (Number(id) === Number(ADMIN_ID)) {
     return bot.sendMessage(id, "Главное меню админа", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Панель администратора" }, { text: "Панель курьера" }]
-        ],
-        resize_keyboard: true
-      }
+      reply_markup: adminStartKeyboard
     });
   }
 
-  // Курьер
+  // курьер
   if (isCourier(username)) {
     return bot.sendMessage(id, "Главное меню курьера", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
-          [{ text: "Панель курьера" }]
-        ],
-        resize_keyboard: true
-      }
+      reply_markup: courierStartKeyboard
     });
   }
 
-  // Клиент — возвращаем главное меню С КНОПКОЙ web_app
+  // клиент
   return bot.sendMessage(id, "Главное меню", {
-    reply_markup: {
-      keyboard: [
-        [{ text: "🛒 КУПИТЬ ЖИЖУ", web_app: { url: MINI_APP_URL } }],
-        [{ text: "💸 Получить скидку" }],
-        [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
-        [{ text: "🧾 Мои заказы" }]
-      ],
-      resize_keyboard: true
-    }
+    reply_markup: mainMenuKeyboard
   });
 }
 
-
-
-// Если админ в состоянии ожидания ввода ника, но нажал кнопку меню
-const menuCommands = ["Список курьеров", "Назад", "Панель администратора"];
-if (adminWaitingCourier.has(username) && menuCommands.includes(text)) {
-  adminWaitingCourier.delete(username); // сброс ожидания
-  console.log(`Состояние ожидания ника сброшено для @${username} из-за меню`);
-}
-
-// ✅ ✅ ✅ ВОТ СЮДА ВСТАВЛЯЕШЬ ОБРАБОТЧИК "НАЗАД"
-if (text === "Назад" || text === "⬅️ Назад") {
-  if (id === ADMIN_ID) {
-    return bot.sendMessage(id, "Главное меню админа", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Панель администратора" }, { text: "Панель курьера" }]
-        ],
-        resize_keyboard: true
-      }
-    });
-  }
-
-  if (isCourier(username)) {
-    return bot.sendMessage(id, "Главное меню курьера", {
-      reply_markup: {
-        keyboard: [
-          [{ text: "Личный кабинет" }, { text: "Поддержка" }],
-          [{ text: "Панель курьера" }]
-        ],
-        resize_keyboard: true
-      }
-    });
-  }
-
-  return bot.sendMessage(id, "Главное меню", {
-    reply_markup: {
-      keyboard: [
-     [{ text: "💸 Получить скидку" }],
-    [{ text: "📊 Мои приглашённые" }],
-    [{ text: "👤 Личный кабинет" }, { text: "🛟 Поддержка" }],
-    [{ text: "🧾 Мои заказы" }]
-      ],
-      resize_keyboard: true
-    }
-  });
-}
-
-// ===== 💸 ПОЛУЧИТЬ СКИДКУ (ПОДМЕНЮ) =====
+// ===== 💸 ПОЛУЧИТЬ СКИДКУ (подменю) =====
 if (text === "💸 Получить скидку") {
-  await bot.sendMessage(id, "💸 Реферальная программа\n\nВыберите действие 👇", {
-    reply_markup: {
-      keyboard: [
-        [{ text: "🤝 Мои приглашённые" }],
-        [{ text: "🔗 Моя реферальная ссылка" }],
-        [{ text: "⬅️ Назад" }]
-      ],
-      resize_keyboard: true
-    }
+  // если админ/курьер был в ожиданиях — тоже сбросим
+  adminWaitingOrdersCourier.delete(username);
+  adminWaitingBroadcast.delete(username);
+  adminWaitingCourier.delete(username);
+
+  return bot.sendMessage(id, "💸 Реферальная программа\n\nВыберите действие 👇", {
+    reply_markup: discountMenuKeyboard
   });
-  return;
 }
+
 
 
 // ===== Просмотр всех курьеров (кнопка 📈 Курьеры) =====
@@ -3067,28 +3013,18 @@ if (text === "🔗 Моя реферальная ссылка") {
   const refLink = `https://t.me/crazydecloud_bot?start=ref_${uname}`;
 
 
-  const msg =
-  "👥 Пригласите друга и получите скидку\n\n" +
-
-  "🎁 Что получает друг:\n" +
-  "• скидка 2€ на первый заказ\n\n" +
-
-  "💸 Что получаете вы:\n" +
-  "• скидка 2€ на следующий заказ\n\n" +
-
-  "📌 Как это работает:\n" +
-  "1️⃣ Вы отправляете другу ссылку\n" +
-  "2️⃣ Друг делает заказ со скидкой 2€\n" +
-  "3️⃣ После выполненного заказа вам начисляется скидка 2€\n\n" +
-
+const msg =
+  "🎁 Скидки за друзей\n\n" +
+  "1) Отправь другу свою ссылку\n" +
+  "2) Друг сделает ПЕРВЫЙ заказ — он получит скидку 2€\n" +
+  "3) После доставки его заказа тебе станет доступна скидка 2€ на следующий заказ\n\n" +
   "⚠️ Важно:\n" +
-  "• скидка начисляется только после заказа друга\n" +
   "• 1 друг = 1 скидка\n" +
   "• скидки не суммируются\n\n" +
-
-  "🔗 Ваша реферальная ссылка:\n" +
+  "🔗 Твоя ссылка:\n" +
   refLink + "\n\n" +
-  "📎 Зажмите ссылку и выберите «Копировать»";
+  "📎 Зажми ссылку → «Копировать»";
+
 
 
   // ✅ БЕЗ inline кнопок
@@ -3097,76 +3033,118 @@ if (text === "🔗 Моя реферальная ссылка") {
   return;
 }
 
-// ===== 📊 МОИ ПРИГЛАШЁННЫЕ =====
-if (text === "🤝 Мои приглашённые"){
-  const uname = (username || "").replace(/^@/, "");
+// ===== 📊 МОИ ПРИГЛАШЁННЫЕ (красиво + 1 запрос вместо 2х на каждого) =====
+if (text === "🤝 Мои приглашённые") {
+  const uname = (username || "").replace(/^@/, "").trim();
 
-  const [refs] = await db.execute(
-    "SELECT username FROM clients WHERE referrer=? ORDER BY username ASC",
-    [uname]
-  );
-
-  // ✅ берём реальное количество доступных скидок из БД
+  // мой баланс бонусов
   const me = await getClient(uname);
   const availableBonuses = Number(me?.referral_bonus_available || 0);
 
-  if (!refs.length) {
+  // одним запросом получаем по каждому приглашённому:
+  // - есть ли заказы
+  // - был ли delivered
+  // - последний статус
+  const [rows] = await db.execute(
+    `
+    SELECT
+      c.username AS invited,
+      COUNT(o.id) AS orders_total,
+      MAX(CASE WHEN o.status='delivered' THEN 1 ELSE 0 END) AS has_delivered,
+      SUBSTRING_INDEX(
+        GROUP_CONCAT(o.status ORDER BY o.created_at DESC SEPARATOR ','),
+        ',', 1
+      ) AS last_status
+    FROM clients c
+    LEFT JOIN orders o
+      ON REPLACE(o.tgNick,'@','') = c.username
+    WHERE c.referrer = ?
+    GROUP BY c.username
+    ORDER BY c.username ASC
+    `,
+    [uname]
+  );
+
+  if (!rows.length) {
     const msg =
-      "👥 Мои приглашённые\n\n" +
-      "Пока список пуст.\n" +
-      "Отправьте другу ссылку из «Получить скидку» — и он появится здесь после /start.";
-    await bot.sendMessage(id, msg);
+      "👥 *Мои приглашённые*\n\n" +
+      "Пока никого нет.\n" +
+      "Зайди в «💸 Получить скидку» → «🔗 Моя реферальная ссылка» и отправь другу.";
+    await bot.sendMessage(id, msg, { parse_mode: "Markdown" });
     return;
   }
 
-  let msg = "👥 Мои приглашённые\n\n";
-  let deliveredCnt = 0;
-  let orderedCnt = 0;
+  // красивые статусы
+  const statusLabel = (ordersTotal, hasDelivered, lastStatus) => {
+    if (!ordersTotal) return "⏳ ждём первый заказ";
+    if (Number(hasDelivered) === 1) return "✅ первый заказ доставлен";
 
-  for (const r of refs) {
-    const invited = r.username;
+    // если заказ есть, но не доставлен — показываем понятный статус
+    const s = String(lastStatus || "");
+    if (s === "new") return "🛒 заказ оформлен";
+    if (s === "taken") return "🚚 заказ в пути";
+    if (s === "canceled") return "❌ заказ отменён";
+    return "🛒 заказ в обработке";
+  };
 
-    // есть ли вообще заказ
-    const [[anyOrder]] = await db.execute(
-      `SELECT status FROM orders
-       WHERE REPLACE(tgNick,'@','')=?
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [invited]
-    );
+  const invitedCnt = rows.length;
+  const orderedCnt = rows.filter(r => Number(r.orders_total) > 0).length;
+  const deliveredCnt = rows.filter(r => Number(r.has_delivered) === 1).length;
 
-    // есть ли delivered
-    const [[delivered]] = await db.execute(
-      `SELECT 1 AS ok FROM orders
-       WHERE REPLACE(tgNick,'@','')=?
-       AND status='delivered'
-       LIMIT 1`,
-      [invited]
-    );
+  let msg =
+    "👥 *Мои приглашённые*\n\n" +
+    `💸 Доступно скидок 2€: *${availableBonuses}*\n` +
+    "Скидка применяется автоматически к следующему заказу.\n\n" +
+    `📌 Итоги:\n` +
+    `• Запустили бота: *${invitedCnt}*\n` +
+    `• Оформили заказ: *${orderedCnt}*\n` +
+    `• Доставлено: *${deliveredCnt}*\n\n` +
+    "📋 Список:\n";
 
-    if (delivered?.ok) {
-      deliveredCnt++;
-      orderedCnt++;
-      msg += `@${invited} — ✅ заказ выполнен\n`;
-    } else if (anyOrder?.status) {
-      orderedCnt++;
-      msg += `@${invited} — 🛒 заказ есть (${anyOrder.status})\n`;
-    } else {
-      msg += `@${invited} — 👋 запустил бот, заказов нет\n`;
-    }
+  // список (аккуратно, по строке на человека)
+  for (const r of rows) {
+    const invited = r.invited;
+    const line = statusLabel(r.orders_total, r.has_delivered, r.last_status);
+    msg += `• @${invited} — ${line}\n`;
   }
 
-  msg +=
-    `\n📌 Итого:\n` +
-    `👋 Запустили бота: ${refs.length}\n` +
-    `🛒 Сделали заказ: ${orderedCnt}\n` +
-    `✅ Выполнено: ${deliveredCnt}\n\n` +
-    `💸 Скидок 2€ доступно: ${availableBonuses}\n` +
-    `Скидка применится автоматически к следующему заказу.`;
+  // Telegram лимит ~4096, на всякий случай режем по частям
+  const MAX = 3900;
+  if (msg.length <= MAX) {
+    await bot.sendMessage(id, msg, { parse_mode: "Markdown" });
+  } else {
+    // делим: шапка отдельно, список кусками
+    const head =
+      "👥 *Мои приглашённые*\n\n" +
+      `💸 Доступно скидок 2€: *${availableBonuses}*\n` +
+      "Скидка применяется автоматически к следующему заказу.\n\n" +
+      `📌 Итоги:\n` +
+      `• Запустили бота: *${invitedCnt}*\n` +
+      `• Оформили заказ: *${orderedCnt}*\n` +
+      `• Доставлено: *${deliveredCnt}*\n\n` +
+      "📋 Список:\n";
 
-  await bot.sendMessage(id, msg);
+    await bot.sendMessage(id, head, { parse_mode: "Markdown" });
+
+    let chunk = "";
+    for (const r of rows) {
+      const invited = r.invited;
+      const line = statusLabel(r.orders_total, r.has_delivered, r.last_status);
+      const rowLine = `• @${invited} — ${line}\n`;
+
+      if ((chunk + rowLine).length > MAX) {
+        await bot.sendMessage(id, chunk, { parse_mode: "Markdown" });
+        chunk = rowLine;
+      } else {
+        chunk += rowLine;
+      }
+    }
+    if (chunk) await bot.sendMessage(id, chunk, { parse_mode: "Markdown" });
+  }
+
   return;
 }
+
 
 
 
@@ -3285,16 +3263,10 @@ if (text === "🛟 Поддержка") {
 // ===== Менюшка =====
 if (text === "🧾 Мои заказы") {
   return bot.sendMessage(id, "Что показать?", {
-    reply_markup: {
-      keyboard: [
-        [{ text: "Активные заказы" }],
-        [{ text: "Выполненные заказы" }],
-        [{ text: "Назад" }]
-      ],
-      resize_keyboard: true
-    }
+    reply_markup: myOrdersKeyboard
   });
 }
+
 
 // ===== Мои заказы: Активные (new/taken) =====
 if (text === "Активные заказы") {
@@ -3334,23 +3306,11 @@ if (text === "Выполненные заказы") {
 }
 
 
-  // ===== Панель администратора =====
-if (text === "Панель администратора" && id === ADMIN_ID) {
-  const kb = {
-    keyboard: [
-   [{ text: "Статистика" }, { text: "Курьеры" }],
-  [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
-  [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
-  [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
-  [{ text: "Список курьеров" }, { text: "Все пользователи" }],
-  [{ text: "Рассылка" }],
-  [{ text: "Назад" }]
-],
-
-    resize_keyboard: true
-  };
-  return bot.sendMessage(id, "Панель администратора", { reply_markup: kb });
+ // ===== Панель администратора =====
+if (text === "Панель администратора" && Number(id) === Number(ADMIN_ID)) {
+  return bot.sendMessage(id, "Панель администратора", {
+    reply_markup: adminStartKeyboard
+  });
 }
 
 
@@ -3707,16 +3667,8 @@ if (adminWaitingBroadcast.has(username)) {
 
 
 // ===== Панель курьера =====
-if (text === "Панель курьера" && (COURIERS[username] || id === ADMIN_ID)) {
-  const kb = {
-    keyboard: [
-      [{ text: "Новые заказы" }, { text: "Взятые заказы" }],
-      [{ text: "Выполненные заказы" }],
-      [{ text: "Назад" }]
-    ],
-    resize_keyboard: true
-  };
-  return bot.sendMessage(id, "Панель курьера", { reply_markup: kb });
+if (text === "Панель курьера" && (isCourier(username) || Number(id) === Number(ADMIN_ID))) {
+  return bot.sendMessage(id, "Панель курьера", { reply_markup: courierPanelKeyboard });
 }
 
 
