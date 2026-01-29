@@ -2482,13 +2482,17 @@ const isNew = existing.length === 0;
     }
 
     // ===== ТЕКСТ ПРИВЕТСТВИЯ (1 основное сообщение) =====
-   let welcomeText =
-  "👋 Добро пожаловать в *CRAZY CLOUD!*\n\n" +
-  "🛒 Заказывайте жидкости прямо в боте\n" +
-  "🚚 Доставка по вашему городу в день заказа\n\n" +
-  "⭐ Отзывы клиентов:\n" +
-  "[crazy_cloud_reviews](https://t.me/crazy_cloud_reviews)\n\n" +
-  "Чтобы оформить заказ, нажмите 🛒 КУПИТЬ ЖИЖУ 👇";
+ let welcomeText = [
+  "👋 Добро пожаловать в *CRAZY CLOUD!*",
+  "",
+  "🛒 Оформляйте заказ прямо в боте",
+  "🚚 Доставка по вашему городу в день заказа",
+  "⭐ Отзывы клиентов: [crazy_cloud_reviews](https://t.me/crazy_cloud_reviews)",
+  "",
+  "Чтобы оформить заказ, нажмите",
+  "КУПИТЬ ЖИЖУ 👇"
+].join("\n");
+
 
 
 // ===== ВЫБОР КЛАВИАТУРЫ (ОДИН РАЗ, БЕЗ ДУБЛЕЙ) =====
@@ -3033,18 +3037,13 @@ const msg =
   return;
 }
 
-// ===== 📊 МОИ ПРИГЛАШЁННЫЕ (красиво + 1 запрос вместо 2х на каждого) =====
+// ===== 📊 МОИ ПРИГЛАШЁННЫЕ (БЕЗ Markdown, чтобы _ в никах не ломал сообщение) =====
 if (text === "🤝 Мои приглашённые") {
   const uname = (username || "").replace(/^@/, "").trim();
 
-  // мой баланс бонусов
   const me = await getClient(uname);
   const availableBonuses = Number(me?.referral_bonus_available || 0);
 
-  // одним запросом получаем по каждому приглашённому:
-  // - есть ли заказы
-  // - был ли delivered
-  // - последний статус
   const [rows] = await db.execute(
     `
     SELECT
@@ -3066,20 +3065,18 @@ if (text === "🤝 Мои приглашённые") {
   );
 
   if (!rows.length) {
-    const msg =
-      "👥 *Мои приглашённые*\n\n" +
+    return bot.sendMessage(
+      id,
+      "👥 Мои приглашённые\n\n" +
       "Пока никого нет.\n" +
-      "Зайди в «💸 Получить скидку» → «🔗 Моя реферальная ссылка» и отправь другу.";
-    await bot.sendMessage(id, msg, { parse_mode: "Markdown" });
-    return;
+      "Зайди в «💸 Получить скидку» → «🔗 Моя реферальная ссылка» и отправь другу."
+    );
   }
 
-  // красивые статусы
   const statusLabel = (ordersTotal, hasDelivered, lastStatus) => {
     if (!ordersTotal) return "⏳ ждём первый заказ";
     if (Number(hasDelivered) === 1) return "✅ первый заказ доставлен";
 
-    // если заказ есть, но не доставлен — показываем понятный статус
     const s = String(lastStatus || "");
     if (s === "new") return "🛒 заказ оформлен";
     if (s === "taken") return "🚚 заказ в пути";
@@ -3091,56 +3088,34 @@ if (text === "🤝 Мои приглашённые") {
   const orderedCnt = rows.filter(r => Number(r.orders_total) > 0).length;
   const deliveredCnt = rows.filter(r => Number(r.has_delivered) === 1).length;
 
-  let msg =
-    "👥 *Мои приглашённые*\n\n" +
-    `💸 Доступно скидок 2€: *${availableBonuses}*\n` +
+  const head =
+    "👥 Мои приглашённые\n\n" +
+    `💸 Доступно скидок 2€: ${availableBonuses}\n` +
     "Скидка применяется автоматически к следующему заказу.\n\n" +
-    `📌 Итоги:\n` +
-    `• Запустили бота: *${invitedCnt}*\n` +
-    `• Оформили заказ: *${orderedCnt}*\n` +
-    `• Доставлено: *${deliveredCnt}*\n\n` +
+    "📌 Итоги:\n" +
+    `• Запустили бота: ${invitedCnt}\n` +
+    `• Оформили заказ: ${orderedCnt}\n` +
+    `• Доставлено: ${deliveredCnt}\n\n` +
     "📋 Список:\n";
 
-  // список (аккуратно, по строке на человека)
-  for (const r of rows) {
-    const invited = r.invited;
-    const line = statusLabel(r.orders_total, r.has_delivered, r.last_status);
-    msg += `• @${invited} — ${line}\n`;
-  }
-
-  // Telegram лимит ~4096, на всякий случай режем по частям
+  // Telegram лимит ~4096, шлём частями
   const MAX = 3900;
-  if (msg.length <= MAX) {
-    await bot.sendMessage(id, msg, { parse_mode: "Markdown" });
-  } else {
-    // делим: шапка отдельно, список кусками
-    const head =
-      "👥 *Мои приглашённые*\n\n" +
-      `💸 Доступно скидок 2€: *${availableBonuses}*\n` +
-      "Скидка применяется автоматически к следующему заказу.\n\n" +
-      `📌 Итоги:\n` +
-      `• Запустили бота: *${invitedCnt}*\n` +
-      `• Оформили заказ: *${orderedCnt}*\n` +
-      `• Доставлено: *${deliveredCnt}*\n\n` +
-      "📋 Список:\n";
+  await bot.sendMessage(id, head);
 
-    await bot.sendMessage(id, head, { parse_mode: "Markdown" });
+  let chunk = "";
+  for (const r of rows) {
+    const invited = String(r.invited || "").trim();
+    const line = statusLabel(r.orders_total, r.has_delivered, r.last_status);
+    const rowLine = `• @${invited} — ${line}\n`;
 
-    let chunk = "";
-    for (const r of rows) {
-      const invited = r.invited;
-      const line = statusLabel(r.orders_total, r.has_delivered, r.last_status);
-      const rowLine = `• @${invited} — ${line}\n`;
-
-      if ((chunk + rowLine).length > MAX) {
-        await bot.sendMessage(id, chunk, { parse_mode: "Markdown" });
-        chunk = rowLine;
-      } else {
-        chunk += rowLine;
-      }
+    if ((chunk + rowLine).length > MAX) {
+      await bot.sendMessage(id, chunk);
+      chunk = rowLine;
+    } else {
+      chunk += rowLine;
     }
-    if (chunk) await bot.sendMessage(id, chunk, { parse_mode: "Markdown" });
   }
+  if (chunk) await bot.sendMessage(id, chunk);
 
   return;
 }
