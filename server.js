@@ -88,6 +88,46 @@ const bot = new TelegramBot(TOKEN);
 bot.deleteWebHook().catch(() => {});
 bot.on("polling_error", (err) => console.error("Polling error:", err));
 
+async function ensureClientsChatIdUnique() {
+  // 0) нормализуем "0" как NULL (чтобы не конфликтовало)
+  await db.execute(`UPDATE clients SET chat_id=NULL WHERE chat_id=0`).catch(() => {});
+
+  // 1) удаляем дубли chat_id (оставляем самую "свежую" запись)
+  // оставляем ту, у которой last_active больше (если равны — id больше)
+  await db.execute(`
+    DELETE c1
+    FROM clients c1
+    JOIN clients c2
+      ON c1.chat_id = c2.chat_id
+     AND c1.chat_id IS NOT NULL
+     AND (
+          COALESCE(c1.last_active,'1970-01-01') < COALESCE(c2.last_active,'1970-01-01')
+          OR (
+            COALESCE(c1.last_active,'1970-01-01') = COALESCE(c2.last_active,'1970-01-01')
+            AND c1.id < c2.id
+          )
+     )
+  `).catch(() => {});
+
+  // 2) добавляем UNIQUE на chat_id (если ещё нет)
+  await db.execute(
+    `ALTER TABLE clients ADD UNIQUE KEY uq_clients_chat_id (chat_id)`
+  ).catch(() => {});
+
+  // 3) РЕКОМЕНДУЮ: убрать UNIQUE с username (username может меняться/переиспользоваться)
+  // если UNIQUE уже убран — просто будет catch
+  try {
+    const [idx] = await db.execute(`SHOW INDEX FROM clients`);
+    const uniqueOnUsername = (idx || []).find(r => r.Column_name === "username" && Number(r.Non_unique) === 0);
+    if (uniqueOnUsername?.Key_name) {
+      await db.execute(`ALTER TABLE clients DROP INDEX \`${uniqueOnUsername.Key_name}\``);
+    }
+  } catch (e) {}
+
+  // 4) и поставить обычный индекс на username (для скорости)
+  await db.execute(`CREATE INDEX idx_clients_username ON clients(username)`).catch(() => {});
+}
+
 
 // ================= Инициализация БД =================
 async function initDB() {
@@ -105,9 +145,9 @@ async function initDB() {
   await db.execute(`
   CREATE TABLE IF NOT EXISTS clients (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(255) UNIQUE,
+    username VARCHAR(255),
     first_name VARCHAR(255),
-    chat_id BIGINT,
+    chat_id BIGINT UNIQUE,
     banned TINYINT(1) DEFAULT 0,
     subscribed TINYINT DEFAULT 1,
     city VARCHAR(255),
@@ -115,6 +155,7 @@ async function initDB() {
     last_active DATETIME
   )
 `);
+
 
 
   await db.execute(`
@@ -284,6 +325,8 @@ await db.execute(`
     console.log("orders.referral_bonus_spent добавлена");
   } catch (e) {}
 
+  await ensureClientsChatIdUnique();
+
   console.log("База данных и таблицы готовы");
 }
 
@@ -332,18 +375,45 @@ function isCourier(username) { return !!COURIERS[username]; }
 
 // ================= Клиенты =================
 async function addOrUpdateClient(username, first_name, chat_id) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+  const uname = String(username || "").replace(/^@/, "").trim();
+  const fname = String(first_name || "");
+  const chatId = chat_id ? Number(chat_id) : null;
 
-  await db.execute(`
+  if (!uname) return;
+
+  // ✅ основной путь — апдейт/инсерт по UNIQUE chat_id
+  if (chatId) {
+    await db.execute(
+      `
+      INSERT INTO clients (chat_id, username, first_name, subscribed, created_at, last_active)
+      VALUES (?, ?, ?, 1, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        username = VALUES(username),
+        first_name = VALUES(first_name),
+        last_active = VALUES(last_active),
+        subscribed = 1
+      `,
+      [chatId, uname, fname, now, now]
+    );
+    return;
+  }
+
+  // запасной путь, если chat_id неизвестен
+  await db.execute(
+    `
     INSERT INTO clients (username, first_name, subscribed, created_at, last_active, chat_id)
-    VALUES (?, ?, 1, ?, ?, ?)
+    VALUES (?, ?, 1, ?, ?, NULL)
     ON DUPLICATE KEY UPDATE
       first_name = VALUES(first_name),
       last_active = VALUES(last_active),
-      chat_id = VALUES(chat_id),
       subscribed = 1
-  `, [username, first_name, now, now, chat_id]);
+    `,
+    [uname, fname, now, now]
+  );
 }
+
+
 
 async function getClient(username) {
   const [rows] = await db.execute("SELECT * FROM clients WHERE username=?", [username]);
@@ -723,7 +793,7 @@ function buildOrderMessage(order) {
     `🚚 Доставка: ${order.delivery || "—"}`,
     `💰 Оплата: ${order.payment || "—"}`,
     `📝 Заказ: ${order.orderText || "—"}`,
-    `📅 Дата: ${order.date || "—"}`,
+    `📅 Дата: ${order.date ? new Date(order.date).toLocaleDateString("ru-RU") : "—"}`,
     `⏰ Время: ${order.time || "—"}`,
     `🚚 Курьер: ${withAt(order.courier_username || "—")}`,
     `📌 Статус: ${order.status || "—"}`
@@ -1016,13 +1086,13 @@ async function restoreOrdersForClients() {
   const limit = pLimit(5);
 
   for (const client of clients) {
-    const [orders] = await db.execute(
-      `SELECT * FROM orders
-       WHERE REPLACE(tgNick,'@','') = ?
-       AND status IN ('new','taken')
-       ORDER BY created_at DESC`,
-      [client.username]
-    );
+   const [orders] = await db.execute(
+  `SELECT * FROM orders
+   WHERE client_chat_id = ?
+   AND status IN ('new','taken')
+   ORDER BY created_at DESC`,
+  [client.chat_id]
+);
 
     const tasks = orders.map(order =>
       limit(async () => {
@@ -1111,6 +1181,346 @@ async function restoreOrdersForCouriers() {
 })();
 
 
+// ================= ПАГИНАЦИЯ ЗАКАЗОВ В ПАНЕЛИ КУРЬЕРА =================
+const ORDERS_PAGE_SIZE = 10;
+
+// chatId -> { msgId, type, page, view: 'list'|'detail', orderId, role, username }
+const ordersPagerState = new Map();
+
+function typeLabel(t) {
+  if (t === "new") return "🆕 Новые заказы";
+  if (t === "taken") return "🚚 Взятые заказы";
+  if (t === "del") return "✅ Выполненные заказы";
+  return "Заказы";
+}
+
+function typeToStatus(t) {
+  if (t === "new") return "new";
+  if (t === "taken") return "taken";
+  if (t === "del") return "delivered";
+  return "new";
+}
+
+function buildPagerKeyboardList(type, page, pages, orders) {
+  // кнопки заказов (по 2 в ряд)
+  const rows = [];
+  let row = [];
+  for (const o of orders) {
+    row.push({ text: `№${o.id}`, callback_data: `pgopen_${type}_${page}_${o.id}` });
+    if (row.length === 2) { rows.push(row); row = []; }
+  }
+  if (row.length) rows.push(row);
+
+  // навигация
+  const nav = [];
+  if (page > 1) nav.push({ text: "⬅️", callback_data: `pg_${type}_${page - 1}` });
+  else nav.push({ text: "·", callback_data: "noop" });
+
+  nav.push({ text: "🔄", callback_data: `pg_${type}_${page}` });
+
+  if (page < pages) nav.push({ text: "➡️", callback_data: `pg_${type}_${page + 1}` });
+  else nav.push({ text: "·", callback_data: "noop" });
+
+  rows.push(nav);
+
+  // переключатели типов + закрыть
+  rows.push([
+    { text: "🆕", callback_data: "pg_new_1" },
+    { text: "🚚", callback_data: "pg_taken_1" },
+    { text: "✅", callback_data: "pg_del_1" }
+  ]);
+
+  rows.push([{ text: "❌ Закрыть", callback_data: "pgclose" }]);
+
+  return { inline_keyboard: rows };
+}
+
+async function fetchOrdersPagerPage({ type, page, role, username }) {
+  const status = typeToStatus(type);
+  const p = Math.max(1, Number(page) || 1);
+
+  const offset = (p - 1) * ORDERS_PAGE_SIZE;
+
+  // admin может смотреть taken/delivered ВСЕ (а courier — только свои)
+  const isAdmin = role === "admin";
+  const courierName = String(username || "").replace(/^@/, "");
+
+  let where = "status=?";
+  const paramsCount = [status];
+  const paramsList = [status];
+
+  if (status === "new") {
+    where += " AND courier_username IS NULL";
+  } else {
+    // taken/delivered
+    if (!isAdmin) {
+      where += " AND courier_username=?";
+      paramsCount.push(courierName);
+      paramsList.push(courierName);
+    }
+  }
+
+  // count
+  const [[cntRow]] = await db.execute(
+    `SELECT COUNT(*) AS cnt FROM orders WHERE ${where}`,
+    paramsCount
+  );
+  const total = Number(cntRow?.cnt || 0);
+  const pages = Math.max(1, Math.ceil(total / ORDERS_PAGE_SIZE));
+  const pageClamped = Math.min(Math.max(1, p), pages);
+  const offsetClamped = (pageClamped - 1) * ORDERS_PAGE_SIZE;
+
+  // сортировка
+  let orderBy = "created_at DESC";
+  if (status === "taken") orderBy = "taken_at DESC";
+  if (status === "delivered") orderBy = "delivered_at DESC";
+
+  const [rows] = await db.execute(
+    `SELECT * FROM orders WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+    [...paramsList, ORDERS_PAGE_SIZE, offsetClamped]
+  );
+
+  return { total, pages, page: pageClamped, orders: rows || [] };
+}
+
+function priceLine(order) {
+  const op = Number(order.original_price || 0);
+  const fp = Number(order.final_price || 0);
+
+  if (fp > 0 && op > 0 && fp < op) return `${fp.toFixed(2)}€ (вместо ${op.toFixed(2)}€)`;
+  if (fp > 0) return `${fp.toFixed(2)}€`;
+  if (op > 0) return `${op.toFixed(2)}€`;
+  return "—";
+}
+
+async function renderOrdersPagerList(chatId, msgId, type, page, role, username) {
+const data = await fetchOrdersPagerPage({ type, page, role, username });
+
+
+  const head =
+    `${typeLabel(type)}\n` +
+    `📄 Страница ${data.page}/${data.pages} • всего: ${data.total}\n\n`;
+
+  if (!data.orders.length) {
+    const text = head + "Пусто.";
+    const kb = buildPagerKeyboardList(type, data.page, data.pages, []);
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: kb });
+    } catch (e) {
+      // если "message is not modified" — игнор
+    }
+    ordersPagerState.set(chatId, { msgId, type, page: data.page, view: "list", orderId: null, role, username });
+    return;
+  }
+
+  const lines = data.orders.map((o, i) => {
+    const client = withAt(o.tgNick);
+    const city = o.city || "—";
+    const time = o.time || "—";
+    const pr = priceLine(o);
+    return `${i + 1}) №${o.id} • ${client} • ${city} • ${pr} • ${time}`;
+  });
+
+  const text = head + lines.join("\n");
+  const kb = buildPagerKeyboardList(type, data.page, data.pages, data.orders);
+
+  try {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: kb });
+  } catch (e) {}
+
+  ordersPagerState.set(chatId, { msgId, type, page: data.page, view: "list", orderId: null, role, username });
+}
+
+async function renderOrdersPagerDetail(chatId, msgId, type, page, orderId, role, username) {
+  const order = await getOrderById(orderId);
+  if (!order) {
+    await bot.answerCallbackQuery(chatId, { text: "Заказ не найден", show_alert: true }).catch(() => {});
+    return;
+  }
+
+  const text = buildTextForOrder(order);
+
+  // действия (как у тебя) + кнопка назад + закрыть
+  const kbRows = buildKeyboardForRecipient(order, { role, username });
+  kbRows.push([{ text: "⬅️ Назад к списку", callback_data: `pg_${type}_${page}` }]);
+  kbRows.push([{ text: "❌ Закрыть", callback_data: "pgclose" }]);
+
+  try {
+    await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: msgId,
+      reply_markup: { inline_keyboard: kbRows }
+    });
+  } catch (e) {}
+
+  ordersPagerState.set(chatId, { msgId, type, page, view: "detail", orderId, role, username });
+}
+
+async function openOrdersPager(chatId, username, role, type) {
+  // создаём одно сообщение и дальше только редактируем
+  const sent = await bot.sendMessage(chatId, "⏳ Загружаю заказы...", {
+    reply_markup: { inline_keyboard: [[{ text: "·", callback_data: "noop" }]] }
+  });
+
+  ordersPagerState.set(chatId, { msgId: sent.message_id, type, page: 1, view: "list", orderId: null, role, username });
+  await renderOrdersPagerList(chatId, sent.message_id, type, 1, role, username);
+}
+
+
+// ================= ПАГИНАЦИЯ ДЛЯ ПАНЕЛИ КУРЬЕРА (10 заказов/страница) =================
+const PAGE_SIZE = 10;
+
+// запоминаем message_id списка, чтобы не спамить новыми сообщениями
+const PANEL_LIST_MSG = new Map(); // key: `${chatId}:${mode}` -> messageId
+
+function panelKey(chatId, mode) {
+  return `${chatId}:${mode}`;
+}
+
+function modeTitle(mode) {
+  if (mode === "new") return "🆕 Новые заказы";
+  if (mode === "taken") return "🚚 Взятые заказы";
+  if (mode === "delivered") return "✅ Выполненные заказы";
+  return "📦 Заказы";
+}
+
+function safeFixed2(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "—";
+  return x.toFixed(2);
+}
+
+// короткая строка, без orderText
+function shortOrderLine(o) {
+  const nick = withAt(o.tgNick);
+  const city = o.city || "—";
+  const price = (o.final_price != null) ? `${safeFixed2(o.final_price)}€` : "—";
+  const time = o.time || "—";
+  return `№${o.id} • ${nick} • ${city} • ${price} • ${time}`;
+}
+
+// грузим 1 страницу + общее количество
+async function fetchPanelOrdersPage(mode, courierUsername, page) {
+  const p = Math.max(1, Number(page || 1));
+  const offset = (p - 1) * PAGE_SIZE;
+
+  let where = "";
+  let params = [];
+
+  if (mode === "new") {
+    where = "WHERE status='new' AND courier_username IS NULL";
+  } else if (mode === "taken") {
+    where = "WHERE status='taken' AND courier_username=?";
+    params.push(String(courierUsername || "").replace(/^@/, ""));
+  } else if (mode === "delivered") {
+    where = "WHERE status='delivered' AND courier_username=?";
+    params.push(String(courierUsername || "").replace(/^@/, ""));
+  } else {
+    where = "WHERE status IN ('new','taken','delivered')";
+  }
+
+  const [[cntRow]] = await db.execute(
+    `SELECT COUNT(*) AS cnt FROM orders ${where}`,
+    params
+  );
+  const total = Number(cntRow?.cnt || 0);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  const pageFixed = Math.min(p, totalPages);
+  const offsetFixed = (pageFixed - 1) * PAGE_SIZE;
+
+  const [rows] = await db.execute(
+    `
+    SELECT * FROM orders
+    ${where}
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?
+    `,
+    [...params, PAGE_SIZE, offsetFixed]
+  );
+
+  return { rows, total, totalPages, page: pageFixed };
+}
+
+async function showOrdersList(chatId, role, username, mode, page, editMessageId) {
+  const courierUsername = (role === "courier" || role === "admin") ? username : null;
+const { rows, total, totalPages, page: p } = await fetchPanelOrdersPage(mode, courierUsername, page);
+
+
+  let text = `${modeTitle(mode)}\nСтраница: ${p}/${totalPages}\nВсего: ${total}\n\n`;
+
+  if (!rows.length) {
+    text += "Пусто.";
+  } else {
+    rows.forEach((o, i) => {
+      text += `${(i + 1) + (p - 1) * PAGE_SIZE}) ${shortOrderLine(o)}\n`;
+    });
+  }
+
+  // клавиатура: список кнопок "№ID" (открыть детали)
+  const kb = [];
+  rows.forEach(o => {
+    kb.push([{ text: `№${o.id}`, callback_data: `view_${o.id}_${mode}_${p}` }]);
+  });
+
+  // навигация
+  const nav = [];
+  if (p > 1) nav.push({ text: "⬅️ Назад", callback_data: `page_${mode}_${p - 1}` });
+  nav.push({ text: "🔄 Обновить", callback_data: `page_${mode}_${p}` });
+  if (p < totalPages) nav.push({ text: "Вперёд ➡️", callback_data: `page_${mode}_${p + 1}` });
+
+  if (nav.length) kb.push(nav);
+
+  const opts = { reply_markup: { inline_keyboard: kb } };
+
+  // редактируем существующее сообщение списка, чтобы не спамить
+  if (editMessageId) {
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: editMessageId, ...opts });
+      return editMessageId;
+    } catch (e) {
+      // если не получилось отредактировать — шлём новое
+    }
+  }
+
+  const sent = await bot.sendMessage(chatId, text, opts);
+  PANEL_LIST_MSG.set(panelKey(chatId, mode), sent.message_id);
+  return sent.message_id;
+}
+
+async function showOrderDetails(chatId, role, username, orderId, mode, page, editMessageId) {
+  const order = await getOrderById(String(orderId));
+  if (!order) {
+    // вернём к списку
+    return showOrdersList(chatId, role, username, mode, page, editMessageId);
+  }
+
+  // полный текст (как у тебя)
+  const fullText = buildTextForOrder(order);
+
+  // твои кнопки действий (взять/доставлено/отказаться/и т.д.)
+  const actionKb = buildKeyboardForRecipient(order, { role, username });
+
+  // добавляем кнопку "назад к списку"
+  const kb = [];
+  if (actionKb && actionKb.length) {
+    actionKb.forEach(r => kb.push(r));
+  }
+  kb.push([{ text: "⬅️ Назад к списку", callback_data: `back_${mode}_${page}` }]);
+
+  const opts = { reply_markup: { inline_keyboard: kb } };
+
+  try {
+    await bot.editMessageText(fullText, { chat_id: chatId, message_id: editMessageId, ...opts });
+    return editMessageId;
+  } catch (e) {
+    // если не редактируется — отправим новым
+    const sent = await bot.sendMessage(chatId, fullText, opts);
+    return sent.message_id;
+  }
+}
+
+
 // ============== Telegram: callback =================
 
 bot.on("callback_query", async (q) => {
@@ -1118,6 +1528,53 @@ bot.on("callback_query", async (q) => {
   const data = q.data || "";
   const fromId = q.from.id;
   const username = q.from.username;
+
+    // ===== ПАГИНАЦИЯ ПАНЕЛИ КУРЬЕРА (список/детали) =====
+  try {
+    if (data.startsWith("page_") || data.startsWith("view_") || data.startsWith("back_")) {
+      const chatId = fromId;
+      const role = (fromId === ADMIN_ID) ? "admin" : (isCourier(username) ? "courier" : "client");
+
+      // message_id списка (чтобы редактировать)
+      const listMsgId =
+        q.message?.message_id ||
+        PANEL_LIST_MSG.get(panelKey(chatId, (data.split("_")[1] || ""))) ||
+        null;
+
+      if (data.startsWith("page_")) {
+        const parts = data.split("_"); // page_mode_page
+        const mode = parts[1];
+        const page = Number(parts[2] || 1);
+        await showOrdersList(chatId, role, username, mode, page, listMsgId);
+        await bot.answerCallbackQuery(q.id);
+        return;
+      }
+
+      if (data.startsWith("view_")) {
+        const parts = data.split("_"); // view_orderId_mode_page
+        const orderId = parts[1];
+        const mode = parts[2];
+        const page = Number(parts[3] || 1);
+        await showOrderDetails(chatId, role, username, orderId, mode, page, listMsgId);
+        await bot.answerCallbackQuery(q.id);
+        return;
+      }
+
+      if (data.startsWith("back_")) {
+        const parts = data.split("_"); // back_mode_page
+        const mode = parts[1];
+        const page = Number(parts[2] || 1);
+        await showOrdersList(chatId, role, username, mode, page, listMsgId);
+        await bot.answerCallbackQuery(q.id);
+        return;
+      }
+    }
+  } catch (e) {
+    console.error("[PANEL PAGINATION ERROR]", e?.message || e);
+    try { await bot.answerCallbackQuery(q.id); } catch {}
+    // не return, пусть дальше твой старый код обработает другие callbacks
+  }
+
 
   console.log(`[CALLBACK] Пользователь @${username} (${fromId}) нажал: ${data}`);
 
@@ -1897,11 +2354,12 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
   try {
     // Проверяем, новый ли пользователь
-    const [existing] = await db.execute(
-      "SELECT id FROM clients WHERE username=?",
-      [username]
-    );
-    const isNew = existing.length === 0;
+   const [existing] = await db.execute(
+  "SELECT id FROM clients WHERE chat_id=? LIMIT 1",
+  [id]
+);
+const isNew = existing.length === 0;
+
 
     // Сохраняем/обновляем клиента
     await addOrUpdateClient(username, first_name, id);
@@ -2119,26 +2577,70 @@ if (text === "Взятые сейчас" && id === ADMIN_ID) {
 
 
 
-// ===== Админ: Сводка курьеров =====
-if (text === "Сводка курьеров" && id === ADMIN_ID) {
-  const [rows] = await db.execute(`
-    SELECT
-      c.username,
-      SUM(o.status='taken') AS taken_cnt,
-      SUM(o.status='delivered' AND DATE(o.delivered_at)=CURDATE()) AS delivered_today
-    FROM couriers c
-    LEFT JOIN orders o ON o.courier_username = c.username
-    GROUP BY c.username
-    ORDER BY taken_cnt DESC, delivered_today DESC
-  `);
+// ===== Админ: Сводка курьеров (доставленные ЗА СЕГОДНЯ + фулл инфа по каждому заказу) =====
+if (text === "✅ Доставлено сегодня" && id === ADMIN_ID) {
+  try {
+    // ⚠️ ВАЖНО: DATE(delivered_at)=CURDATE() зависит от таймзоны MySQL.
+    // Если MySQL в UTC, "сегодня" будет по UTC. Пока оставляем как у тебя раньше.
 
-  if (!rows.length) return bot.sendMessage(id, "Нет курьеров");
+    // 1) Список курьеров
+    const [couriers] = await db.execute(
+      "SELECT username FROM couriers ORDER BY username ASC"
+    );
 
-  const lines = rows.map(r =>
-    `@${r.username}: взято=${r.taken_cnt || 0}, выполнено сегодня=${r.delivered_today || 0}`
-  ).join("\n");
+    if (!couriers.length) {
+      await bot.sendMessage(id, "Нет курьеров");
+      return;
+    }
 
-  return bot.sendMessage(id, "📌 Сводка курьеров:\n" + lines);
+    // 2) Все delivered за сегодня одним запросом
+    const [todayOrders] = await db.execute(
+      `SELECT * FROM orders
+       WHERE status='delivered'
+         AND delivered_at IS NOT NULL
+         AND DATE(delivered_at)=CURDATE()
+       ORDER BY delivered_at DESC`
+    );
+
+    // 3) Группируем по courier_username
+    const byCourier = {};
+    for (const o of todayOrders) {
+      const c = String(o.courier_username || "").replace(/^@/, "").trim();
+      if (!c) continue;
+      if (!byCourier[c]) byCourier[c] = [];
+      byCourier[c].push(o);
+    }
+
+    const todayStr = new Date().toLocaleDateString("ru-RU");
+    await bot.sendMessage(id, `📦 Сводка курьеров за сегодня (${todayStr})`);
+
+    // 4) Отправляем по каждому курьеру: шапка + ВСЕ заказы фулл инфой
+    for (const c of couriers) {
+      const courierU = String(c.username || "").replace(/^@/, "").trim();
+      const list = byCourier[courierU] || [];
+
+      await bot.sendMessage(
+        id,
+        `🚚 Курьер: @${courierU}\n✅ Доставлено сегодня: ${list.length}`
+      );
+
+      if (!list.length) continue;
+
+      // фулл карточка заказа (твой buildTextForOrder)
+      for (const o of list) {
+        await bot.sendMessage(id, buildTextForOrder(o));
+      }
+
+      // разделитель, чтобы читаемо
+      await bot.sendMessage(id, "——————————————");
+    }
+
+    return;
+  } catch (err) {
+    console.error("[Сводка курьеров] error:", err?.message || err);
+    await bot.sendMessage(id, "Ошибка при формировании сводки курьеров");
+    return;
+  }
 }
 
 
@@ -2299,7 +2801,7 @@ if (adminWaitingOrdersCourier.has(username)) {
        keyboard: [
    [{ text: "Статистика" }, { text: "Курьеры" }],
   [{ text: "Активные по курьеру" }, { text: "Выполненные по курьеру" }],
-  [{ text: "Взятые сейчас" }, { text: "Сводка курьеров" }],
+  [{ text: "Взятые сейчас" }, { text: "✅ Доставлено сегодня" }],
   [{ text: "🤝 Рефералы" }, { text: "🚨 Логи рефералов" }],
   [{ text: "Добавить курьера" }, { text: "Удалить курьера" }],
   [{ text: "Список курьеров" }, { text: "Все пользователи" }],
@@ -2659,31 +3161,30 @@ if (text === "👤 Личный кабинет") {
 
     // Всего заказов
     const [[{ cnt: totalOrders }]] = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ?",
-      [uname]
-    );
+  "SELECT COUNT(*) AS cnt FROM orders WHERE client_chat_id=?",
+  [id]
+);
 
-    // Статусы заказов
-    const [[{ cnt: newCnt }]] = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='new'",
-      [uname]
-    );
+const [[{ cnt: newCnt }]] = await db.execute(
+  "SELECT COUNT(*) AS cnt FROM orders WHERE client_chat_id=? AND status='new'",
+  [id]
+);
 
-    const [[{ cnt: takenCnt }]] = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='taken'",
-      [uname]
-    );
+const [[{ cnt: takenCnt }]] = await db.execute(
+  "SELECT COUNT(*) AS cnt FROM orders WHERE client_chat_id=? AND status='taken'",
+  [id]
+);
 
-    const [[{ cnt: deliveredCnt }]] = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','') = ? AND status='delivered'",
-      [uname]
-    );
+const [[{ cnt: deliveredCnt }]] = await db.execute(
+  "SELECT COUNT(*) AS cnt FROM orders WHERE client_chat_id=? AND status='delivered'",
+  [id]
+);
 
-    // Последний заказ
-    const [lastOrders] = await db.execute(
-      "SELECT id, status, created_at FROM orders WHERE REPLACE(tgNick,'@','')=? ORDER BY created_at DESC LIMIT 1",
-      [uname]
-    );
+const [lastOrders] = await db.execute(
+  "SELECT id, status, created_at FROM orders WHERE client_chat_id=? ORDER BY created_at DESC LIMIT 1",
+  [id]
+);
+
     const lastOrder = lastOrders[0];
 
     // Клиент из БД (у тебя уже есть getClient)
@@ -2774,10 +3275,11 @@ if (text === "🧾 Мои заказы") {
 if (text === "Активные заказы") {
   const uname = (username || "").replace(/^@/, "");
 
-  const [orders] = await db.execute(
-    "SELECT * FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('new','taken') ORDER BY created_at DESC",
-    [uname]
-  );
+ const [orders] = await db.execute(
+  "SELECT * FROM orders WHERE client_chat_id=? AND status IN ('new','taken') ORDER BY created_at DESC",
+  [id]
+);
+
 
   if (!orders.length) return bot.sendMessage(id, "Активных заказов нет");
 
@@ -2793,9 +3295,9 @@ if (text === "Выполненные заказы") {
   const uname = (username || "").replace(/^@/, "");
 
   const [orders] = await db.execute(
-    "SELECT * FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('delivered','canceled') ORDER BY created_at DESC",
-    [uname]
-  );
+  "SELECT * FROM orders WHERE client_chat_id=? AND status IN ('delivered','canceled') ORDER BY created_at DESC",
+  [id]
+);
 
   if (!orders.length) return bot.sendMessage(id, "Выполненных заказов нет");
 
@@ -3243,20 +3745,16 @@ if (id === ADMIN_ID) {
     params = [courierName];
   }
 
-const [orders] = await db.execute(query, params);
+// вместо 50 сообщений — показываем 1 страницу списком (10 шт)
+let mode = "new";
+if (text === "Взятые заказы") mode = "taken";
+if (text === "Выполненные заказы") mode = "delivered";
 
-if (!orders.length) {
-  await bot.sendMessage(id, emptyText);
-  return;
-}
+const role = (id === ADMIN_ID) ? "admin" : "courier";
 
-await bot.sendMessage(id, `Найдено заказов: ${orders.length}`);
-
-for (const order of orders) {
-  await clearOrderMessage(order.id, id); // ✅ чтобы прислало заново
-  await sendOrUpdateOrderToChat(order, id, "courier", username);
-}
-
+// создаём/обновляем “список” как ОДНО сообщение
+const existingMsgId = PANEL_LIST_MSG.get(panelKey(id, mode)) || null;
+await showOrdersList(id, role, username, mode, 1, existingMsgId);
 return;
 } // закрыли IF
 
@@ -3371,15 +3869,8 @@ if (!/^[a-zA-Z0-9_]{3,32}$/.test(cleanUsername)) {
 console.log(`[API] Новый заказ от @${cleanUsername}`);
 
 // ✅ 3) гарантируем что клиент есть в БД ДО расчёта скидок
-await db.execute(
-  `INSERT INTO clients (username, chat_id, banned, created_at, last_active, subscribed)
-   VALUES (?, ?, 0, NOW(), NOW(), 1)
-   ON DUPLICATE KEY UPDATE
-     chat_id = VALUES(chat_id),
-     last_active = NOW(),
-     subscribed = 1`,
-  [cleanUsername, clientChatIdNum || null]
-);
+await addOrUpdateClient(cleanUsername, tgUser?.first_name || "", clientChatIdNum);
+
 
 // 4) получаем клиента уже гарантированно
 const client = await getClient(cleanUsername);
@@ -3464,6 +3955,23 @@ console.log("[PRICE]", {
   ordersCount
 });
 
+// ===== ИТОГОВОЕ КОЛИЧЕСТВО И ИТОГОВАЯ СУММА (если в заказе 2+ шт) =====
+const qtyMatches = String(orderText || "").match(/×\s*(\d+)\s*шт/gi) || [];
+let totalQty = 0;
+
+for (const m of qtyMatches) {
+  const mm = m.match(/×\s*(\d+)\s*шт/i);
+  if (mm && mm[1]) totalQty += Number(mm[1]) || 0;
+}
+
+// если вдруг не распарсилось — считаем 1
+if (!totalQty || totalQty < 1) totalQty = 1;
+
+// originalPrice / finalPrice у тебя — это ЦЕНА ЗА 1 ШТ
+const originalTotal = Number(originalPrice || 15) * totalQty;
+const finalTotal = Number(finalPrice || 15) * totalQty;
+
+
 // ✅ уведомление пригласившему: друг оформил первый заказ (1 раз)
 try {
   if (discountType === "first_order" && client?.referrer) {
@@ -3543,8 +4051,8 @@ try {
       time,
       status: "new",
       client_chat_id: clientChatIdNum,
-      original_price: originalPrice,
-      final_price: finalPrice,
+      original_price: originalTotal,
+      final_price: finalTotal,
       discount_type: discountType,
 
       // ✅ для возврата при отмене/удалении
