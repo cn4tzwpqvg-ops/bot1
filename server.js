@@ -3021,7 +3021,7 @@ bot.on("message", async (msg) => {
 if (text.startsWith("/start")) return;
 
   // ===== ADMIN: создать промокод под юзера =====
- if (Number(id) === Number(ADMIN_ID) && text.startsWith("/promo")) {
+if (Number(id) === Number(ADMIN_ID) && /^\/promo(\s|$)/.test(text)) {
   const parts = text.split(" ").filter(Boolean);
   const target = parts[1] || null; // /promo OR /promo @username
 
