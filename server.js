@@ -69,9 +69,12 @@ const adminStartKeyboard = {
 // ================= Настройки1 =================
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
-const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 7664644901;
-const PORT = 3000;
+const ADMIN_ID = Number(process.env.ADMIN_ID || 7664644901);
+
+// Railway: порт задаётся платформой через env PORT
+const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
+
 
 
 // ================= Состояние =================
@@ -3268,13 +3271,19 @@ app.use(cors({
     "https://cn4tzwpqvg-ops.github.io",
     "https://cn4tzwpqvg-ops.github.io/crazycloud"
   ],
-  methods: ["GET","POST","OPTIONS"],
+  methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
 
 app.use(express.json());
+
+// ✅ health-check endpoints
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+
 
 // Функция для рассылки обновлений stock всем подключённым клиентам WebSocket
 function broadcastStock() {
@@ -3696,5 +3705,5 @@ const tgNick = body.tgNick || body.tgUser?.username;  // ✅ добавили fa
 
 // ================= Запуск сервера =================
 server.listen(PORT, HOST, () => {
-  console.log(`Server running at port ${PORT}`);
+  console.log(`Server running on ${HOST}:${PORT}`);
 });
