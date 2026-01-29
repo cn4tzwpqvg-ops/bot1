@@ -2481,17 +2481,19 @@ const isNew = existing.length === 0;
       }
     }
 
-    // ===== ТЕКСТ ПРИВЕТСТВИЯ (1 основное сообщение) =====
- let welcomeText = [
+   // ===== ТЕКСТ ПРИВЕТСТВИЯ (1 основное сообщение) =====
+let welcomeText = [
   "👋 Добро пожаловать в *CRAZY CLOUD!*",
   "",
   "🛒 Оформляйте заказ прямо в боте",
   "🚚 Доставка по вашему городу в день заказа",
-  "⭐ Отзывы клиентов: [crazy_cloud_reviews](https://t.me/crazy_cloud_reviews)",
+  "⭐ Отзывы клиентов:",
+  "[crazy_cloud_reviews](https://t.me/crazy_cloud_reviews)",
   "",
   "Чтобы оформить заказ, нажмите",
   "КУПИТЬ ЖИЖУ 👇"
 ].join("\n");
+
 
 
 
@@ -3037,13 +3039,15 @@ const msg =
   return;
 }
 
-// ===== 📊 МОИ ПРИГЛАШЁННЫЕ (БЕЗ Markdown, чтобы _ в никах не ломал сообщение) =====
+// ===== 📊 МОИ ПРИГЛАШЁННЫЕ (шапка отдельно, список отдельным сообщением) =====
 if (text === "🤝 Мои приглашённые") {
   const uname = (username || "").replace(/^@/, "").trim();
 
+  // мой баланс бонусов
   const me = await getClient(uname);
   const availableBonuses = Number(me?.referral_bonus_available || 0);
 
+  // одним запросом по каждому приглашённому
   const [rows] = await db.execute(
     `
     SELECT
@@ -3065,14 +3069,15 @@ if (text === "🤝 Мои приглашённые") {
   );
 
   if (!rows.length) {
-    return bot.sendMessage(
-      id,
-      "👥 Мои приглашённые\n\n" +
+    const msg =
+      "👥 *Мои приглашённые*\n\n" +
       "Пока никого нет.\n" +
-      "Зайди в «💸 Получить скидку» → «🔗 Моя реферальная ссылка» и отправь другу."
-    );
+      "Зайди в «💸 Получить скидку» → «🔗 Моя реферальная ссылка» и отправь другу.";
+    await bot.sendMessage(id, msg, { parse_mode: "Markdown" });
+    return;
   }
 
+   // красивые статусы
   const statusLabel = (ordersTotal, hasDelivered, lastStatus) => {
     if (!ordersTotal) return "⏳ ждём первый заказ";
     if (Number(hasDelivered) === 1) return "✅ первый заказ доставлен";
@@ -3088,34 +3093,42 @@ if (text === "🤝 Мои приглашённые") {
   const orderedCnt = rows.filter(r => Number(r.orders_total) > 0).length;
   const deliveredCnt = rows.filter(r => Number(r.has_delivered) === 1).length;
 
-  const head =
-    "👥 Мои приглашённые\n\n" +
-    `💸 Доступно скидок 2€: ${availableBonuses}\n` +
+  // ✅ 1) Первое сообщение — итоги (без списка), но "📋 Список:" в конце
+  const headMsg =
+    "👥 *Мои приглашённые*\n\n" +
+    `💸 Доступно скидок 2€: *${availableBonuses}*\n` +
     "Скидка применяется автоматически к следующему заказу.\n\n" +
     "📌 Итоги:\n" +
-    `• Запустили бота: ${invitedCnt}\n` +
-    `• Оформили заказ: ${orderedCnt}\n` +
-    `• Доставлено: ${deliveredCnt}\n\n` +
-    "📋 Список:\n";
+    `• Запустили бота: *${invitedCnt}*\n` +
+    `• Оформили заказ: *${orderedCnt}*\n` +
+    `• Доставлено: *${deliveredCnt}*\n\n` +
+    "📋 Список:";
 
-  // Telegram лимит ~4096, шлём частями
-  const MAX = 3900;
-  await bot.sendMessage(id, head);
+  await bot.sendMessage(id, headMsg, { parse_mode: "Markdown" });
 
-  let chunk = "";
-  for (const r of rows) {
-    const invited = String(r.invited || "").trim();
+  // ✅ 2) Второе сообщение — список отдельным сообщением (и режем по лимиту)
+  const lines = rows.map(r => {
+    const invited = r.invited;
     const line = statusLabel(r.orders_total, r.has_delivered, r.last_status);
-    const rowLine = `• @${invited} — ${line}\n`;
+    return `• @${invited} — ${line}`;
+  });
 
-    if ((chunk + rowLine).length > MAX) {
-      await bot.sendMessage(id, chunk);
-      chunk = rowLine;
+  const MAX = 3900; // безопасно ниже лимита Telegram
+  let chunk = "";
+
+  for (const line of lines) {
+    const add = (chunk ? "\n" : "") + line;
+    if ((chunk + add).length > MAX) {
+      await bot.sendMessage(id, chunk); // список без Markdown — просто текст
+      chunk = line;
     } else {
-      chunk += rowLine;
+      chunk += add;
     }
   }
-  if (chunk) await bot.sendMessage(id, chunk);
+
+  if (chunk) {
+    await bot.sendMessage(id, chunk);
+  }
 
   return;
 }
