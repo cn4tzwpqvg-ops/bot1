@@ -1567,10 +1567,8 @@ async function showOrdersFullCards(chatId, role, username, mode) {
   let query = "";
   let params = [];
   let emptyText = "";
-  let title = "";
 
   if (mode === "new") {
-    title = "🆕 Новые заказы";
     emptyText = "Нет новых заказов";
     query = `
       SELECT * FROM orders
@@ -1578,7 +1576,6 @@ async function showOrdersFullCards(chatId, role, username, mode) {
       ORDER BY created_at DESC
     `;
   } else if (mode === "taken") {
-    title = "🚚 Взятые заказы";
     emptyText = "Нет взятых заказов";
     query = `
       SELECT * FROM orders
@@ -1596,14 +1593,15 @@ async function showOrdersFullCards(chatId, role, username, mode) {
     return bot.sendMessage(chatId, emptyText);
   }
 
-  // Шапка (можешь убрать если не нужна)
-  await bot.sendMessage(chatId, `${title}: ${orders.length}`);
-
-  // IMPORTANT: sendOrUpdateOrderToChat сам добавит кнопки по роли/владельцу
   for (const o of orders) {
+    // 🔥 чтобы карточка пришла "сейчас" вниз — удаляем старую
+    await deleteOrderMessageForChat(o.id, chatId);
+
+    // ✅ отправляем фулл инфу + кнопки
     await sendOrUpdateOrderToChat(o, chatId, role, username);
   }
 }
+
 
 
 async function showOrderDetails(chatId, role, username, orderId, mode, page, editMessageId) {
