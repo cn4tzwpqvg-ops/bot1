@@ -182,14 +182,19 @@ async function ensureClientsChatIdUnique() {
 // ================= Инициализация БД =================
 async function initDB() {
   db = await mysql.createConnection({
-    host: process.env.MYSQLHOST,
-    user: process.env.MYSQLUSER,
-    password: process.env.MYSQL_ROOT_PASSWORD,
-   database: process.env.MYSQLDATABASE,
-    port: parseInt(process.env.MYSQLPORT) || 3306
-  });
+  host: process.env.MYSQLHOST,
+  user: process.env.MYSQLUSER,
+  password: process.env.MYSQL_ROOT_PASSWORD,
+  database: process.env.MYSQLDATABASE,
+  port: parseInt(process.env.MYSQLPORT) || 3306,
+  timezone: "+03:00",
+});
 
   console.log("MySQL connected");
+
+  // чтобы CURDATE() и DATE() считались в вашей зоне (Симферополь = UTC+3)
+await db.execute("SET time_zone = '+03:00'").catch(() => {});
+
 
   // ===== Создание таблиц =====
   await db.execute(`
@@ -287,6 +292,34 @@ await db.execute(`
     )
   `);
 
+  // ===== КАМПАНИИ ПРОМО (одна ссылка для всех) =====
+await db.execute(`
+  CREATE TABLE IF NOT EXISTS promo_campaigns (
+    code VARCHAR(16) PRIMARY KEY,
+    created_at DATETIME NOT NULL,
+    created_by BIGINT NULL,
+    active TINYINT(1) DEFAULT 1,
+    expires_at DATETIME NULL
+  )
+`);
+
+await db.execute(`
+  CREATE TABLE IF NOT EXISTS promo_campaign_claims (
+    campaign_code VARCHAR(16) NOT NULL,
+    chat_id BIGINT NOT NULL,
+    username VARCHAR(255) NULL,
+    claimed_at DATETIME NOT NULL,
+    used TINYINT(1) DEFAULT 0,
+    used_at DATETIME NULL,
+    used_order_id VARCHAR(255) NULL,
+    PRIMARY KEY (campaign_code, chat_id)
+  )
+`);
+
+await db.execute(`CREATE INDEX idx_pc_active ON promo_campaigns(active)`).catch(()=>{});
+await db.execute(`CREATE INDEX idx_pcc_used ON promo_campaign_claims(used)`).catch(()=>{});
+
+
   await db.execute(`CREATE INDEX idx_promo_intended ON promo_codes(intended_username)`).catch(()=>{});
   await db.execute(`CREATE INDEX idx_promo_reserved ON promo_codes(reserved_by_chat_id)`).catch(()=>{});
   await db.execute(`CREATE INDEX idx_promo_used ON promo_codes(used)`).catch(()=>{});
@@ -312,8 +345,17 @@ await db.execute(`
   ];
 
   for (const [table, index, column] of indexes) {
-    await db.execute(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${column})`).catch(() => {});
+  try {
+    await db.execute(`CREATE INDEX \`${index}\` ON \`${table}\`(\`${column}\`)`);
+  } catch (e) {
+    const msg = String(e?.message || "").toLowerCase();
+    // дубликат индекса игнорируем
+    if (!msg.includes("duplicate") && !msg.includes("exists")) {
+      console.error("[INDEX CREATE ERROR]", table, index, e?.message || e);
+    }
   }
+}
+
 
      // ===== ДОБАВЛЯЕМ КОЛОНКИ ДЛЯ РЕФЕРАЛКИ =====
 
@@ -486,43 +528,47 @@ function isCourier(username) {
 
 // ================= Клиенты =================
 async function addOrUpdateClient(username, first_name, chat_id) {
-  const now = new Date().toISOString().slice(0, 19).replace("T", " ");
   const uname = String(username || "").replace(/^@/, "").trim();
   const fname = String(first_name || "");
   const chatId = chat_id ? Number(chat_id) : null;
-
   if (!uname) return;
 
-  // ✅ основной путь — апдейт/инсерт по UNIQUE chat_id
   if (chatId) {
     await db.execute(
       `
       INSERT INTO clients (chat_id, username, first_name, subscribed, created_at, last_active)
-      VALUES (?, ?, ?, 1, ?, ?)
+      VALUES (?, ?, ?, 1, NOW(), NOW())
       ON DUPLICATE KEY UPDATE
         username = VALUES(username),
         first_name = VALUES(first_name),
-        last_active = VALUES(last_active),
+        last_active = NOW(),
         subscribed = 1
       `,
-      [chatId, uname, fname, now, now]
+      [chatId, uname, fname]
     );
     return;
   }
 
-  // запасной путь, если chat_id неизвестен
-  await db.execute(
+  const [upd] = await db.execute(
     `
-    INSERT INTO clients (username, first_name, subscribed, created_at, last_active, chat_id)
-    VALUES (?, ?, 1, ?, ?, NULL)
-    ON DUPLICATE KEY UPDATE
-      first_name = VALUES(first_name),
-      last_active = VALUES(last_active),
-      subscribed = 1
+    UPDATE clients
+    SET first_name = ?, last_active = NOW(), subscribed = 1
+    WHERE username = ?
     `,
-    [uname, fname, now, now]
+    [fname, uname]
   );
+
+  if (upd.affectedRows === 0) {
+    await db.execute(
+      `
+      INSERT INTO clients (username, first_name, subscribed, created_at, last_active, chat_id)
+      VALUES (?, ?, 1, NOW(), NOW(), NULL)
+      `,
+      [uname, fname]
+    );
+  }
 }
+
 
 
 
@@ -533,6 +579,155 @@ async function getClient(username) {
 
 function normU(u) {
   return String(u || "").replace(/^@+/, "").trim();
+}
+
+function makeCampaignCode(len = 8) {
+  return crypto.randomBytes(8).toString("hex").slice(0, len).toUpperCase();
+}
+
+async function createCampaign(createdByChatId, expiresAt = null) {
+  for (let i = 0; i < 10; i++) {
+    const code = makeCampaignCode(8);
+    try {
+      await db.execute(
+        "INSERT INTO promo_campaigns (code, created_at, created_by, active, expires_at) VALUES (?, NOW(), ?, 1, ?)",
+        [code, Number(createdByChatId) || null, expiresAt]
+      );
+      return code;
+    } catch (e) {
+      if (String(e?.message || "").toLowerCase().includes("duplicate")) continue;
+      throw e;
+    }
+  }
+  throw new Error("CANNOT_CREATE_CAMPAIGN");
+}
+
+// /start pc_CODE — “клейм” права на скидку
+async function claimCampaign(codeRaw, username, chatId) {
+  const code = String(codeRaw || "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  const uname = normU(username);
+  const cid = Number(chatId);
+
+  if (!code) return { ok: false, error: "bad_code" };
+
+  const [rows] = await db.execute(
+    `SELECT code, active, expires_at FROM promo_campaigns WHERE code=? LIMIT 1`,
+    [code]
+  );
+  const c = rows[0];
+  if (!c) return { ok: false, error: "not_found" };
+  if (Number(c.active) !== 1) return { ok: false, error: "inactive" };
+  if (c.expires_at && new Date(c.expires_at).getTime() < Date.now()) return { ok: false, error: "expired" };
+
+  // Только клиент без заказов (не canceled)
+  const [[row]] = await db.execute(
+    `SELECT COUNT(*) AS cnt
+     FROM orders
+     WHERE status <> 'canceled'
+       AND (client_chat_id=? OR REPLACE(tgNick,'@','')=?)`,
+    [cid, uname]
+  );
+  if (Number(row?.cnt || 0) > 0) return { ok: false, error: "already_has_orders" };
+
+    // 🔒 не даём принять акцию, если уже есть ref_ или c_ (чтобы не было конфликтов)
+  const [clRows] = await db.execute(
+    "SELECT referrer, promo_code FROM clients WHERE chat_id=? LIMIT 1",
+    [cid]
+  );
+  const cl = clRows[0] || {};
+  if (cl.referrer || cl.promo_code) return { ok: false, error: "has_other_discount" };
+
+  // Запоминаем, что пользователь пришёл по кампании
+  await db.execute(
+    `INSERT INTO promo_campaign_claims (campaign_code, chat_id, username, claimed_at)
+     VALUES (?, ?, ?, NOW())
+     ON DUPLICATE KEY UPDATE username=VALUES(username)`,
+    [code, cid, uname]
+  );
+
+  return { ok: true, code };
+}
+
+// Проверка в момент оформления заказа: есть ли у него неиспользованная кампания
+async function canUseCampaignDiscount(username, chatId) {
+  const cid = Number(chatId);
+
+  const [rows] = await db.execute(
+    `SELECT pcc.campaign_code
+     FROM promo_campaign_claims pcc
+     JOIN promo_campaigns pc ON pc.code = pcc.campaign_code
+     WHERE pcc.chat_id=?
+       AND pcc.used=0
+       AND pc.active=1
+       AND (pc.expires_at IS NULL OR pc.expires_at > NOW())
+     ORDER BY pcc.claimed_at DESC
+     LIMIT 1`,
+    [cid]
+  );
+
+  return rows.length ? rows[0].campaign_code : null;
+}
+
+
+
+// есть ли у пользователя активированный claim по акции (pc_), не использован
+async function hasActiveCampaignClaim(chatId) {
+  const cid = Number(chatId);
+  if (!cid) return false;
+
+  const [[r]] = await db.execute(
+    `SELECT 1 AS ok
+     FROM promo_campaign_claims
+     WHERE chat_id=? AND used=0
+     LIMIT 1`,
+    [cid]
+  );
+
+  return !!r?.ok;
+}
+
+
+// “Съедаем” скидку кампании при создании заказа (атомарно)
+async function consumeCampaign(chatId, orderId) {
+  const cid = Number(chatId);
+
+  const [upd] = await db.execute(
+    `UPDATE promo_campaign_claims pcc
+     JOIN promo_campaigns pc ON pc.code = pcc.campaign_code
+     SET pcc.used=1, pcc.used_at=NOW(), pcc.used_order_id=?
+     WHERE pcc.chat_id=?
+       AND pcc.used=0
+       AND pc.active=1
+       AND (pc.expires_at IS NULL OR pc.expires_at > NOW())`,
+    [String(orderId), cid]
+  );
+
+  return upd.affectedRows === 1;
+}
+
+// Возврат при отмене/удалении (если заказ НЕ delivered)
+async function refundCampaignIfNeeded(order) {
+  try {
+    if (!order) return;
+    if (String(order.discount_type || "") !== "campaign_promo") return;
+    if (String(order.status || "") === "delivered") return;
+
+    const cid = order.client_chat_id ? Number(order.client_chat_id) : null;
+    if (!cid) return;
+
+    const [upd] = await db.execute(
+      `UPDATE promo_campaign_claims
+       SET used=0, used_at=NULL, used_order_id=NULL
+       WHERE used=1 AND used_order_id=? AND chat_id=?`,
+      [String(order.id), cid]
+    );
+
+    if (upd.affectedRows === 1) {
+      await addReferralLog("campaign_refund", normU(order.tgNick) || "unknown", `refund order:${order.id}`);
+    }
+  } catch (e) {
+    console.error("[refundCampaignIfNeeded] error:", e?.message || e);
+  }
 }
 
 function makePromoCode(len = 10) {
@@ -579,6 +774,21 @@ async function claimPromoCode(codeRaw, username, chatId) {
   [cid, uname]
 );
   if (Number(row?.cnt || 0) > 0) return { ok: false, error: "already_has_orders" };
+
+    // 🔒 если уже активирована акция pc_ — промокод не даём
+  if (await hasActiveCampaignClaim(cid)) {
+    return { ok: false, error: "campaign_already_claimed" };
+  }
+
+  // 🔒 если уже есть referrer — промокод не даём (чтобы не конфликтовало с рефкой)
+  const [cl2] = await db.execute(
+    "SELECT referrer FROM clients WHERE chat_id=? LIMIT 1",
+    [cid]
+  );
+  if (cl2[0]?.referrer) {
+    return { ok: false, error: "has_other_discount" };
+  }
+
 
   const [rows] = await db.execute("SELECT * FROM promo_codes WHERE code=? LIMIT 1", [code]);
   const p = rows[0];
@@ -750,6 +960,24 @@ function formatMySQLDateTime(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
          `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
+
+function mysqlDateTimeToMs(dt, tz = "+03:00") {
+  if (!dt) return Date.now();
+
+  // ✅ если mysql2 вернул Date — просто берём epoch
+  if (dt instanceof Date) return dt.getTime();
+
+  if (typeof dt === "number") return dt;
+
+  const s = String(dt); // ожидаем "YYYY-MM-DD HH:MM:SS"
+  const iso = s.includes("T") ? s : s.replace(" ", "T");
+  const withTz = /Z$|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + tz;
+
+  const ms = Date.parse(withTz);
+  return Number.isFinite(ms) ? ms : Date.now();
+}
+
+
 async function hasReferralLog(type, username, details) {
   const [rows] = await db.execute(
     "SELECT 1 FROM referral_logs WHERE type=? AND username=? AND details=? LIMIT 1",
@@ -898,94 +1126,82 @@ async function addOrder(order) {
   const createdAt = formatMySQLDateTime(now);
 
   // Вставляем или обновляем заказ
-  await db.execute(
-    `
-    INSERT INTO orders (
-      id,
-      tgNick,
-      city,
-      delivery,
-      payment,
-      orderText,
-      date,
-      time,
-      status,
-      created_at,
-      client_chat_id,
-      original_price,
-      final_price,
-      discount_type,
-      referral_bonus_reserved_qty,
-      referral_bonus_spent
-
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      tgNick = VALUES(tgNick),
-      city = VALUES(city),
-      delivery = VALUES(delivery),
-      payment = VALUES(payment),
-      orderText = VALUES(orderText),
-      date = VALUES(date),
-      time = VALUES(time),
-      status = VALUES(status),
-      client_chat_id = VALUES(client_chat_id),
-      original_price = VALUES(original_price),
-      final_price = VALUES(final_price),
-      discount_type = VALUES(discount_type),
-      referral_bonus_reserved_qty = VALUES(referral_bonus_reserved_qty),
-      referral_bonus_spent = VALUES(referral_bonus_spent)
-    `,
-    [
-      order.id,
-      order.tgNick,
-      order.city,
-      order.delivery,
-      order.payment,
-      order.orderText,
-      mysqlDate,
-      mysqlTime,
-      order.status || "new",
-      createdAt,
-      order.client_chat_id || null, // ← что пришло — то и пишем
-      order.original_price ?? 15,
-      order.final_price ?? 15,
-      order.discount_type || null,
-      order.referral_bonus_reserved_qty ?? 0,
-      order.referral_bonus_spent ?? 0
-    ]
-  );
+ await db.execute(
+  `
+  INSERT INTO orders (
+    id, tgNick, city, delivery, payment, orderText,
+    date, time, status, created_at, client_chat_id,
+    original_price, final_price, discount_type,
+    referral_bonus_reserved_qty, referral_bonus_spent
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
+  ON DUPLICATE KEY UPDATE
+    tgNick = VALUES(tgNick),
+    city = VALUES(city),
+    delivery = VALUES(delivery),
+    payment = VALUES(payment),
+    orderText = VALUES(orderText),
+    date = VALUES(date),
+    time = VALUES(time),
+    status = VALUES(status),
+    client_chat_id = VALUES(client_chat_id),
+    original_price = VALUES(original_price),
+    final_price = VALUES(final_price),
+    discount_type = VALUES(discount_type),
+    referral_bonus_reserved_qty = VALUES(referral_bonus_reserved_qty),
+    referral_bonus_spent = VALUES(referral_bonus_spent)
+  `,
+  [
+    order.id,
+    order.tgNick,
+    order.city,
+    order.delivery,
+    order.payment,
+    order.orderText,
+    mysqlDate,
+    mysqlTime,
+    order.status || "new",
+    order.client_chat_id || null,
+    order.original_price ?? 15,
+    order.final_price ?? 15,
+    order.discount_type || null,
+    order.referral_bonus_reserved_qty ?? 0,
+    order.referral_bonus_spent ?? 0
+  ]
+);
 }
 
 
 
 
 async function getOrderById(id) {
-  const [rows] = await db.execute("SELECT * FROM orders WHERE id=?", [id]);
+  const [rows] = await db.execute(
+    "SELECT *, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_sec FROM orders WHERE id=?",
+    [id]
+  );
   return rows[0];
 }
 
-async function updateOrderStatus(id, status, courier_username = null) {
-  const now = formatMySQLDateTime();
 
+async function updateOrderStatus(id, status, courier_username = null) {
   switch (status) {
     case "taken":
       await db.execute(
-        "UPDATE orders SET status = ?, courier_username = ?, taken_at = ? WHERE id = ?",
-        [status, courier_username, now, id]
+        "UPDATE orders SET status=?, courier_username=?, taken_at=NOW() WHERE id=?",
+        [status, courier_username, id]
       );
       break;
 
     case "delivered":
       await db.execute(
-        "UPDATE orders SET status = ?, delivered_at = ?, courier_username = ? WHERE id = ?",
-        [status, now, courier_username, id]
+        "UPDATE orders SET status=?, delivered_at=NOW(), courier_username=? WHERE id=?",
+        [status, courier_username, id]
       );
       break;
 
     case "new":
       await db.execute(
-        "UPDATE orders SET status = ?, courier_username = NULL, taken_at = NULL, delivered_at = NULL WHERE id = ?",
+        "UPDATE orders SET status=?, courier_username=NULL, taken_at=NULL, delivered_at=NULL WHERE id=?",
         [status, id]
       );
       break;
@@ -995,15 +1211,16 @@ async function updateOrderStatus(id, status, courier_username = null) {
   }
 }
 
+
 async function takeOrderAtomic(orderId, username) {
   if (!username) return false;
-  const now = formatMySQLDateTime();
   const [res] = await db.execute(
-    "UPDATE orders SET status='taken', courier_username=?, taken_at=? WHERE id=? AND status='new'",
-    [username, now, orderId]
+    "UPDATE orders SET status='taken', courier_username=?, taken_at=NOW() WHERE id=? AND status='new'",
+    [username, orderId]
   );
   return res.affectedRows === 1;
 }
+
 
 async function reassignOrderCourier(orderId, newCourierUsername) {
   const now = formatMySQLDateTime();
@@ -1066,14 +1283,12 @@ function buildKeyboardForRecipient(order, { role, username }) {
 
 // Клиент — отмена в первые 20 минут, пока заказ NEW или TAKEN
 if (isClient) {
-  const createdMs = order.created_at
-    ? new Date(order.created_at).getTime()
-    : Date.now();
+  const createdMs = mysqlDateTimeToMs(order.created_at); // важно чтобы работало и с Date и со строкой
+const orderAge = Math.max(0, Date.now() - createdMs);
 
-  const orderAge = Date.now() - createdMs;
+const canCancelByTime = orderAge <= 20 * 60 * 1000;
+const canCancelByStatus = (order.status === "new" || order.status === "taken");
 
-  const canCancelByTime = orderAge <= 20 * 60 * 1000;
-  const canCancelByStatus = (order.status === "new" || order.status === "taken");
 
   console.log("[DEBUG cancel btn]", {
     orderId: order.id,
@@ -1149,8 +1364,9 @@ if (order.discount_type === "referral_bonus") {
 if (order.discount_type === "promo") {
   lines.push("🎟 Скидка применена: промокод 2€ (первый заказ)");
 }
-
-
+if (order.discount_type === "campaign_promo") {
+  lines.push("🎁 Скидка применена: акция 2€ (первый заказ)");
+}
     } else {
       lines.push(`💸 Цена: ${order.original_price}€`);
     }
@@ -1453,11 +1669,8 @@ async function restoreOrdersForClients() {
             text
           );
 
-          await saveOrderMessage(
-            order.id,
-            client.chat_id,
-            sent.message_id
-          );
+          await sendOrUpdateOrderToChat(order, client.chat_id, "client", client.username);
+
 
           console.log(
             `[INFO] Отправлен заказ №${order.id} клиенту @${client.username}`
@@ -1681,9 +1894,12 @@ const data = await fetchOrdersPagerPage({ type, page, role, username });
 async function renderOrdersPagerDetail(chatId, msgId, type, page, orderId, role, username) {
   const order = await getOrderById(orderId);
   if (!order) {
-    await bot.answerCallbackQuery(chatId, { text: "Заказ не найден", show_alert: true }).catch(() => {});
-    return;
-  }
+  await bot.editMessageText("Заказ не найден", {
+    chat_id: chatId,
+    message_id: msgId
+  }).catch(() => {});
+  return;
+}
 
   const text = buildTextForOrder(order);
 
@@ -1925,11 +2141,18 @@ bot.on("callback_query", async (q) => {
       const chatId = fromId;
       const role = (fromId === ADMIN_ID) ? "admin" : (isCourier(username) ? "courier" : "client");
 
-      // message_id списка (чтобы редактировать)
+            // message_id списка (чтобы редактировать)
+      let modeForKey = null;
+
+      if (data.startsWith("page_")) modeForKey = data.split("_")[1]; // page_mode_page
+      if (data.startsWith("view_")) modeForKey = data.split("_")[2]; // view_orderId_mode_page
+      if (data.startsWith("back_")) modeForKey = data.split("_")[1]; // back_mode_page
+
       const listMsgId =
         q.message?.message_id ||
-        PANEL_LIST_MSG.get(panelKey(chatId, (data.split("_")[1] || ""))) ||
+        (modeForKey ? PANEL_LIST_MSG.get(panelKey(chatId, modeForKey)) : null) ||
         null;
+
 
       if (data.startsWith("page_")) {
         const parts = data.split("_"); // page_mode_page
@@ -2192,6 +2415,7 @@ if (data.startsWith("admin_delete_confirm_") && fromId === ADMIN_ID) {
   // ✅ ВОТ ЭТО ДОБАВЬ (до удаления order из БД)
   await refundReservedBonusIfNeeded(order);
   await refundPromoIfNeeded(order); // ✅ ДОБАВИТЬ
+  await refundCampaignIfNeeded(order); 
 
 
   // 1) удалить сообщения заказа у всех
@@ -2588,7 +2812,7 @@ if (data.startsWith("confirm_cancel_")) {
     return bot.answerCallbackQuery(q.id, { text: "Заказ не найден", show_alert: true });
   }
 
-  const orderAge = Date.now() - new Date(order.created_at).getTime();
+const orderAge = Date.now() - mysqlDateTimeToMs(order.created_at);
 const okStatus = (order.status === "new" || order.status === "taken");
 if (orderAge > 20 * 60 * 1000 || !okStatus) {
   return bot.answerCallbackQuery(q.id, { text: "Заказ не отменяем", show_alert: true });
@@ -2660,9 +2884,10 @@ if (data.startsWith("cancel_")) {
 const updatedOrder = await getOrderById(orderId);
 
 await refundReservedBonusIfNeeded(updatedOrder);
-await refundPromoIfNeeded(updatedOrder);   // ✅ ДОБАВИТЬ
-
+await refundPromoIfNeeded(updatedOrder);
+await refundCampaignIfNeeded(updatedOrder);
 await sendOrUpdateOrderAll(updatedOrder);
+
 
 
     // ✅ Уведомление админа всегда
@@ -2766,6 +2991,8 @@ console.log(`Клиент @${username} добавлен/обновлён в ба
 // ===== PROMO / РЕФЕРАЛ (привязываем только если реально принято) =====
 let promoAccepted = false;
 let referralAccepted = false;
+let campaignAccepted = false;
+
 
 // ===== Если это курьер — обновим chat_id (как у тебя было) =====
 if (isCourier(username)) {
@@ -2779,7 +3006,44 @@ if (isCourier(username)) {
   console.log(`Курьер @${username} добавлен/обновлён, chat_id: ${id}`);
 }
 
-// ===== PROMO: /start c_CODE =====
+// ===== АКЦИЯ: /start pc_CODE (одна ссылка для всех) =====
+if (payload && payload.startsWith("pc_")) {
+  const codeRaw = payload.slice(3);
+
+  try {
+    const r = await claimCampaign(codeRaw, username, id);
+
+    if (r.ok) {
+      campaignAccepted = true;
+
+      // чтобы рефералка не привязывалась, если человек пришёл по акции
+      promoAccepted = true;
+
+      // лог админу
+      try {
+        const u = String(username || "").replace(/^@+/, "").trim();
+        await bot.sendMessage(
+          ADMIN_ID,
+          `🆕 @${escapeMarkdownV2(u)} присоединился по *АКЦИИ* (общая ссылка)\nКод: \`${escapeMarkdownV2(r.code)}\``,
+          { parse_mode: "MarkdownV2" }
+        );
+      } catch {}
+    } else {
+      const map = {
+        not_found: "❌ Акция не найдена.",
+        inactive: "❌ Акция выключена.",
+        expired: "❌ Акция закончилась.",
+        has_other_discount: "❌ Нельзя активировать акцию: у вас уже есть реферальная скидка или промокод.",
+        already_has_orders: "❌ Акция только для клиентов без заказов."
+      };
+      await bot.sendMessage(id, map[r.error] || "❌ Акция недействительна.");
+    }
+  } catch (e) {
+    console.error("[АКЦИЯ claim] error:", e?.message || e);
+  }
+}
+
+// ===== ПРОМОКОД: /start c_CODE (одноразовый купон) =====
 if (payload && payload.startsWith("c_")) {
   const codeRaw = payload.slice(2);
 
@@ -2787,64 +3051,44 @@ if (payload && payload.startsWith("c_")) {
     const r = await claimPromoCode(codeRaw, username, id);
 
     if (r.ok) {
-  promoAccepted = true;
- // ✅ уведомляем админа, если промо создано админом
-  try {
-    const codeNorm = String(r.code || codeRaw).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-    const u = String(username || "").replace(/^@+/, "").trim();
+      promoAccepted = true;
 
-    const [rowsP] = await db.execute(
-      "SELECT created_by FROM promo_codes WHERE code=? LIMIT 1",
-      [codeNorm]
-    );
-    const createdBy = rowsP[0]?.created_by;
-
-    if (Number(createdBy) === Number(ADMIN_ID)) {
-      const details = `user:@${u} code:${codeNorm}`;
-
-      // антидубль
-      const exists = await hasReferralLog("admin_promo_join", "admin", details);
-      if (!exists) {
-        await addReferralLog("admin_promo_join", "admin", details);
-
+      // (по желанию) лог админу
+      try {
+        const u = String(username || "").replace(/^@+/, "").trim();
         await bot.sendMessage(
           ADMIN_ID,
-          `🆕 \\@${escapeMarkdownV2(u)} присоединился по *промо-ссылке админа*\nКод: \`${codeNorm}\``,
+          `🎟 @${escapeMarkdownV2(u)} активировал промокод \`${escapeMarkdownV2(r.code)}\``,
           { parse_mode: "MarkdownV2" }
         );
-      }
-    }
-  } catch (e) {
-    console.error("[ADMIN PROMO JOIN notify] error:", e?.message || e);
-  }
-
-} else {
+      } catch {}
+    } else {
       const map = {
-        not_found: "❌ Купон не найден.",
-        used: "❌ Купон уже использован.",
-        reserved_by_other: "❌ Купон уже привязан к другому.",
-        already_has_orders: "❌ Купон только для клиентов без заказов.",
-        not_for_you: "❌ Этот купон предназначен другому пользователю.",
-        already_has_promo: "❌ У вас уже есть привязанный купон."
+        bad_code: "❌ Неверный промокод.",
+        not_found: "❌ Промокод не найден.",
+        used: "❌ Промокод уже использован.",
+        not_for_you: "❌ Этот промокод не для вас.",
+        reserved_by_other: "❌ Промокод уже привязан к другому пользователю.",
+        already_has_promo: "❌ У вас уже активирован другой промокод.",
+        campaign_already_claimed: "❌ У вас уже активирована акция. Промокод недоступен.",
+has_other_discount: "❌ У вас уже активирована скидка по реферальной ссылке. Промокод недоступен.",
+        already_has_orders: "❌ Промокод только для клиентов без заказов."
       };
-
-      await bot.sendMessage(id, map[r.error] || "❌ Купон недействителен.");
-
-      // лог в БД (чтобы видеть попытки)
-      await addReferralLog(
-        "promo_rejected",
-        String(username || "").replace(/^@+/, "").trim() || "unknown",
-        `code:${String(codeRaw || "").toUpperCase()} reason:${r.error || "unknown"}`
-      );
+      await bot.sendMessage(id, map[r.error] || "❌ Промокод недействителен.");
     }
   } catch (e) {
     console.error("[PROMO claim] error:", e?.message || e);
   }
 }
 
+
+
 // ===== РЕФЕРАЛ: /start ref_username =====
 // рефералку привязываем только новому пользователю, и только если PROMO НЕ принято
-if (!promoAccepted && isNew && payload && payload.startsWith("ref_")) {
+
+const hasCampaign = await hasActiveCampaignClaim(id);
+
+if (!promoAccepted && !hasCampaign && isNew && payload && payload.startsWith("ref_")) {
   const referrer = payload.replace("ref_", "").replace(/^@/, "").trim();
   const me = String(username || "").replace(/^@/, "").trim();
 
@@ -2970,13 +3214,20 @@ if (isAdmin) {
     });
 
     // ✅ 1️⃣.1 — ВОТ СЮДА промо-уведомление
-if (promoAccepted) {
+if (campaignAccepted) {
   await bot.sendMessage(
     id,
-    "🎟 Промо активировано ✅\nСкидка 2€ применится автоматически к *первому* заказу.",
+    "🎁 Акция активирована ✅\nСкидка 2€ будет применяться автоматически, пока акция включена.",
+    { parse_mode: "Markdown" }
+  );
+} else if (promoAccepted) {
+  await bot.sendMessage(
+    id,
+    "🎟 Промокод активирован ✅\nСкидка 2€ применится автоматически к *первому* заказу.",
     { parse_mode: "Markdown" }
   );
 }
+
 
     // ✅ 2️⃣ Реф-сообщение только если реферал реально принят
     if (referralAccepted) {
@@ -3019,6 +3270,42 @@ bot.on("message", async (msg) => {
   const text = msg.text.trim();
   // ⛔️ чтобы /start обрабатывался только bot.onText(/\/start/)
 if (text.startsWith("/start")) return;
+
+// ===== ADMIN: показать все команды для копирования =====
+if (Number(id) === Number(ADMIN_ID) && (text === "/commands" || text === "/cmd" || text === "/admin")) {
+  const msg =
+    "🛠 Админ-команды (копируй и вставляй):\n\n" +
+    "/action\n" +
+    "/action_off CODE\n\n" +
+    "/promo\n" +
+    "/promo @username\n" +
+    "/promos\n" +
+    "/promo_del CODE\n" +
+    "/promo_cleanup\n\n" +
+    "/ban @username\n" +
+    "/unban @username\n" +
+    "/banned\n";
+
+  await bot.sendMessage(id, msg, { disable_web_page_preview: true });
+  return;
+}
+
+
+// ===== ADMIN: создать акцию (общая ссылка) =====
+if (Number(id) === Number(ADMIN_ID) && /^\/action(\s|$)/.test(text)) {
+  const code = await createCampaign(id, null); // без срока
+  const link = `https://t.me/crazydecloud_bot?start=pc_${code}`;
+  return bot.sendMessage(id, `🎯 Акция создана\n\nСсылка:\n${link}\n\n(Одна ссылка для всех, скидка 2€ на первый заказ)`);
+}
+
+// ===== ADMIN: выключить акцию =====
+if (Number(id) === Number(ADMIN_ID) && text.startsWith("/action_off")) {
+  const code = String(text.split(" ")[1] || "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  if (!code) return bot.sendMessage(id, "Формат: /action_off CODE");
+  const [r] = await db.execute("UPDATE promo_campaigns SET active=0 WHERE code=?", [code]);
+  return bot.sendMessage(id, r.affectedRows ? `✅ Акция ${code} выключена` : `❌ Акция ${code} не найдена`);
+}
+
 
   // ===== ADMIN: создать промокод под юзера =====
 if (Number(id) === Number(ADMIN_ID) && /^\/promo(\s|$)/.test(text)) {
@@ -3222,15 +3509,6 @@ if (text === "✅ Доставлено сегодня" && id === ADMIN_ID) {
     return bot.sendMessage(id, "У вас нет username, бот не сможет идентифицировать вас как курьера.");
   }
 
-  // ===== Логирование всех сообщений =====
-  console.log(" MESSAGE", {
-    from: id,
-    username,
-    text,
-    waitingReview: waitingReview.has(id)
-  });
-
-
 // ===== Проверка бана =====
 try {
   const [userRows] = await db.execute(
@@ -3297,21 +3575,6 @@ if (waitingReview.has(id)) {
   if (reviewText.length < 3) {
     return bot.sendMessage(id, "Слишком короткий отзыв, напишите хотя бы несколько слов");
   }
-
-// ===== добавляем колонки rating и review_text в reviews, если ещё нет =====
-try {
-  await db.execute("ALTER TABLE reviews ADD COLUMN rating INT");
-  console.log("rating добавлен в reviews");
-} catch (e) {
-  console.log("rating уже существует в reviews");
-}
-
-try {
-  await db.execute("ALTER TABLE reviews ADD COLUMN review_text TEXT");
-  console.log("review_text добавлен в reviews");
-} catch (e) {
-  console.log("review_text уже существует в reviews");
-}
 
 // ===== сохраняем отзыв + рейтинг =====
 const now = new Date().toISOString().slice(0, 19).replace("T", " ");
@@ -3486,19 +3749,9 @@ if (text === "Курьеры" && id === ADMIN_ID) {
 }
 
 
-
-// 👉 Проверяем — новый ли пользователь
-const [rows] = await db.execute(
-  "SELECT id FROM clients WHERE chat_id=?",
-  [id]
-);
-const isNew = rows.length === 0;
-
-
-
   // Добавляем или обновляем клиента
 await addOrUpdateClient(username, first_name, id);
-const client = await getClient(username);
+
 
 // ===== Команды бан/разбан =====
 if (text.startsWith("/ban ") && id === ADMIN_ID) {
@@ -3713,7 +3966,7 @@ const [lastOrders] = await db.execute(
     const formatRu = (dt) => {
       if (!dt) return "—";
       return new Date(dt).toLocaleString("ru-RU", {
-        timeZone: "Europe/Zaporozhye",
+        timeZone: "Europe/Simferopol",
         day: "2-digit",
         month: "2-digit",
         year: "numeric",
@@ -4441,8 +4694,7 @@ if (hasActive) {
   discountType = null;
   reservedBonusQty = 0;
 } else {
-
-  // ✅ 1) PROMO (самый приоритет) — только если 0 заказов
+  // ✅ 1) PROMO — только если 0 заказов
   if (ordersCount === 0 && clientChatIdNum) {
     try {
       const promo = await canUsePromoDiscount(cleanUsername, clientChatIdNum);
@@ -4455,20 +4707,30 @@ if (hasActive) {
     }
   }
 
-  // ✅ 2) Первый заказ по рефке — только если промо не применилось
+  // ✅ 1.5) CAMPAIGN — только если 0 заказов и промо не применилось
+  if (!discountType && ordersCount === 0 && clientChatIdNum) {
+    try {
+      const camp = await canUseCampaignDiscount(cleanUsername, clientChatIdNum);
+      if (camp) {
+        finalPrice = 13;
+        discountType = "campaign_promo";
+      }
+    } catch (e) {
+      console.error("[CAMPAIGN send-order] error:", e?.message || e);
+    }
+  }
+
+  // ✅ 2) Первый заказ по рефке — только если 0 заказов и ничего выше не применилось
   if (!discountType && ordersCount === 0 && client?.referrer) {
     const okRef = await isEligibleReferrer(client.referrer);
     if (okRef) {
       finalPrice = 13;
       discountType = "first_order";
-    } else {
-      finalPrice = 15;
-      discountType = null;
     }
   }
 
-  // ✅ 3) Реф-бонус — только если промо/первый заказ не применились
-  else if (!discountType && Number(client?.referral_bonus_available || 0) > 0) {
+  // ✅ 3) Реф-бонус — только если ничего выше не применилось
+  if (!discountType && Number(client?.referral_bonus_available || 0) > 0) {
     finalPrice = 13;
     discountType = "referral_bonus";
     reservedBonusQty = 1;
@@ -4483,7 +4745,7 @@ if (hasActive) {
       discountType = null;
       reservedBonusQty = 0;
     } else {
-      reservedBonusUser = cleanUsername; // ✅ чтобы catch смог вернуть
+      reservedBonusUser = cleanUsername;
 
       await db.execute(
         "INSERT INTO referral_logs (type, username, details, created_at) VALUES (?, ?, ?, NOW())",
@@ -4492,6 +4754,7 @@ if (hasActive) {
     }
   }
 }
+
 
 
 // Лог
@@ -4629,6 +4892,20 @@ if (discountType === "promo") {
   }
 }
 
+// ✅ акция "сгорает" только после успешного создания заказа
+if (discountType === "campaign_promo") {
+  const ok = await consumeCampaign(clientChatIdNum, id);
+
+  // если не получилось — откатываем скидку на заказе
+  if (!ok) {
+    await db.execute(
+      "UPDATE orders SET final_price=?, discount_type=NULL WHERE id=?",
+      [originalTotal, id]
+    );
+  }
+}
+
+
 
     // ✅ СТРАХОВКА: гарантируем client_chat_id у заказа (как у тебя)
    if (clientChatIdNum) {
@@ -4683,112 +4960,147 @@ if (discountType === "promo") {
 
 
 // ================= API: узнать цену/скидку (без резерва бонусов) =================
+// ================= API: узнать цену/скидку (без резерва бонусов) =================
 app.post("/api/price-info", async (req, res) => {
   try {
     const body = req.body || {};
-const tgNick = body.tgNick || body.tgUser?.username;  // ✅ добавили fallback
-const cid = Number(body.client_chat_id || body.tgUser?.id || 0);
+    const tgNick = body.tgNick || body.tgUser?.username;
+    const chatId = Number(body.client_chat_id || body.tgUser?.id || 0);
 
+    const originalPrice = 15;
 
-    // 1) Без tgNick — значит Mini App открыт вне Telegram / нет username
+    // 1) Без username — Mini App открыт вне Telegram / нет username
     if (!tgNick) {
       return res.json({
         ok: false,
-        finalPrice: 15,
+        originalPrice,
+        finalPrice: originalPrice,
         discountType: null,
-        error: "USERNAME_REQUIRED"
+        hasActive: false,
+        ordersCount: 0,
+        error: "USERNAME_REQUIRED",
       });
     }
 
     // 2) Нормализуем и валидируем username
     const cleanUsername = String(tgNick).replace(/^@+/, "").trim();
 
-    // Telegram username: 3..32, латиница/цифры/подчеркивание
     if (!/^[a-zA-Z0-9_]{3,32}$/.test(cleanUsername)) {
       return res.json({
         ok: false,
-        finalPrice: 15,
+        originalPrice,
+        finalPrice: originalPrice,
         discountType: null,
-        error: "INVALID_USERNAME"
+        hasActive: false,
+        ordersCount: 0,
+        error: "INVALID_USERNAME",
       });
     }
 
-    // 3) Достаём клиента (может быть null)
+    // (не обязательно, но полезно) держим clients актуальным
+    if (chatId > 0) {
+      await addOrUpdateClient(cleanUsername, body.tgUser?.first_name || "", chatId);
+    }
+
     const client = await getClient(cleanUsername);
 
-    // 4) Активный заказ (new/taken)? тогда скидки не показываем
-    const activeRows = await db.execute(
-      "SELECT id FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('new','taken') LIMIT 1",
-      [cleanUsername]
-    );
-    const activeOrder = (activeRows && activeRows[0] && activeRows[0][0]) ? activeRows[0][0] : null;
-    const hasActive = !!(activeOrder && activeOrder.id);
+    // 3) Активный заказ? (сначала по chat_id, потом fallback по username)
+    let hasActive = false;
 
-    // 5) Сколько заказов было (без canceled)
-    const cntRows = await db.execute(
-      "SELECT COUNT(*) AS cnt FROM orders WHERE REPLACE(tgNick,'@','')=? AND status <> 'canceled'",
-      [cleanUsername]
-    );
-    const ordersCount =
-      (cntRows && cntRows[0] && cntRows[0][0] && typeof cntRows[0][0].cnt !== "undefined")
-        ? Number(cntRows[0][0].cnt)
-        : 0;
-
-const originalPrice = 15;
-let finalPrice = 15;
-let discountType = null;
-
-// Если уже есть активный заказ — никаких скидок
-if (!hasActive) {
-  // ✅ 1) ПРОМО (приоритет) — только если 0 заказов
-  let promoCode = null;
-  try {
-    const chatId = Number(cid);
-    if (ordersCount === 0 && Number.isFinite(chatId) && chatId > 0) {
-      promoCode = await canUsePromoDiscount(cleanUsername, chatId);
+    if (chatId > 0) {
+      const [[r]] = await db.execute(
+        "SELECT id FROM orders WHERE client_chat_id=? AND status IN ('new','taken') LIMIT 1",
+        [chatId]
+      );
+      hasActive = !!r?.id;
     }
-  } catch (e) {
-    console.error("[PROMO price-info] error:", e?.message || e);
-  }
 
-  if (ordersCount === 0 && promoCode) {
-    finalPrice = 13;
-    discountType = "promo";
-  }
-
-  // ✅ 2) Первый заказ по рефералке — только если промо не применилось
-  else if (ordersCount === 0 && client?.referrer) {
-    const okRef = await isEligibleReferrer(client.referrer);
-    if (okRef) {
-      finalPrice = 13;
-      discountType = "first_order";
+    if (!hasActive) {
+      const [[r2]] = await db.execute(
+        "SELECT id FROM orders WHERE REPLACE(tgNick,'@','')=? AND status IN ('new','taken') LIMIT 1",
+        [cleanUsername]
+      );
+      hasActive = !!r2?.id;
     }
-  }
 
-  // ✅ 3) Реф-бонус — только если промо/первый заказ не применились
-  else if (Number(client?.referral_bonus_available || 0) > 0) {
-    finalPrice = 13;
-    discountType = "referral_bonus";
-  }
-}
+    // 4) Сколько заказов было (без canceled)
+    let ordersCount = 0;
 
-return res.json({
-  ok: true,
-  originalPrice,
-  finalPrice,
-  discountType,
-  hasActive,
-  ordersCount
-});
+    if (chatId > 0) {
+      const [[r]] = await db.execute(
+        `SELECT COUNT(*) AS cnt
+         FROM orders
+         WHERE status <> 'canceled'
+           AND (client_chat_id=? OR REPLACE(tgNick,'@','')=?)`,
+        [chatId, cleanUsername]
+      );
+      ordersCount = Number(r?.cnt || 0);
+    } else {
+      const [[r]] = await db.execute(
+        `SELECT COUNT(*) AS cnt
+         FROM orders
+         WHERE status <> 'canceled' AND REPLACE(tgNick,'@','')=?`,
+        [cleanUsername]
+      );
+      ordersCount = Number(r?.cnt || 0);
+    }
 
+    let finalPrice = originalPrice;
+    let discountType = null;
 
+    // ================= скидки =================
+    if (!hasActive) {
+      // ✅ 1) PROMO — только если 0 заказов
+      if (ordersCount === 0 && chatId > 0) {
+        const promoCode = await canUsePromoDiscount(cleanUsername, chatId);
+        if (promoCode) {
+          finalPrice = 13;
+          discountType = "promo";
+        }
+      }
+
+      // ✅ 1.5) CAMPAIGN — только если 0 заказов и промо не применилось
+      if (!discountType && ordersCount === 0 && chatId > 0) {
+        const camp = await canUseCampaignDiscount(cleanUsername, chatId);
+        if (camp) {
+          finalPrice = 13;
+          discountType = "campaign_promo";
+        }
+      }
+
+      // ✅ 2) Первый заказ по рефералке — только если промо/акция не применились
+      if (!discountType && ordersCount === 0 && client?.referrer) {
+        const okRef = await isEligibleReferrer(client.referrer);
+        if (okRef) {
+          finalPrice = 13;
+          discountType = "first_order";
+        }
+      }
+
+      // ✅ 3) Реф-бонус — только если ничего выше не применилось
+      if (!discountType && Number(client?.referral_bonus_available || 0) > 0) {
+        finalPrice = 13;
+        discountType = "referral_bonus";
+      }
+    }
+    // ================= /скидки =================
+
+    return res.json({
+      ok: true,
+      originalPrice,
+      finalPrice,
+      discountType,
+      hasActive,
+      ordersCount,
+    });
   } catch (e) {
-    console.error("[/api/price-info] error:", e && e.message ? e.message : e);
+    console.error("[/api/price-info] error:", e?.message || e);
     return res.status(500).json({
       ok: false,
+      originalPrice: 15,
       finalPrice: 15,
       discountType: null,
-      error: "SERVER_ERROR"
+      error: "SERVER_ERROR",
     });
   }
 });
@@ -4801,6 +5113,7 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
+
 
 
 
