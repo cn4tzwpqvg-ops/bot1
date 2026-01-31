@@ -11,7 +11,8 @@ const crypto = require("crypto");
 
 
 // ================= Новая функция: рассылка и обновление с лимитом =================
-const pLimit = require("p-limit").default; // убедиться, что установлен npm install p-limit
+const pLimit = require("p-limit"); // без .default
+// убедиться, что установлен npm install p-limit
 
 const MINI_APP_URL = "https://cn4tzwpqvg-ops.github.io/crazycloud/";
 
@@ -133,10 +134,36 @@ const waitingReview = new Map();
 // ================= Глобальные переменные =================
 let db;
 let COURIERS = {};
-const bot = new TelegramBot(TOKEN);
+// ВАЖНО: отключаем автостарт, сами стартуем после deleteWebhook
 
-bot.deleteWebHook().catch(() => {});
-bot.on("polling_error", (err) => console.error("Polling error:", err));
+const bot = new TelegramBot(TOKEN, {
+  polling: {
+    autoStart: false,
+    params: { timeout: 10 }
+  }
+});
+
+// ОДИН обработчик, без "console.error(err)" целиком (иначе токен в логах)
+bot.on("polling_error", async (err) => {
+  const body = err?.response?.body;
+  const code = body?.error_code;
+  const desc = body?.description || err.message;
+
+  console.error("[polling_error]", code ? `code=${code}` : "", desc);
+
+  // Самые частые кейсы:
+  // 409 = конфликт getUpdates (вебхук включен ИЛИ второй инстанс)
+  if (code === 409) {
+    try { await bot.stopPolling(); } catch {}
+    try { await bot.deleteWebHook(); } catch {}
+
+    // перезапуск polling
+    setTimeout(() => {
+      bot.startPolling({ restart: true }).catch(() => {});
+    }, 3000);
+  }
+});
+
 
 async function ensureClientsChatIdUnique() {
   // 0) нормализуем "0" как NULL (чтобы не конфликтовало)
@@ -1736,9 +1763,19 @@ async function restoreOrdersForCouriers() {
   await restoreOrdersForClients();   // безопасно
   await restoreOrdersForCouriers();  // безопасно
 
-  bot.startPolling();
+   // СНАЧАЛА точно выключаем webhook
+  try {
+    await bot.deleteWebHook();
+    console.log("[TG] webhook deleted");
+  } catch (e) {
+    console.error("[TG] deleteWebhook error:", e?.response?.body || e?.message || e);
+  }
+
+  // ПОТОМ запускаем polling с авто-restart
+  await bot.startPolling({ restart: true });
   console.log("Бот и сервер запущены");
 })();
+
 
 
 // ================= ПАГИНАЦИЯ ЗАКАЗОВ В ПАНЕЛИ КУРЬЕРА =================
